@@ -68,9 +68,28 @@ fn main() -> Result<()> {
 
     let mut app = App::new(&globals, &qh, &args, images)?;
 
-    // First roundtrip: output enumeration + the color manager's
-    // supported_* events (terminated by done).
+    // First roundtrip: output enumeration, wl_shm formats, and the color
+    // manager's supported_* events (terminated by done).
     queue.roundtrip(&mut app).context("initial roundtrip")?;
+
+    // fp16 images need Abgr16161616f shm support (prism and wlroots
+    // advertise it). Quantize to 8-bit rather than dying elsewhere.
+    use smithay_client_toolkit::shm::ShmHandler as _;
+    if !app
+        .shm_state()
+        .formats()
+        .contains(&wayland_client::protocol::wl_shm::Format::Abgr16161616f)
+    {
+        for (path, loaded) in app.images.iter_mut() {
+            if matches!(loaded.image.pixels, decode::Pixels::RgbaF16(_)) {
+                tracing::warn!(
+                    path = %path.display(),
+                    "compositor lacks fp16 shm buffers; quantizing to 8-bit"
+                );
+                loaded.image = Arc::new(loaded.image.quantized_to_8bit());
+            }
+        }
+    }
 
     // Create image descriptions and wait for ready/failed. The protocol
     // forbids attaching a description before its ready event.

@@ -118,7 +118,10 @@ pub fn upload(pool: &mut SlotPool, img: &DecodedImage) -> Result<Buffer> {
             shm_format(img),
         )
         .context("creating shm buffer")?;
-    canvas.copy_from_slice(pixel_bytes(img));
+    // The pool may hand back a canvas larger than requested (minimum slot
+    // size); fill only the buffer's own bytes.
+    let bytes = pixel_bytes(img);
+    canvas[..bytes.len()].copy_from_slice(bytes);
     Ok(buffer)
 }
 

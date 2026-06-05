@@ -41,6 +41,26 @@ pub struct DecodedImage {
     pub has_alpha: bool,
 }
 
+impl DecodedImage {
+    /// Lossy fallback for compositors that don't accept fp16 shm buffers:
+    /// clamp + quantize to 8-bit, keeping the encoding tag. Banding on
+    /// >8-bit sources and clipped HDR highlights — but it displays.
+    pub fn quantized_to_8bit(&self) -> DecodedImage {
+        let pixels = match &self.pixels {
+            Pixels::Rgba8(d) => Pixels::Rgba8(d.clone()),
+            Pixels::RgbaF16(d) => Pixels::Rgba8(
+                d.iter()
+                    .map(|v| (v.to_f32().clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
+                    .collect(),
+            ),
+        };
+        DecodedImage {
+            pixels,
+            ..self.clone()
+        }
+    }
+}
+
 /// Straight-alpha RGBA pixels as decoded, before color resolution.
 #[derive(Debug)]
 pub enum RawPixels {

@@ -304,7 +304,9 @@ impl App {
             .create_buffer(1, 1, 4, wl_shm::Format::Argb8888)
             .context("creating color buffer")?;
         let px = |v: f64| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-        canvas.copy_from_slice(&[px(wp.color.b), px(wp.color.g), px(wp.color.r), 0xff]);
+        // The pool may hand back a canvas larger than requested (minimum
+        // slot size); only the buffer's own bytes matter.
+        canvas[..4].copy_from_slice(&[px(wp.color.b), px(wp.color.g), px(wp.color.r), 0xff]);
         buffer
             .attach_to(wp.layer.wl_surface())
             .context("attaching color buffer")?;
