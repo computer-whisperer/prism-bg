@@ -44,10 +44,11 @@ pub struct DecodedImage {
 
 impl DecodedImage {
     /// Lossy fallback for compositors that don't accept fp16 shm buffers:
-    /// quantize to 8-bit. Linear-light content is sRGB-encoded first and
-    /// retagged (8-bit linear bands horribly in the darks); values above
-    /// 1.0 clip to reference white. Display-referred TFs just clamp.
-    pub fn quantized_to_8bit(&self) -> DecodedImage {
+    /// quantize to 8-bit, encoding linear-light content with `target_tf`
+    /// first (8-bit linear bands horribly in the darks) and retagging.
+    /// Values above 1.0 clip to reference white. Display-referred TFs just
+    /// clamp and keep their tag.
+    pub fn quantized_to_8bit(&self, target_tf: Tf) -> DecodedImage {
         let Pixels::RgbaF16(d) = &self.pixels else {
             return self.clone();
         };
@@ -62,7 +63,7 @@ impl DecodedImage {
                     // Pixels are premultiplied; the OETF applies to the
                     // straight value, premultiplication to the encoded one.
                     if a > 0.0 {
-                        v = srgb_oetf((v / a).clamp(0.0, 1.0)) * a;
+                        v = target_tf.oetf((v / a).clamp(0.0, 1.0)) * a;
                     }
                 } else {
                     v = v.clamp(0.0, 1.0);
@@ -73,7 +74,7 @@ impl DecodedImage {
         }
         let encoding = if linear {
             ColorEncoding {
-                tf: Tf::Srgb,
+                tf: target_tf,
                 primaries: self.encoding.primaries,
                 luminances: None,
             }
@@ -86,13 +87,75 @@ impl DecodedImage {
             ..self.clone()
         }
     }
-}
 
-fn srgb_oetf(x: f32) -> f32 {
-    if x <= 0.0031308 {
-        x * 12.92
-    } else {
-        1.055 * x.powf(1.0 / 2.4) - 0.055
+    /// Re-encode through a different display-referred TF (for compositors
+    /// whose named-TF vocabulary lacks the source's — e.g. KWin dropped the
+    /// protocol-deprecated `srgb`). Pixels are decoded with the source EOTF
+    /// and re-encoded with the target OETF, through straight alpha; linear
+    /// sources clip above reference white and drop their luminances.
+    pub fn reencoded_tf(&self, target_tf: Tf) -> DecodedImage {
+        let src_tf = self.encoding.tf;
+        let convert = |v: f32| target_tf.oetf(src_tf.eotf(v.clamp(0.0, 1.0)));
+        let pixels = match &self.pixels {
+            Pixels::Rgba8(d) => {
+                // Opaque pixels go through a per-channel LUT; translucent
+                // ones need straight-alpha math.
+                let lut: Vec<u8> = (0..=255u16)
+                    .map(|v| (convert(v as f32 / 255.0) * 255.0 + 0.5) as u8)
+                    .collect();
+                let mut out = Vec::with_capacity(d.len());
+                for px in d.chunks_exact(4) {
+                    let a = px[3];
+                    if a == 255 {
+                        out.extend_from_slice(&[
+                            lut[px[0] as usize],
+                            lut[px[1] as usize],
+                            lut[px[2] as usize],
+                            255,
+                        ]);
+                    } else {
+                        let af = a as f32 / 255.0;
+                        for &c in &px[..3] {
+                            let v = if a == 0 {
+                                0.0
+                            } else {
+                                convert(c as f32 / 255.0 / af) * af
+                            };
+                            out.push((v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+                        }
+                        out.push(a);
+                    }
+                }
+                Pixels::Rgba8(out)
+            }
+            Pixels::RgbaF16(d) => {
+                let mut out = Vec::with_capacity(d.len());
+                for px in d.chunks_exact(4) {
+                    let a = px[3].to_f32().clamp(0.0, 1.0);
+                    for &c in &px[..3] {
+                        let v = if a > 0.0 {
+                            convert(c.to_f32() / a) * a
+                        } else {
+                            0.0
+                        };
+                        out.push(f16::from_f32(v));
+                    }
+                    out.push(f16::from_f32(a));
+                }
+                Pixels::RgbaF16(out)
+            }
+        };
+        DecodedImage {
+            pixels,
+            encoding: ColorEncoding {
+                tf: target_tf,
+                primaries: self.encoding.primaries,
+                // Display-referred either side; luminance declarations
+                // don't survive the conversion (linear sources clipped).
+                luminances: None,
+            },
+            ..self.clone()
+        }
     }
 }
 
@@ -412,7 +475,7 @@ mod quantize_tests {
             },
             has_alpha: false,
         };
-        let q = img.quantized_to_8bit();
+        let q = img.quantized_to_8bit(Tf::Srgb);
         assert_eq!(q.encoding.tf, Tf::Srgb);
         assert!(q.encoding.luminances.is_none());
         let Pixels::Rgba8(d) = &q.pixels else {
@@ -438,11 +501,74 @@ mod quantize_tests {
             },
             has_alpha: false,
         };
-        let q = img.quantized_to_8bit();
+        let q = img.quantized_to_8bit(Tf::Srgb);
         assert_eq!(q.encoding.tf, Tf::Pq);
         let Pixels::Rgba8(d) = &q.pixels else {
             panic!("expected 8-bit")
         };
         assert_eq!(&d[..], &[128, 255, 64, 255]);
+    }
+}
+
+#[cfg(test)]
+mod reencode_tests {
+    use super::*;
+    use crate::color::{ColorEncoding, PrimaryVolume, Tf};
+
+    fn srgb_image(pixels: Pixels) -> DecodedImage {
+        DecodedImage {
+            width: 1,
+            height: 1,
+            pixels,
+            encoding: ColorEncoding::SRGB,
+            has_alpha: false,
+        }
+    }
+
+    #[test]
+    fn srgb_to_gamma22_reencodes_opaque_8bit() {
+        // sRGB 188 → linear ≈0.5029 → gamma2.2 ≈ 0.7316 → 187.
+        let img = srgb_image(Pixels::Rgba8(vec![188, 0, 255, 255]));
+        let out = img.reencoded_tf(Tf::Gamma22);
+        assert_eq!(out.encoding.tf, Tf::Gamma22);
+        let Pixels::Rgba8(d) = &out.pixels else { panic!() };
+        assert_eq!(&d[..], &[187, 0, 255, 255]);
+    }
+
+    #[test]
+    fn reencode_respects_premultiplied_alpha() {
+        // Straight value 188 premultiplied by a=0.5 → 94 in the buffer.
+        // Conversion must go through the straight value: 188→187, then
+        // re-premultiply → round(187 * 128/255) = 94.
+        let img = srgb_image(Pixels::Rgba8(vec![94, 0, 128, 128]));
+        let out = img.reencoded_tf(Tf::Gamma22);
+        let Pixels::Rgba8(d) = &out.pixels else { panic!() };
+        // straight 94/(128/255)=187.3→ converted ≈186.5 → ×0.502 ≈ 94
+        assert!((d[0] as i32 - 94).abs() <= 1, "got {}", d[0]);
+        assert_eq!(d[3], 128);
+    }
+
+    #[test]
+    fn gamma22_quantize_target() {
+        // linear 0.5 → 0.5^(1/2.2) ≈ 0.7297 → 186
+        let d: Vec<f16> = [0.5f32, 0.0, 1.0, 1.0]
+            .iter()
+            .map(|&v| f16::from_f32(v))
+            .collect();
+        let img = DecodedImage {
+            width: 1,
+            height: 1,
+            pixels: Pixels::RgbaF16(d),
+            encoding: ColorEncoding {
+                tf: Tf::Linear,
+                primaries: PrimaryVolume::Srgb,
+                luminances: None,
+            },
+            has_alpha: false,
+        };
+        let q = img.quantized_to_8bit(Tf::Gamma22);
+        assert_eq!(q.encoding.tf, Tf::Gamma22);
+        let Pixels::Rgba8(d) = &q.pixels else { panic!() };
+        assert_eq!(&d[..], &[186, 0, 255, 255]);
     }
 }

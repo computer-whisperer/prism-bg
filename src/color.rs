@@ -132,6 +132,44 @@ impl ColorEncoding {
     };
 }
 
+impl Tf {
+    /// Decode an electrical value to linear light. Only defined for the
+    /// display-referred TFs (+identity); PQ needs luminance context and is
+    /// never converted client-side.
+    pub fn eotf(self, x: f32) -> f32 {
+        match self {
+            Tf::Srgb => {
+                if x <= 0.04045 {
+                    x / 12.92
+                } else {
+                    ((x + 0.055) / 1.055).powf(2.4)
+                }
+            }
+            Tf::Gamma22 => x.powf(2.2),
+            Tf::Bt1886 => x.powf(2.4),
+            Tf::Linear => x,
+            Tf::Pq => unreachable!("PQ is never converted client-side"),
+        }
+    }
+
+    /// Encode linear light to an electrical value (inverse of [`Self::eotf`]).
+    pub fn oetf(self, x: f32) -> f32 {
+        match self {
+            Tf::Srgb => {
+                if x <= 0.0031308 {
+                    x * 12.92
+                } else {
+                    1.055 * x.powf(1.0 / 2.4) - 0.055
+                }
+            }
+            Tf::Gamma22 => x.powf(1.0 / 2.2),
+            Tf::Bt1886 => x.powf(1.0 / 2.4),
+            Tf::Linear => x,
+            Tf::Pq => unreachable!("PQ is never converted client-side"),
+        }
+    }
+}
+
 /// Map CICP code points (H.273) to a [`ColorEncoding`], for sources that
 /// carry them (PNG `cICP`, JXL, ICC v4.4 `cicp` tag). Returns `None` when
 /// the code points name something we can't express losslessly (we'd rather

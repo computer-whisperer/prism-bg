@@ -71,32 +71,15 @@ fn main() -> Result<()> {
     // First roundtrip: output enumeration, wl_shm formats, and the color
     // manager's supported_* events (terminated by done).
     queue.roundtrip(&mut app).context("initial roundtrip")?;
-
-    // fp16 images need Abgr16161616f shm support (prism and wlroots
-    // advertise it). Quantize to 8-bit rather than dying elsewhere.
-    use smithay_client_toolkit::shm::ShmHandler as _;
-    if !app
-        .shm_state()
-        .formats()
-        .contains(&wayland_client::protocol::wl_shm::Format::Abgr16161616f)
-    {
-        for (path, loaded) in app.images.iter_mut() {
-            if matches!(loaded.image.pixels, decode::Pixels::RgbaF16(_)) {
-                tracing::warn!(
-                    path = %path.display(),
-                    "compositor lacks fp16 shm buffers; quantizing to 8-bit"
-                );
-                loaded.image = Arc::new(loaded.image.quantized_to_8bit());
-            }
-        }
+    if app.color.as_ref().is_some_and(|c| !c.done) {
+        queue.roundtrip(&mut app).context("waiting for color manager caps")?;
     }
+
+    adapt_images_to_caps(&mut app)?;
 
     // Create image descriptions and wait for ready/failed. The protocol
     // forbids attaching a description before its ready event.
-    if let Some(color) = &app.color {
-        if !color.done {
-            queue.roundtrip(&mut app).context("waiting for color manager caps")?;
-        }
+    if app.color.is_some() {
         let color = app.color.as_ref().unwrap();
         let mut descriptions = Vec::new();
         for (path, loaded) in &app.images {
@@ -133,4 +116,75 @@ fn main() -> Result<()> {
     loop {
         queue.blocking_dispatch(&mut app).context("event loop")?;
     }
+}
+
+/// Adapt loaded images to what the compositor can actually take:
+/// - without fp16 shm (`Abgr16161616f`), quantize to 8-bit;
+/// - when an image's TF isn't in the compositor's named-TF vocabulary,
+///   re-encode the pixels to one that is. KWin notably dropped the
+///   protocol-deprecated `srgb`, so plain sRGB images re-encode to
+///   gamma 2.2 there; linear sources clip at reference white when
+///   `ext_linear` is missing. PQ is never converted — failing loudly
+///   beats silently tone-mapping HDR.
+fn adapt_images_to_caps(app: &mut App) -> Result<()> {
+    use crate::color::Tf;
+    use smithay_client_toolkit::shm::ShmHandler as _;
+
+    let fp16_ok = app
+        .shm_state()
+        .formats()
+        .contains(&wayland_client::protocol::wl_shm::Format::Abgr16161616f);
+
+    // The display-referred TF we re-encode into when we must. Preference
+    // order keeps pixels untouched on compositors that accept sRGB.
+    let sdr_tf = match &app.color {
+        Some(c) => [Tf::Srgb, Tf::Gamma22, Tf::Bt1886]
+            .into_iter()
+            .find(|&t| c.supports_tf(t)),
+        // No color management: surfaces are untagged, compositor assumes
+        // sRGB; nothing to negotiate.
+        None => Some(Tf::Srgb),
+    };
+
+    for (path, loaded) in app.images.iter_mut() {
+        if !fp16_ok && matches!(loaded.image.pixels, decode::Pixels::RgbaF16(_)) {
+            let target = sdr_tf.context("compositor supports no display-referred TF")?;
+            tracing::warn!(
+                path = %path.display(),
+                ?target,
+                "compositor lacks fp16 shm buffers; quantizing to 8-bit"
+            );
+            loaded.image = Arc::new(loaded.image.quantized_to_8bit(target));
+        }
+        let Some(color) = &app.color else { continue };
+        let tf = loaded.image.encoding.tf;
+        if color.supports_tf(tf) {
+            continue;
+        }
+        match tf {
+            Tf::Srgb | Tf::Gamma22 | Tf::Bt1886 | Tf::Linear => {
+                let target = sdr_tf.context("compositor supports no display-referred TF")?;
+                if tf == Tf::Linear {
+                    tracing::warn!(
+                        path = %path.display(),
+                        ?target,
+                        "compositor lacks ext_linear; re-encoding (HDR clips at reference white)"
+                    );
+                } else {
+                    tracing::info!(
+                        path = %path.display(),
+                        from = ?tf,
+                        to = ?target,
+                        "re-encoding to a TF the compositor supports"
+                    );
+                }
+                loaded.image = Arc::new(loaded.image.reencoded_tf(target));
+            }
+            Tf::Pq => anyhow::bail!(
+                "{}: compositor does not support the PQ transfer function",
+                path.display()
+            ),
+        }
+    }
+    Ok(())
 }

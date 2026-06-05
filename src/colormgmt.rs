@@ -49,6 +49,11 @@ impl ColorState {
         self.features.contains(&f)
     }
 
+    /// Whether the compositor advertised the named TF for `tf`.
+    pub fn supports_tf(&self, tf: Tf) -> bool {
+        self.tfs.contains(&protocol_tf(tf))
+    }
+
     /// Create a parametric image description for `enc`, degrading where
     /// harmless and failing where rendering would be wrong:
     /// - luminances are dropped (with a warning) if `set_luminances` is
@@ -63,14 +68,10 @@ impl ColorState {
         if !self.feature(Feature::Parametric) {
             bail!("compositor lacks parametric image descriptions");
         }
-        let tf = match enc.tf {
-            Tf::Srgb => TransferFunction::Srgb,
-            Tf::Gamma22 => TransferFunction::Gamma22,
-            Tf::Bt1886 => TransferFunction::Bt1886,
-            Tf::Pq => TransferFunction::St2084Pq,
-            Tf::Linear => TransferFunction::ExtLinear,
-        };
+        let tf = protocol_tf(enc.tf);
         if !self.tfs.contains(&tf) {
+            // main's capability-adaptation pass re-encodes unsupported TFs
+            // before descriptions are created; reaching this is a bug there.
             bail!("compositor does not support transfer function {tf:?}");
         }
 
@@ -168,6 +169,16 @@ impl ColorState {
         let cm = self.manager.get_surface(surface, qh, ());
         cm.set_image_description(&desc.object, intent);
         cm
+    }
+}
+
+fn protocol_tf(tf: Tf) -> TransferFunction {
+    match tf {
+        Tf::Srgb => TransferFunction::Srgb,
+        Tf::Gamma22 => TransferFunction::Gamma22,
+        Tf::Bt1886 => TransferFunction::Bt1886,
+        Tf::Pq => TransferFunction::St2084Pq,
+        Tf::Linear => TransferFunction::ExtLinear,
     }
 }
 
