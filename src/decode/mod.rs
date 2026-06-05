@@ -12,6 +12,7 @@
 
 mod generic;
 mod jxl;
+mod jxr;
 mod png;
 
 use std::path::Path;
@@ -100,6 +101,7 @@ fn decode(data: &[u8]) -> Result<RawImage> {
     match sniff(data) {
         Some(Format::Png) => png::decode(data),
         Some(Format::Jxl) => jxl::decode(data),
+        Some(Format::Jxr) => jxr::decode(data),
         Some(f) => generic::decode(data, f),
         None => bail!("unrecognized image format"),
     }
@@ -111,6 +113,7 @@ pub enum Format {
     Jpeg,
     WebP,
     Jxl,
+    Jxr,
     Avif,
     Exr,
     Hdr,
@@ -127,6 +130,9 @@ fn sniff(data: &[u8]) -> Option<Format> {
         || data.starts_with(b"\x00\x00\x00\x0cJXL \x0d\x0a\x87\x0a")
     {
         Some(Format::Jxl)
+    } else if data.starts_with(&[0x49, 0x49, 0xbc]) {
+        // TIFF-style little-endian header with the JXR signature byte.
+        Some(Format::Jxr)
     } else if data.len() > 12 && &data[4..8] == b"ftyp" && &data[8..12] == b"avif" {
         Some(Format::Avif)
     } else if data.starts_with(&[0x76, 0x2f, 0x31, 0x01]) {
@@ -308,5 +314,39 @@ mod tests {
             Some((9, 16, true)) => {}
             other => panic!("unexpected colr parse: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod jxr_probe {
+    #[test]
+    #[ignore]
+    fn probe_file() {
+        let path = std::env::var("PROBE_IMAGE").unwrap();
+        let img = super::load(std::path::Path::new(&path)).unwrap();
+        let (mut mn, mut mx, mut sum) = (f32::MAX, f32::MIN, 0f64);
+        let mut n = 0u64;
+        match &img.pixels {
+            super::Pixels::Rgba8(d) => {
+                for px in d.chunks_exact(4) {
+                    for &c in &px[..3] {
+                        let v = c as f32 / 255.0;
+                        mn = mn.min(v); mx = mx.max(v); sum += v as f64; n += 1;
+                    }
+                }
+            }
+            super::Pixels::RgbaF16(d) => {
+                for px in d.chunks_exact(4) {
+                    for &c in &px[..3] {
+                        let v = c.to_f32();
+                        mn = mn.min(v); mx = mx.max(v); sum += v as f64; n += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "{}x{} encoding={:?} has_alpha={} rgb min={mn} max={mx} mean={}",
+            img.width, img.height, img.encoding, img.has_alpha, sum / n as f64
+        );
     }
 }

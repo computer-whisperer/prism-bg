@@ -46,7 +46,9 @@ pub fn decode(data: &[u8], format: Format) -> Result<RawImage> {
         Format::Hdr => Box::new(
             image::codecs::hdr::HdrDecoder::new(reader).context("reading HDR header")?,
         ),
-        Format::Png | Format::Jxl => unreachable!("handled by dedicated decoders"),
+        Format::Png | Format::Jxl | Format::Jxr => {
+            unreachable!("handled by dedicated decoders")
+        }
     };
 
     let icc = decoder.icc_profile().unwrap_or_default();
@@ -113,7 +115,7 @@ fn resolve_color(data: &[u8], format: Format, icc: Option<Vec<u8>>) -> Result<Ra
                 reference: SCENE_LINEAR_REF_NITS,
             }),
         })),
-        Format::Png | Format::Jxl => unreachable!(),
+        Format::Png | Format::Jxl | Format::Jxr => unreachable!(),
     }
 }
 

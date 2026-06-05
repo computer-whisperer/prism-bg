@@ -31,3 +31,12 @@ jxl-oxide = "0.12"
 # pure-Rust CMS for ICC profile handling (prism takes parametric
 # descriptions only, so ICC is resolved client-side).
 moxcms = "0.8"
+
+# JPEG XR (Windows HDR wallpapers/screenshots, scRGB) — vendored jxrlib C.
+jpegxr = "0.3"
+
+# jpegxr 0.3.1 vendored: its pinned bindgen 0.69 generates opaque structs
+# with current libclang (forward-declared tagPKImageDecode); bumped to
+# bindgen 0.72. Drop the patch when upstream updates.
+[patch.crates-io]
+jpegxr = { path = "vendor/jpegxr" }
