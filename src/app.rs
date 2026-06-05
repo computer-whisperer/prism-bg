@@ -40,22 +40,30 @@ use wayland_protocols::wp::viewporter::client::{
 };
 
 use crate::cli::{Args, Color, Intent, Mode, OutputSpec};
-use crate::colormgmt::{ColorState, DescriptionHandle};
+use crate::colormgmt::{ColorState, DescriptionHandle, Status};
 use crate::decode::DecodedImage;
 use crate::surfaces::{place, upload, upload_tiled, WireRgb8};
 
-/// Image identity for deduplication: path + luminance treatment (the same
-/// file capped differently for different outputs is different pixels).
-pub type ImageKey = (PathBuf, Option<(u64, u64)>);
+/// Image identity for deduplication: path + effective luminance treatment
+/// (the same file treated differently for different outputs is different
+/// pixels).
+pub type ImageKey = (PathBuf, Option<(u64, u64, u64)>);
 
-/// The dedup key for `spec`'s image, if it has one.
-pub fn image_key(spec: &OutputSpec) -> Option<ImageKey> {
-    spec.image
-        .as_ref()
-        .map(|p| (p.clone(), spec.luminance.map(|l| l.key())))
+/// The effective treatment for a spec once `--tone-map auto` has been
+/// resolved to concrete nits (or `None` when not requested / unavailable).
+pub fn resolve_treatment(
+    spec: &OutputSpec,
+    tone_nits: Option<f64>,
+) -> Option<crate::color::LuminanceControl> {
+    let t = crate::color::LuminanceControl {
+        tone_map: tone_nits,
+        ..spec.luminance.unwrap_or_default()
+    };
+    (!t.is_empty()).then_some(t)
 }
 
-/// A decoded image plus its (shared) compositor-side description.
+/// A decoded, treated, capability-adapted image plus its (shared)
+/// compositor-side description.
 pub struct LoadedImage {
     pub image: Arc<DecodedImage>,
     pub description: Option<DescriptionHandle>,
@@ -75,10 +83,20 @@ struct ImagePart {
 struct Wallpaper {
     output: wl_output::WlOutput,
     name: String,
+    spec: OutputSpec,
     layer: LayerSurface,
     viewport: WpViewport,
     color: Color,
+    /// Built lazily by [`App::service`] once the tone target (if `auto`)
+    /// and the image description are resolved.
     image_part: Option<ImagePart>,
+    /// Image preparation failed; don't retry every service pass.
+    broken: bool,
+    /// Keeps the preferred-description subscription alive (auto mode).
+    _feedback: Option<
+        wayland_protocols::wp::color_management::v1::client
+            ::wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1,
+    >,
     /// Logical size from the last configure; 0 until configured.
     size: (u32, u32),
     scale: i32,
@@ -98,11 +116,17 @@ pub struct App {
     pub color: Option<ColorState>,
     pub intent: Intent,
     pub specs: Vec<OutputSpec>,
+    /// Raw decoded images by path, kept for deriving treated variants
+    /// (per-output tone targets, hotplug).
+    pub raw_images: HashMap<PathBuf, Arc<DecodedImage>>,
+    /// Treated + capability-adapted images by (path, treatment).
     pub images: HashMap<ImageKey, LoadedImage>,
-    /// False until main() has created the image descriptions; gates
-    /// wallpaper creation for outputs announced during the setup
-    /// roundtrips (main sweeps them once descriptions settle).
-    pub bootstrapped: bool,
+    /// Resolved per-output tone-map targets (nits), from the preferred
+    /// image description's target_max_cll / target_luminance.
+    pub tone_targets: HashMap<String, f64>,
+    /// In-flight info collection per output: (target_max_cll,
+    /// target_luminance.max).
+    pub pending_targets: HashMap<String, (Option<f64>, Option<f64>)>,
     wallpapers: Vec<Wallpaper>,
 }
 
@@ -113,7 +137,7 @@ impl App {
         globals: &GlobalList,
         qh: &QueueHandle<App>,
         args: &Args,
-        images: HashMap<ImageKey, LoadedImage>,
+        raw_images: HashMap<PathBuf, Arc<DecodedImage>>,
     ) -> Result<App> {
         let compositor =
             CompositorState::bind(globals, qh).context("wl_compositor not available")?;
@@ -152,18 +176,11 @@ impl App {
             color,
             intent: args.intent,
             specs: args.specs.clone(),
-            images,
-            bootstrapped: false,
+            raw_images,
+            images: HashMap::new(),
+            tone_targets: HashMap::new(),
+            pending_targets: HashMap::new(),
             wallpapers: Vec::new(),
-        })
-    }
-
-    /// All image descriptions created and no longer pending?
-    pub fn descriptions_settled(&self) -> bool {
-        self.images.values().all(|li| {
-            li.description
-                .as_ref()
-                .is_none_or(|d| d.status() != crate::colormgmt::Status::Pending)
         })
     }
 
@@ -198,38 +215,6 @@ impl App {
         layer.set_size(0, 0);
         let viewport = self.get_viewport(qh, layer.wl_surface());
 
-        let mode = spec.effective_mode();
-        let image_part = match (image_key(&spec), mode) {
-            (Some(key), m) if m != Mode::SolidColor => {
-                let loaded = &self.images[&key];
-                let (subsurface, child) = self
-                    .subcompositor
-                    .create_subsurface(layer.wl_surface().clone(), qh);
-                let viewport = self.get_viewport(qh, &child);
-                let cm = match (&self.color, &loaded.description) {
-                    (Some(color), Some(desc)) => {
-                        Some(color.tag_surface(qh, &child, desc, self.intent))
-                    }
-                    _ => None,
-                };
-                if !loaded.image.has_alpha {
-                    if let Ok(region) = Region::new(&self.compositor) {
-                        region.add(0, 0, i32::MAX, i32::MAX);
-                        child.set_opaque_region(Some(region.wl_region()));
-                    }
-                }
-                Some(ImagePart {
-                    _subsurface: subsurface,
-                    surface: child,
-                    viewport,
-                    _cm: cm,
-                    image: loaded.image.clone(),
-                    mode,
-                })
-            }
-            _ => None,
-        };
-
         // The parent is always opaque (solid color under an image, or the
         // solid color itself).
         if let Ok(region) = Region::new(&self.compositor) {
@@ -237,22 +222,249 @@ impl App {
             layer.wl_surface().set_opaque_region(Some(region.wl_region()));
         }
 
-        // Bare commit maps the layer surface; the configure callback draws.
+        // `--tone-map auto` needs the output's preferred description;
+        // subscribe before the first service pass.
+        let wants_image =
+            spec.image.is_some() && spec.effective_mode() != Mode::SolidColor;
+        let feedback = match (&self.color, spec.tone_map, wants_image) {
+            (Some(color), Some(crate::cli::ToneMap::Auto), true) => {
+                Some(color.watch_preferred(qh, layer.wl_surface(), name.clone()))
+            }
+            (None, Some(crate::cli::ToneMap::Auto), true) => {
+                tracing::warn!(
+                    output = name,
+                    "--tone-map auto needs wp_color_management_v1; tone mapping disabled"
+                );
+                None
+            }
+            _ => None,
+        };
+
+        // Bare commit maps the layer surface; the configure callback draws
+        // the color, service() attaches the image once it's prepared.
         layer.commit();
 
-        tracing::info!(output = name, ?mode, "wallpaper surface created");
+        tracing::info!(output = name, mode = ?spec.effective_mode(), "wallpaper surface created");
+        let color = spec.color.unwrap_or(Color { r: 0.0, g: 0.0, b: 0.0 });
         self.wallpapers.push(Wallpaper {
             output,
             name,
+            spec,
             layer,
             viewport,
-            color: spec.color.unwrap_or(Color { r: 0.0, g: 0.0, b: 0.0 }),
-            image_part,
+            color,
+            image_part: None,
+            broken: false,
+            _feedback: feedback,
             size: (0, 0),
             scale,
             color_buffer: None,
             image_buffer: None,
         });
+    }
+
+    /// Attach images to wallpapers whose prerequisites have resolved:
+    /// the tone target (when `--tone-map auto`) and the image description
+    /// readiness. Called from the main loop after every dispatch — cheap
+    /// when nothing is pending.
+    pub fn service(&mut self, qh: &QueueHandle<App>) {
+        for i in 0..self.wallpapers.len() {
+            let wp = &self.wallpapers[i];
+            if wp.image_part.is_some() || wp.broken {
+                continue;
+            }
+            let spec = wp.spec.clone();
+            let name = wp.name.clone();
+            let Some(path) = spec.image.clone() else { continue };
+            if spec.effective_mode() == Mode::SolidColor {
+                continue;
+            }
+
+            // Resolve the tone target.
+            let tone = match spec.tone_map {
+                Some(crate::cli::ToneMap::Nits(n)) => Some(n),
+                Some(crate::cli::ToneMap::Auto) => {
+                    if self.color.is_none() {
+                        None // warned at add_output
+                    } else {
+                        match self.tone_targets.get(&name) {
+                            Some(&t) => Some(t),
+                            None => continue, // feedback still in flight
+                        }
+                    }
+                }
+                None => None,
+            };
+
+            let treatment = resolve_treatment(&spec, tone);
+            let key: ImageKey = (path, treatment.map(|t| t.key()));
+            if let Err(e) = self.ensure_image(qh, &key, treatment) {
+                tracing::error!(output = name, "preparing image failed: {e:#}");
+                self.wallpapers[i].broken = true;
+                continue;
+            }
+            let ready = match &self.images[&key].description {
+                None => true, // no color management; attach untagged
+                Some(d) => match d.status() {
+                    Status::Ready => true,
+                    Status::Pending => false, // ready event will re-trigger
+                    Status::Failed(msg) => {
+                        tracing::error!(
+                            output = name,
+                            "compositor rejected image description: {msg}"
+                        );
+                        self.wallpapers[i].broken = true;
+                        continue;
+                    }
+                },
+            };
+            if ready {
+                self.attach_image(qh, i, &key);
+            }
+        }
+    }
+
+    /// Treat + capability-adapt + describe the image for `key` if it isn't
+    /// cached yet.
+    fn ensure_image(
+        &mut self,
+        qh: &QueueHandle<App>,
+        key: &ImageKey,
+        treatment: Option<crate::color::LuminanceControl>,
+    ) -> Result<()> {
+        if self.images.contains_key(key) {
+            return Ok(());
+        }
+        let raw = self
+            .raw_images
+            .get(&key.0)
+            .context("raw image missing (bug)")?
+            .clone();
+        let treated = match treatment {
+            Some(ctrl) => {
+                let t = raw.luminance_controlled(ctrl);
+                tracing::info!(
+                    path = %key.0.display(),
+                    ?ctrl,
+                    luminances = ?t.encoding.luminances,
+                    "luminance treatment applied"
+                );
+                Arc::new(t)
+            }
+            None => raw,
+        };
+        let adapted = self.adapt_image(treated)?;
+        let description = match &self.color {
+            Some(color) => Some(color.create_description(qh, &adapted.encoding)?),
+            None => None,
+        };
+        self.images.insert(
+            key.clone(),
+            LoadedImage {
+                image: adapted,
+                description,
+            },
+        );
+        Ok(())
+    }
+
+    /// Adapt one image to compositor capabilities, two ordered axes (see
+    /// the module docs in `decode`): TF vocabulary first (full-precision
+    /// pixels), buffer container second (fp16 → unorm16+PQ → 8-bit).
+    fn adapt_image(&self, image: Arc<DecodedImage>) -> Result<Arc<DecodedImage>> {
+        use crate::color::Tf;
+        use wayland_client::protocol::wl_shm::Format;
+
+        let formats = self.shm.formats();
+        let fp16_ok = formats.contains(&Format::Abgr16161616f)
+            && std::env::var_os("PRISM_BG_FORCE_NO_FP16").is_none();
+        let unorm16_ok = formats.contains(&Format::Abgr16161616);
+        let sdr_tf = match &self.color {
+            Some(c) => [Tf::Srgb, Tf::Gamma22, Tf::Bt1886]
+                .into_iter()
+                .find(|&t| c.supports_tf(t)),
+            None => Some(Tf::Srgb),
+        };
+
+        let mut image = image;
+
+        // Axis 1: TF vocabulary.
+        if let Some(color) = &self.color {
+            let tf = image.encoding.tf;
+            if !color.supports_tf(tf) {
+                match tf {
+                    Tf::Srgb | Tf::Gamma22 | Tf::Bt1886 | Tf::Linear => {
+                        let target =
+                            sdr_tf.context("compositor supports no display-referred TF")?;
+                        if tf == Tf::Linear {
+                            tracing::warn!(
+                                ?target,
+                                "compositor lacks ext_linear; re-encoding (HDR clips at \
+                                 reference white)"
+                            );
+                        } else {
+                            tracing::info!(from = ?tf, to = ?target, "re-encoding TF");
+                        }
+                        image = Arc::new(image.reencoded_tf(target));
+                    }
+                    Tf::Pq => anyhow::bail!(
+                        "compositor does not support the PQ transfer function"
+                    ),
+                }
+            }
+        }
+
+        // Axis 2: buffer container.
+        if !fp16_ok && matches!(image.pixels, crate::decode::Pixels::RgbaF16(_)) {
+            let target = sdr_tf.context("compositor supports no display-referred TF")?;
+            if unorm16_ok {
+                let pq_ok = self
+                    .color
+                    .as_ref()
+                    .is_some_and(|c| c.supports_tf(Tf::Pq));
+                tracing::info!(
+                    pq = pq_ok && image.encoding.tf == Tf::Linear,
+                    "compositor lacks fp16 shm; repacking as 16-bit unorm"
+                );
+                image = Arc::new(image.repacked_unorm16(pq_ok, target));
+            } else {
+                tracing::warn!(?target, "compositor lacks fp16 and 16-bit shm; quantizing to 8-bit");
+                image = Arc::new(image.quantized_to_8bit(target));
+            }
+        }
+        Ok(image)
+    }
+
+    /// Build the image subsurface for wallpaper `i` from the prepared
+    /// image at `key`, tag it, and draw.
+    fn attach_image(&mut self, qh: &QueueHandle<App>, i: usize, key: &ImageKey) {
+        let loaded = &self.images[key];
+        let wp = &self.wallpapers[i];
+        let (subsurface, child) = self
+            .subcompositor
+            .create_subsurface(wp.layer.wl_surface().clone(), qh);
+        let viewport = self.get_viewport(qh, &child);
+        let cm = match (&self.color, &loaded.description) {
+            (Some(color), Some(desc)) => Some(color.tag_surface(qh, &child, desc, self.intent)),
+            _ => None,
+        };
+        if !loaded.image.has_alpha {
+            if let Ok(region) = Region::new(&self.compositor) {
+                region.add(0, 0, i32::MAX, i32::MAX);
+                child.set_opaque_region(Some(region.wl_region()));
+            }
+        }
+        let part = ImagePart {
+            _subsurface: subsurface,
+            surface: child,
+            viewport,
+            _cm: cm,
+            image: loaded.image.clone(),
+            mode: wp.spec.effective_mode(),
+        };
+        tracing::info!(output = wp.name, "image attached");
+        self.wallpapers[i].image_part = Some(part);
+        self.draw(i);
     }
 
     fn get_viewport(&self, qh: &QueueHandle<App>, surface: &WlSurface) -> WpViewport {
@@ -397,9 +609,9 @@ impl OutputHandler for App {
     }
 
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
-        if self.bootstrapped {
-            self.add_output(qh, output);
-        }
+        // Safe at any time: image attachment is deferred to service(),
+        // which only runs once main's setup roundtrips are done.
+        self.add_output(qh, output);
     }
 
     fn update_output(

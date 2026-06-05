@@ -71,6 +71,15 @@ impl Color {
     }
 }
 
+/// `--tone-map` argument: an explicit display peak, or "ask the
+/// compositor" (resolved per output from the preferred image
+/// description's target luminance before pixels are treated).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ToneMap {
+    Nits(f64),
+    Auto,
+}
+
 /// Per-output wallpaper spec. `output == "*"` is the fallback.
 #[derive(Debug, Clone)]
 pub struct OutputSpec {
@@ -80,6 +89,8 @@ pub struct OutputSpec {
     pub color: Option<Color>,
     /// HDR luminance shaping (`--cap-luminance` / `--scale-luminance`).
     pub luminance: Option<LuminanceControl>,
+    /// BT.2390 tone mapping (`--tone-map`); `Auto` resolves per output.
+    pub tone_map: Option<ToneMap>,
 }
 
 impl OutputSpec {
@@ -90,6 +101,7 @@ impl OutputSpec {
             mode: None,
             color: None,
             luminance: None,
+            tone_map: None,
         }
     }
 
@@ -130,6 +142,12 @@ Usage: prism-bg <options...>
                          Combines with --cap-luminance: scale first, then
                          clip — tames overall level and white outliers
                          independently.
+      --tone-map <nits|auto>
+                         Remaster HDR content to a display peak via the
+                         BT.2390 EETF (knee + roll-off, hue-preserving).
+                         'auto' asks the compositor for the output's
+                         target luminance. Runs between --scale-luminance
+                         and --cap-luminance.
       --intent <intent>  Rendering intent (perceptual|relative|absolute).
                          Default: perceptual.
       --no-color-management
@@ -187,6 +205,15 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
                     .luminance
                     .get_or_insert(LuminanceControl::default())
                     .scale_max = Some(parse_nits(&value("--scale-luminance")?)?);
+                current_touched = true;
+            }
+            "--tone-map" => {
+                let v = value("--tone-map")?;
+                current.tone_map = Some(if v == "auto" {
+                    ToneMap::Auto
+                } else {
+                    ToneMap::Nits(parse_nits(&v)?)
+                });
                 current_touched = true;
             }
             "--intent" => {
@@ -317,10 +344,10 @@ mod luminance_cli_tests {
                 .map(|s| s.to_string()),
         )
         .unwrap();
-        assert_eq!(args.specs[0].luminance, Some(LuminanceControl { cap: Some(600.0), scale_max: None }));
+        assert_eq!(args.specs[0].luminance, Some(LuminanceControl { cap: Some(600.0), scale_max: None, tone_map: None }));
         assert_eq!(
             args.specs[1].luminance,
-            Some(LuminanceControl { scale_max: Some(1000.0), cap: None })
+            Some(LuminanceControl { scale_max: Some(1000.0), cap: None, tone_map: None })
         );
     }
 

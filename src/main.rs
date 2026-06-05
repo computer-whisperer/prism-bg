@@ -21,8 +21,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use wayland_client::{globals::registry_queue_init, Connection};
 
-use app::{App, LoadedImage};
-use colormgmt::Status;
+use app::App;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -35,209 +34,54 @@ fn main() -> Result<()> {
     let args = cli::parse(std::env::args().skip(1))?;
 
     // Decode every referenced image up front, before touching the display —
-    // a bad file should fail fast. Deduplicated by (path, luminance
-    // treatment): the raw decode is shared, the treated pixels are not.
-    let mut images: HashMap<_, _> = HashMap::new();
-    let mut raw_cache: HashMap<&std::path::PathBuf, Arc<decode::DecodedImage>> = HashMap::new();
+    // a bad file should fail fast. Luminance treatment and capability
+    // adaptation happen lazily per output (App::service): `--tone-map
+    // auto` targets only resolve once the compositor tells us about each
+    // output, and the same file may need different pixels per output.
+    let mut raw_images: HashMap<std::path::PathBuf, Arc<decode::DecodedImage>> = HashMap::new();
     for spec in &args.specs {
-        let Some(key) = app::image_key(spec) else { continue };
-        if images.contains_key(&key) {
+        let Some(path) = &spec.image else { continue };
+        if raw_images.contains_key(path) {
             continue;
         }
-        let path = spec.image.as_ref().unwrap();
-        let base = match raw_cache.get(path) {
-            Some(img) => img.clone(),
-            None => {
-                let img = Arc::new(decode::load(path)?);
-                tracing::info!(
-                    path = %path.display(),
-                    width = img.width,
-                    height = img.height,
-                    tf = ?img.encoding.tf,
-                    primaries = ?img.encoding.primaries,
-                    luminances = ?img.encoding.luminances,
-                    fp16 = matches!(img.pixels, decode::Pixels::RgbaF16(_)),
-                    "image loaded"
-                );
-                raw_cache.insert(path, img.clone());
-                img
-            }
-        };
-        let image = match spec.luminance {
-            Some(ctrl) => {
-                let treated = base.luminance_controlled(ctrl);
-                tracing::info!(
-                    path = %path.display(),
-                    ?ctrl,
-                    luminances = ?treated.encoding.luminances,
-                    "luminance control applied"
-                );
-                Arc::new(treated)
-            }
-            None => base,
-        };
-        images.insert(
-            key,
-            LoadedImage {
-                image,
-                description: None,
-            },
+        let img = Arc::new(decode::load(path)?);
+        tracing::info!(
+            path = %path.display(),
+            width = img.width,
+            height = img.height,
+            tf = ?img.encoding.tf,
+            primaries = ?img.encoding.primaries,
+            luminances = ?img.encoding.luminances,
+            fp16 = matches!(img.pixels, decode::Pixels::RgbaF16(_)),
+            "image loaded"
         );
+        raw_images.insert(path.clone(), img);
     }
-    drop(raw_cache);
 
     let conn = Connection::connect_to_env().context("connecting to Wayland display")?;
     let (globals, mut queue) = registry_queue_init::<App>(&conn)?;
     let qh = queue.handle();
 
-    let mut app = App::new(&globals, &qh, &args, images)?;
+    let mut app = App::new(&globals, &qh, &args, raw_images)?;
 
-    // First roundtrip: output enumeration, wl_shm formats, and the color
-    // manager's supported_* events (terminated by done).
+    // Setup roundtrips: output enumeration, wl_shm formats, and the color
+    // manager's supported_* events (terminated by done). Image treatment
+    // waits on these (capability adaptation needs the caps).
     queue.roundtrip(&mut app).context("initial roundtrip")?;
     if app.color.as_ref().is_some_and(|c| !c.done) {
         queue.roundtrip(&mut app).context("waiting for color manager caps")?;
     }
 
-    adapt_images_to_caps(&mut app)?;
-
-    // Create image descriptions and wait for ready/failed. The protocol
-    // forbids attaching a description before its ready event.
-    if app.color.is_some() {
-        let color = app.color.as_ref().unwrap();
-        let mut descriptions = Vec::new();
-        for (key, loaded) in &app.images {
-            let desc = color
-                .create_description(&qh, &loaded.image.encoding)
-                .with_context(|| format!("describing {}", key.0.display()))?;
-            descriptions.push((key.clone(), desc));
-        }
-        for (key, desc) in descriptions {
-            app.images.get_mut(&key).unwrap().description = Some(desc);
-        }
-        while !app.descriptions_settled() {
-            queue.roundtrip(&mut app).context("waiting for image descriptions")?;
-        }
-        for ((path, _), loaded) in &app.images {
-            if let Some(desc) = &loaded.description {
-                if let Status::Failed(msg) = desc.status() {
-                    bail!(
-                        "compositor rejected image description for {}: {msg}",
-                        path.display()
-                    );
-                }
-            }
-        }
-    }
-
-    // Descriptions are settled; create wallpapers for the outputs we
-    // already know about. Hotplugged outputs arrive via new_output.
-    app.bootstrapped = true;
+    // Wallpapers for the outputs we already know about (hotplug arrives
+    // via new_output). Images attach via service() as their tone targets
+    // and descriptions resolve.
     for output in app.output_state.outputs().collect::<Vec<_>>() {
         app.add_output(&qh, output);
     }
+    app.service(&qh);
 
     loop {
         queue.blocking_dispatch(&mut app).context("event loop")?;
+        app.service(&qh);
     }
-}
-
-/// Adapt loaded images to what the compositor can actually take.
-///
-/// Two independent axes, in order:
-/// 1. **TF vocabulary** — when an image's TF isn't advertised, re-encode
-///    the pixels to one that is (KWin dropped the protocol-deprecated
-///    `srgb`, so plain sRGB re-encodes to gamma 2.2 there). Linear sources
-///    clip at reference white when `ext_linear` is missing; PQ without
-///    compositor PQ fails loudly rather than tone-mapping client-side.
-/// 2. **Buffer container** — fp16 shm (`Abgr16161616f`) when advertised;
-///    else 16-bit unorm (`Abgr16161616`), PQ-encoding linear HDR content
-///    so the luminance range survives (the KWin path — real HDR, no
-///    fp16); else quantize to 8-bit.
-fn adapt_images_to_caps(app: &mut App) -> Result<()> {
-    use crate::color::Tf;
-    use smithay_client_toolkit::shm::ShmHandler as _;
-    use wayland_client::protocol::wl_shm::Format;
-
-    let formats = app.shm_state().formats().to_vec();
-    // PRISM_BG_FORCE_NO_FP16=1 pretends fp16 shm is missing, to exercise
-    // the unorm16/8-bit ladder on compositors that do support it.
-    let fp16_ok = formats.contains(&Format::Abgr16161616f)
-        && std::env::var_os("PRISM_BG_FORCE_NO_FP16").is_none();
-    let unorm16_ok = formats.contains(&Format::Abgr16161616);
-
-    // The display-referred TF we re-encode into when we must. Preference
-    // order keeps pixels untouched on compositors that accept sRGB.
-    let sdr_tf = match &app.color {
-        Some(c) => [Tf::Srgb, Tf::Gamma22, Tf::Bt1886]
-            .into_iter()
-            .find(|&t| c.supports_tf(t)),
-        // No color management: surfaces are untagged, compositor assumes
-        // sRGB; nothing to negotiate.
-        None => Some(Tf::Srgb),
-    };
-
-    for ((path, _), loaded) in app.images.iter_mut() {
-        // Axis 1: TF vocabulary (before any container change, while the
-        // pixels still carry full precision).
-        if let Some(color) = &app.color {
-            let tf = loaded.image.encoding.tf;
-            if !color.supports_tf(tf) {
-                match tf {
-                    Tf::Srgb | Tf::Gamma22 | Tf::Bt1886 | Tf::Linear => {
-                        let target =
-                            sdr_tf.context("compositor supports no display-referred TF")?;
-                        if tf == Tf::Linear {
-                            tracing::warn!(
-                                path = %path.display(),
-                                ?target,
-                                "compositor lacks ext_linear; re-encoding (HDR clips at \
-                                 reference white)"
-                            );
-                        } else {
-                            tracing::info!(
-                                path = %path.display(),
-                                from = ?tf,
-                                to = ?target,
-                                "re-encoding to a TF the compositor supports"
-                            );
-                        }
-                        loaded.image = Arc::new(loaded.image.reencoded_tf(target));
-                    }
-                    Tf::Pq => anyhow::bail!(
-                        "{}: compositor does not support the PQ transfer function",
-                        path.display()
-                    ),
-                }
-            }
-        }
-
-        // Axis 2: buffer container.
-        if fp16_ok || !matches!(loaded.image.pixels, decode::Pixels::RgbaF16(_)) {
-            continue;
-        }
-        if unorm16_ok {
-            let pq_ok = app
-                .color
-                .as_ref()
-                .is_some_and(|c| c.supports_tf(Tf::Pq));
-            let target = sdr_tf.context("compositor supports no display-referred TF")?;
-            let hdr = loaded.image.encoding.tf == Tf::Linear;
-            tracing::info!(
-                path = %path.display(),
-                pq = pq_ok && hdr,
-                "compositor lacks fp16 shm; repacking as 16-bit unorm"
-            );
-            loaded.image = Arc::new(loaded.image.repacked_unorm16(pq_ok, target));
-        } else {
-            let target = sdr_tf.context("compositor supports no display-referred TF")?;
-            tracing::warn!(
-                path = %path.display(),
-                ?target,
-                "compositor lacks fp16 and 16-bit shm; quantizing to 8-bit"
-            );
-            loaded.image = Arc::new(loaded.image.quantized_to_8bit(target));
-        }
-    }
-    Ok(())
 }

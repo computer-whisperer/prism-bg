@@ -185,15 +185,18 @@ impl DecodedImage {
         }
     }
 
-    /// Apply user-requested luminance shaping (`--scale-luminance` then
-    /// `--cap-luminance`), in absolute nits. Operates on HDR sources:
-    /// Linear (nits = value × declared reference) and PQ (through the PQ
-    /// EOTF). Display-referred SDR content passes through with a warning —
-    /// its luminance is the compositor's business. The declared luminance
-    /// maximum shrinks to the resulting content ceiling so downstream tone
-    /// mapping sees an honest value.
+    /// Apply user-requested luminance shaping, in absolute nits, in stage
+    /// order: `--scale-luminance` (whole-image normalize off the measured
+    /// peak), `--tone-map` (BT.2390 EETF compression toward a display
+    /// peak, applied max-RGB so hue survives), `--cap-luminance` (hard
+    /// clip). Operates on HDR sources: Linear (nits = value × declared
+    /// reference) and PQ (through the PQ EOTF). Display-referred SDR
+    /// content passes through with a warning — its luminance is the
+    /// compositor's business. The declared luminance maximum shrinks to
+    /// the resulting content ceiling so downstream tone mapping sees an
+    /// honest value.
     pub fn luminance_controlled(&self, ctrl: crate::color::LuminanceControl) -> DecodedImage {
-        use crate::color::{pq_eotf, pq_oetf, Luminances};
+        use crate::color::{bt2390_eetf, pq_eotf, pq_oetf, Luminances};
 
         let (Pixels::RgbaF16(d), Tf::Linear | Tf::Pq) = (&self.pixels, self.encoding.tf)
         else {
@@ -226,45 +229,78 @@ impl DecodedImage {
             }
         };
 
-        // Stage 1: whole-image scale to put the measured peak at most at
-        // `scale_max`.
-        let mut peak_after = None;
-        let scale = match ctrl.scale_max {
-            None => 1.0,
-            Some(target) => {
-                let target = target as f32;
-                // Content peak over straight channel values.
-                let mut peak = 0f32;
-                for px in d.chunks_exact(4) {
-                    let a = px[3].to_f32().clamp(0.0, 1.0);
-                    if a <= 0.0 {
-                        continue;
-                    }
-                    for &c in &px[..3] {
-                        peak = peak.max(nits_of(c.to_f32() / a));
-                    }
+        // Content peak over straight channel values (scale and tone-map
+        // both need it).
+        let peak = if ctrl.scale_max.is_some() || ctrl.tone_map.is_some() {
+            let mut peak = 0f32;
+            for px in d.chunks_exact(4) {
+                let a = px[3].to_f32().clamp(0.0, 1.0);
+                if a <= 0.0 {
+                    continue;
                 }
-                tracing::info!(peak_nits = peak, target_nits = target, "content peak measured");
-                let s = if peak <= target { 1.0 } else { target / peak };
-                peak_after = Some((peak * s) as f64);
+                for &c in &px[..3] {
+                    peak = peak.max(nits_of(c.to_f32() / a));
+                }
+            }
+            tracing::info!(peak_nits = peak, "content peak measured");
+            Some(peak)
+        } else {
+            None
+        };
+
+        // Stage 1: whole-image scale to put the peak at most at scale_max.
+        let mut ceiling = None; // honest content ceiling, tracked per stage
+        let scale = match (ctrl.scale_max, peak) {
+            (Some(target), Some(peak)) => {
+                let s = if peak <= target as f32 { 1.0 } else { target as f32 / peak };
+                ceiling = Some((peak * s) as f64);
                 s
             }
+            _ => {
+                ceiling = peak.map(|p| p as f64);
+                1.0
+            }
         };
-        // Stage 2: hard clip after scaling.
-        let cap = ctrl.cap.map(|c| c as f32).unwrap_or(f32::INFINITY);
 
-        let transform = |v: f32| v_of((nits_of(v) * scale).min(cap));
+        // Stage 2: BT.2390 EETF toward the tone-map target. Max-RGB: the
+        // curve is evaluated on the pixel's brightest channel and all
+        // three scale by the same ratio, preserving hue.
+        let tone = ctrl.tone_map.map(|target| {
+            let src_peak = ceiling.unwrap_or(10000.0) as f32;
+            if (target as f32) < src_peak {
+                ceiling = Some(target);
+            }
+            bt2390_eetf(src_peak, target as f32)
+        });
+
+        // Stage 3: hard clip.
+        let cap = ctrl.cap.map(|c| c as f32).unwrap_or(f32::INFINITY);
+        if let Some(c) = ctrl.cap {
+            ceiling = Some(ceiling.map_or(c, |x| x.min(c)));
+        }
+
         let mut out = Vec::with_capacity(d.len());
         for px in d.chunks_exact(4) {
             let a = px[3].to_f32().clamp(0.0, 1.0);
-            for &c in &px[..3] {
-                // Through straight alpha (cap is non-linear).
-                let v = if a > 0.0 {
-                    transform(c.to_f32() / a) * a
-                } else {
-                    0.0
-                };
-                out.push(f16::from_f32(v));
+            // Straight linear nits (the stages are non-linear; alpha is
+            // re-applied to the result).
+            let mut rgb = [0f32; 3];
+            if a > 0.0 {
+                for (o, &c) in rgb.iter_mut().zip(&px[..3]) {
+                    *o = nits_of(c.to_f32() / a) * scale;
+                }
+                if let Some(eetf) = &tone {
+                    let m = rgb[0].max(rgb[1]).max(rgb[2]);
+                    if m > 0.0 {
+                        let ratio = eetf(m) / m;
+                        for o in &mut rgb {
+                            *o *= ratio;
+                        }
+                    }
+                }
+            }
+            for o in rgb {
+                out.push(f16::from_f32(v_of(o.min(cap)) * a));
             }
             out.push(px[3]);
         }
@@ -274,12 +310,7 @@ impl DecodedImage {
             max: 10000.0,
             reference: if pq { 203.0 } else { 80.0 },
         });
-        // The honest content ceiling: the post-scale peak when measured,
-        // clipped by the cap, never above the original declaration.
-        let new_max = [Some(old.max), peak_after, ctrl.cap]
-            .into_iter()
-            .flatten()
-            .fold(f64::INFINITY, f64::min);
+        let new_max = ceiling.map_or(old.max, |c| c.min(old.max));
         DecodedImage {
             pixels: Pixels::RgbaF16(out),
             encoding: ColorEncoding {
@@ -908,7 +939,7 @@ mod luminance_tests {
     fn cap_clips_above_target_only() {
         // 80 / 400 / 1600 nits, cap at 200.
         let img = scrgb([1.0, 5.0, 20.0, 1.0]);
-        let out = img.luminance_controlled(LuminanceControl { cap: Some(200.0), scale_max: None });
+        let out = img.luminance_controlled(LuminanceControl { cap: Some(200.0), scale_max: None, tone_map: None });
         let n = rgb_nits(&out);
         assert!((n[0] - 80.0).abs() < 0.1, "{n:?}");
         assert!((n[1] - 200.0).abs() < 0.2, "{n:?}");
@@ -920,7 +951,7 @@ mod luminance_tests {
     fn scale_preserves_ratios() {
         // Peak 1600 nits scaled to 400: everything halves twice.
         let img = scrgb([1.0, 5.0, 20.0, 1.0]);
-        let out = img.luminance_controlled(LuminanceControl { scale_max: Some(400.0), cap: None });
+        let out = img.luminance_controlled(LuminanceControl { scale_max: Some(400.0), cap: None, tone_map: None });
         let n = rgb_nits(&out);
         assert!((n[0] - 20.0).abs() < 0.05, "{n:?}");
         assert!((n[1] - 100.0).abs() < 0.2, "{n:?}");
@@ -931,7 +962,7 @@ mod luminance_tests {
     #[test]
     fn scale_is_noop_below_target() {
         let img = scrgb([1.0, 2.0, 0.5, 1.0]); // peak 160 nits
-        let out = img.luminance_controlled(LuminanceControl { scale_max: Some(400.0), cap: None });
+        let out = img.luminance_controlled(LuminanceControl { scale_max: Some(400.0), cap: None, tone_map: None });
         let n = rgb_nits(&out);
         assert!((n[1] - 160.0).abs() < 0.2, "{n:?}");
     }
@@ -950,7 +981,7 @@ mod luminance_tests {
             },
             has_alpha: false,
         };
-        let out = img.luminance_controlled(LuminanceControl { cap: Some(500.0), scale_max: None });
+        let out = img.luminance_controlled(LuminanceControl { cap: Some(500.0), scale_max: None, tone_map: None });
         let Pixels::RgbaF16(d) = &out.pixels else { panic!() };
         let nits = |v: f16| pq_eotf(v.to_f32()) * 10000.0;
         assert!((nits(d[0]) - 100.0).abs() < 0.5);
@@ -968,7 +999,7 @@ mod luminance_tests {
             encoding: ColorEncoding::SRGB,
             has_alpha: false,
         };
-        let out = img.luminance_controlled(LuminanceControl { cap: Some(200.0), scale_max: None });
+        let out = img.luminance_controlled(LuminanceControl { cap: Some(200.0), scale_max: None, tone_map: None });
         assert_eq!(out.encoding, ColorEncoding::SRGB);
         let Pixels::Rgba8(d) = &out.pixels else { panic!() };
         assert_eq!(&d[..], &[10, 20, 30, 255]);
@@ -1007,6 +1038,7 @@ mod combined_luminance_tests {
         let out = img.luminance_controlled(LuminanceControl {
             scale_max: Some(800.0),
             cap: Some(300.0),
+            tone_map: None,
         });
         let Pixels::RgbaF16(d) = &out.pixels else { panic!() };
         let n: Vec<f32> = d[..3].iter().map(|v| v.to_f32() * 80.0).collect();
@@ -1043,7 +1075,79 @@ mod combined_luminance_tests {
         let out = img.luminance_controlled(LuminanceControl {
             scale_max: Some(400.0),
             cap: None,
+            tone_map: None,
         });
         assert_eq!(out.encoding.luminances.unwrap().max, 160.0);
+    }
+}
+
+#[cfg(test)]
+mod tone_map_tests {
+    use super::*;
+    use crate::color::{
+        bt2390_eetf, ColorEncoding, LuminanceControl, Luminances, PrimaryVolume, Tf,
+    };
+
+    #[test]
+    fn eetf_endpoints_and_monotonicity() {
+        let f = bt2390_eetf(1000.0, 400.0);
+        // Source peak maps to the target peak.
+        assert!((f(1000.0) - 400.0).abs() < 1.0, "peak -> {}", f(1000.0));
+        // Dark values are essentially untouched (below the knee).
+        assert!((f(10.0) - 10.0).abs() < 0.1, "10 -> {}", f(10.0));
+        assert!((f(80.0) - 80.0).abs() < 1.0, "80 -> {}", f(80.0));
+        // Monotonic.
+        let mut prev = 0.0;
+        for i in 0..=100 {
+            let v = f(i as f32 * 10.0);
+            assert!(v >= prev - 1e-3, "non-monotonic at {i}");
+            prev = v;
+        }
+        // Identity when target covers the source.
+        let id = bt2390_eetf(400.0, 1000.0);
+        assert_eq!(id(123.0), 123.0);
+    }
+
+    #[test]
+    fn tone_map_compresses_and_preserves_hue() {
+        // scRGB: a saturated orange highlight at 800 nits peak channel and
+        // a dark pixel. Tone-map to 400.
+        let img = DecodedImage {
+            width: 1,
+            height: 2,
+            pixels: Pixels::RgbaF16(
+                [10.0f32, 5.0, 1.0, 1.0, 0.5, 0.25, 0.125, 1.0]
+                    .iter()
+                    .map(|&v| f16::from_f32(v))
+                    .collect(),
+            ),
+            encoding: ColorEncoding {
+                tf: Tf::Linear,
+                primaries: PrimaryVolume::Srgb,
+                luminances: Some(Luminances {
+                    min: 0.0,
+                    max: 10000.0,
+                    reference: 80.0,
+                }),
+            },
+            has_alpha: false,
+        };
+        let out = img.luminance_controlled(LuminanceControl {
+            scale_max: None,
+            tone_map: Some(400.0),
+            cap: None,
+        });
+        let Pixels::RgbaF16(d) = &out.pixels else { panic!() };
+        let v: Vec<f32> = d.iter().map(|x| x.to_f32()).collect();
+        // Bright pixel compressed below target: max channel ≤ 400 nits.
+        let max_nits = v[0].max(v[1]).max(v[2]) * 80.0;
+        assert!(max_nits <= 400.5, "max {max_nits}");
+        // Hue preserved: channel ratios unchanged (max-RGB scaling).
+        assert!((v[1] / v[0] - 0.5).abs() < 1e-3, "g/r = {}", v[1] / v[0]);
+        assert!((v[2] / v[0] - 0.1).abs() < 1e-3, "b/r = {}", v[2] / v[0]);
+        // Dark pixel (40 nits, far below the knee) untouched.
+        assert!((v[4] - 0.5).abs() < 2e-3, "dark r = {}", v[4]);
+        // Declared ceiling = tone target.
+        assert_eq!(out.encoding.luminances.unwrap().max, 400.0);
     }
 }

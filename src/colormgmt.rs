@@ -10,11 +10,13 @@ use wayland_client::{
     globals::GlobalList, Connection, Dispatch, Proxy, QueueHandle, WEnum,
 };
 use wayland_protocols::wp::color_management::v1::client::{
+    wp_color_management_surface_feedback_v1::{self, WpColorManagementSurfaceFeedbackV1},
     wp_color_management_surface_v1::WpColorManagementSurfaceV1,
     wp_color_manager_v1::{
         self, Feature, Primaries, RenderIntent, TransferFunction, WpColorManagerV1,
     },
     wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1,
+    wp_image_description_info_v1::{self, WpImageDescriptionInfoV1},
     wp_image_description_v1::{self, WpImageDescriptionV1},
 };
 
@@ -153,6 +155,23 @@ impl ColorState {
         Ok(())
     }
 
+    /// Subscribe to the preferred image description for `surface` (which
+    /// follows the output it sits on) and fire the first query. The
+    /// resolved target luminance lands in [`App::tone_targets`] keyed by
+    /// `output`; `preferred_changed` re-queries.
+    pub fn watch_preferred(
+        &self,
+        qh: &QueueHandle<App>,
+        surface: &wayland_client::protocol::wl_surface::WlSurface,
+        output: String,
+    ) -> WpColorManagementSurfaceFeedbackV1 {
+        let fb = self
+            .manager
+            .get_surface_feedback(surface, qh, FeedbackData(output));
+        query_preferred(&fb, qh);
+        fb
+    }
+
     /// Wrap `surface` and attach `desc` with the chosen intent.
     pub fn tag_surface(
         &self,
@@ -248,6 +267,94 @@ impl Dispatch<WpImageDescriptionV1, DescStatus> for App {
             Event::Failed { cause, msg } => {
                 tracing::error!(?cause, msg, id = desc.id().protocol_id(), "image description failed");
                 *status.lock().unwrap() = Status::Failed(msg);
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---- preferred-description feedback (for --tone-map auto) ----
+
+/// User data carrying the output name a feedback/info object reports for.
+#[derive(Debug, Clone)]
+pub struct FeedbackData(pub String);
+
+/// Issue (or re-issue) the preferred-description query on a feedback
+/// object: get_preferred_parametric → get_information; the description
+/// object itself is discarded once the info request is in flight.
+fn query_preferred(fb: &WpColorManagementSurfaceFeedbackV1, qh: &QueueHandle<App>) {
+    let output = fb.data::<FeedbackData>().unwrap().clone();
+    let desc = fb.get_preferred_parametric(qh, output.clone());
+    desc.get_information(qh, output);
+    desc.destroy();
+}
+
+impl Dispatch<WpColorManagementSurfaceFeedbackV1, FeedbackData> for App {
+    fn event(
+        _: &mut App,
+        fb: &WpColorManagementSurfaceFeedbackV1,
+        event: wp_color_management_surface_feedback_v1::Event,
+        _: &FeedbackData,
+        _: &Connection,
+        qh: &QueueHandle<App>,
+    ) {
+        use wp_color_management_surface_feedback_v1::Event;
+        if matches!(event, Event::PreferredChanged { .. }) {
+            // Output HDR mode changed (or the surface moved outputs);
+            // re-resolve. Already-treated images are not re-targeted
+            // mid-flight — restart picks up the new target.
+            query_preferred(fb, qh);
+        }
+    }
+}
+
+// The preferred description object: ready/failed don't matter, only the
+// info derived from it. Distinguished from owned descriptions by the
+// user-data type.
+impl Dispatch<WpImageDescriptionV1, FeedbackData> for App {
+    fn event(
+        _: &mut App,
+        _: &WpImageDescriptionV1,
+        _: wp_image_description_v1::Event,
+        _: &FeedbackData,
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+    }
+}
+
+impl Dispatch<WpImageDescriptionInfoV1, FeedbackData> for App {
+    fn event(
+        state: &mut App,
+        _: &WpImageDescriptionInfoV1,
+        event: wp_image_description_info_v1::Event,
+        data: &FeedbackData,
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+        use wp_image_description_info_v1::Event;
+        let output = &data.0;
+        match event {
+            Event::TargetMaxCll { max_cll } => {
+                state.pending_targets.entry(output.clone()).or_default().0 =
+                    Some(max_cll as f64);
+            }
+            Event::TargetLuminance { max_lum, .. } => {
+                state.pending_targets.entry(output.clone()).or_default().1 =
+                    Some(max_lum as f64);
+            }
+            Event::Done => {
+                let (cll, lum_max) =
+                    state.pending_targets.remove(output).unwrap_or_default();
+                // max_cll is the tighter "content light level the display
+                // handles" bound when present; target_luminance.max is
+                // always sent.
+                if let Some(target) = cll.or(lum_max) {
+                    tracing::info!(output, target_nits = target, "output tone-map target");
+                    state.tone_targets.insert(output.clone(), target);
+                } else {
+                    tracing::warn!(output, "preferred description had no target luminance");
+                }
             }
             _ => {}
         }

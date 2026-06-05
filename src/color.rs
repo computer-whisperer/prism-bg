@@ -189,32 +189,68 @@ pub fn pq_oetf(y: f32) -> f32 {
 /// declare absurd peaks). Values are target nits; applied to linear and PQ
 /// sources in absolute luminance, before anything else sees the pixels.
 ///
-/// The two stages compose, scale first: `scale_max` normalizes the whole
-/// image so its measured peak lands at most there (preserving highlight
-/// structure), then `cap` hard-clips whatever still exceeds it — the
-/// "color is sane but the white peaks are crazy" recipe is a generous
-/// scale plus a tight cap.
+/// The stages compose in order: `scale_max` normalizes the whole image so
+/// its measured peak lands at most there (preserving highlight structure),
+/// `tone_map` compresses what remains above the target through the
+/// BT.2390 EETF (knee + roll-off, hue-preserving), and `cap` hard-clips
+/// anything still left. The "color is sane but the white peaks are crazy"
+/// recipe is a generous scale plus a tight cap; the automatic remaster is
+/// `tone_map` alone.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct LuminanceControl {
     /// Scale linearly so the content peak lands at most here (no-op when
     /// already below).
     pub scale_max: Option<f64>,
-    /// Hard-clip channels above this many nits (after scaling).
+    /// Compress to this display peak via the BT.2390 EETF (resolved nits;
+    /// `--tone-map auto` resolves from the output's preferred description
+    /// before this struct is built).
+    pub tone_map: Option<f64>,
+    /// Hard-clip channels above this many nits (last).
     pub cap: Option<f64>,
 }
 
 impl LuminanceControl {
     pub fn is_empty(&self) -> bool {
-        self.scale_max.is_none() && self.cap.is_none()
+        self.scale_max.is_none() && self.tone_map.is_none() && self.cap.is_none()
     }
 
     /// Stable hash key (f64 isn't Eq) for image deduplication. Zero bits
     /// can't collide with a real value — nits are validated positive.
-    pub fn key(&self) -> (u64, u64) {
+    pub fn key(&self) -> (u64, u64, u64) {
         (
             self.scale_max.map_or(0, f64::to_bits),
+            self.tone_map.map_or(0, f64::to_bits),
             self.cap.map_or(0, f64::to_bits),
         )
+    }
+}
+
+/// BT.2390 EETF: map luminance mastered up to `src_peak` nits onto a
+/// display peaking at `target` nits. Identity below the knee
+/// (KS = 1.5·maxLum − 0.5 in normalized PQ), Hermite-spline roll-off
+/// above it. Returns a nits → nits function; identity when
+/// `target ≥ src_peak`.
+pub fn bt2390_eetf(src_peak: f32, target: f32) -> impl Fn(f32) -> f32 {
+    let src_max_pq = pq_oetf(src_peak / 10000.0);
+    let max_lum = (pq_oetf(target / 10000.0) / src_max_pq).min(1.0);
+    let ks = 1.5 * max_lum - 0.5;
+    let noop = target >= src_peak;
+    move |nits: f32| {
+        if noop {
+            return nits;
+        }
+        let e1 = pq_oetf(nits.max(0.0) / 10000.0) / src_max_pq;
+        let e2 = if e1 < ks {
+            e1
+        } else {
+            // Hermite spline P(E1) per BT.2390-8 §5.4.1.
+            let t = (e1 - ks) / (1.0 - ks);
+            let (t2, t3) = (t * t, t * t * t);
+            (2.0 * t3 - 3.0 * t2 + 1.0) * ks
+                + (t3 - 2.0 * t2 + t) * (1.0 - ks)
+                + (-2.0 * t3 + 3.0 * t2) * max_lum
+        };
+        pq_eotf(e2 * src_max_pq) * 10000.0
     }
 }
 

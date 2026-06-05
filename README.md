@@ -58,6 +58,12 @@ Extras beyond swaybg (also per-output-group):
   absolute nits on linear and PQ sources, update the declared luminance
   maximum to the honest post-treatment ceiling (the measured peak, even
   when nothing changed), and warn+pass-through on SDR images.
+- `--tone-map <nits|auto>` — remaster HDR content to a display peak with
+  the BT.2390 EETF (knee + Hermite roll-off in PQ space, applied max-RGB
+  so hue survives). `auto` resolves the target per output from the
+  compositor's preferred image description (`target_max_cll`, falling
+  back to the target luminance) — the same numbers prism derives from
+  its HDR config and EDID. Runs between scale and cap.
 - `--intent perceptual|relative|absolute` (default perceptual).
 - `--no-color-management` (debug escape hatch).
 
