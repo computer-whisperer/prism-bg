@@ -23,8 +23,12 @@ pipeline renders it correctly on every output, SDR or HDR.
   reference white.
 - **Pixels ship at full fidelity.** 8-bit sRGB-ish sources stay 8-bit;
   anything wider (16-bit PNG, 10-bit AVIF, JXL, EXR) rides fp16 shm
-  buffers (`Abgr16161616f`), premultiplied electrical. Compositors
-  without fp16 shm get a quantized 8-bit fallback.
+  buffers (`Abgr16161616f`), premultiplied electrical. Without fp16 shm
+  the buffer degrades along a ladder: 16-bit unorm (`Abgr16161616`) —
+  PQ-encoding linear HDR content so the luminance range survives intact
+  (the KWin path: real HDR, no fp16) — then 8-bit. The compositor's
+  named-TF vocabulary is negotiated the same way (KWin dropped the
+  deprecated `srgb` TF; pixels re-encode to gamma 2.2 there).
 - **No client-side resampling.** Every mode except `tile` submits the
   image at native resolution and lets `wp_viewport` describe the crop and
   size; prism scales in linear-light fp16, which is gamma-correct —

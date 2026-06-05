@@ -23,12 +23,15 @@ use half::f16;
 use crate::cms;
 use crate::color::{ColorEncoding, Tf};
 
-/// Wire pixel formats — exactly the two wl_shm formats prism accepts
-/// beyond BGRA: `Abgr8888` (RGBA bytes) and `Abgr16161616f` (RGBA halfs).
-/// Premultiplied alpha, tightly packed.
+/// Wire pixel formats. Decoding produces `Rgba8` (`Abgr8888`) or `RgbaF16`
+/// (`Abgr16161616f`); `Rgba16` (`Abgr16161616`, 16-bit unorm) only appears
+/// via capability adaptation, for compositors with deep integer buffers
+/// but no fp16 shm (KWin). Premultiplied alpha, tightly packed, RGBA
+/// memory order.
 #[derive(Debug, Clone)]
 pub enum Pixels {
     Rgba8(Vec<u8>),
+    Rgba16(Vec<u16>),
     RgbaF16(Vec<f16>),
 }
 
@@ -49,6 +52,14 @@ impl DecodedImage {
     /// Values above 1.0 clip to reference white. Display-referred TFs just
     /// clamp and keep their tag.
     pub fn quantized_to_8bit(&self, target_tf: Tf) -> DecodedImage {
+        if let Pixels::Rgba16(d) = &self.pixels {
+            // Already display-referred unorm (adaptation output); just
+            // drop precision.
+            return DecodedImage {
+                pixels: Pixels::Rgba8(d.iter().map(|&v| (v >> 8) as u8).collect()),
+                ..self.clone()
+            };
+        }
         let Pixels::RgbaF16(d) = &self.pixels else {
             return self.clone();
         };
@@ -128,6 +139,22 @@ impl DecodedImage {
                 }
                 Pixels::Rgba8(out)
             }
+            Pixels::Rgba16(d) => {
+                let mut out = Vec::with_capacity(d.len());
+                for px in d.chunks_exact(4) {
+                    let a = px[3] as f32 / 65535.0;
+                    for &c in &px[..3] {
+                        let v = if a > 0.0 {
+                            convert(c as f32 / 65535.0 / a) * a
+                        } else {
+                            0.0
+                        };
+                        out.push((v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16);
+                    }
+                    out.push(px[3]);
+                }
+                Pixels::Rgba16(out)
+            }
             Pixels::RgbaF16(d) => {
                 let mut out = Vec::with_capacity(d.len());
                 for px in d.chunks_exact(4) {
@@ -154,6 +181,68 @@ impl DecodedImage {
                 // don't survive the conversion (linear sources clipped).
                 luminances: None,
             },
+            ..self.clone()
+        }
+    }
+
+    /// Repack fp16 pixels into 16-bit unorm (`Abgr16161616`) for
+    /// compositors with deep integer shm but no fp16 (KWin). Electrical
+    /// content ([0,1] by definition) converts losslessly-for-display;
+    /// linear HDR content PQ-encodes (perceptually transparent at 16 bits,
+    /// preserving the full luminance range — this is the path that keeps
+    /// HDR alive without fp16) or, without compositor PQ support, falls
+    /// back to `sdr_tf` with highlights clipped at reference white.
+    pub fn repacked_unorm16(&self, pq_supported: bool, sdr_tf: Tf) -> DecodedImage {
+        let Pixels::RgbaF16(d) = &self.pixels else {
+            return self.clone();
+        };
+        let q = |v: f32| (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+        let linear = self.encoding.tf == Tf::Linear;
+        // 1.0 in linear content = this many cd/m² (scRGB 80, scene-linear
+        // 203 — always set by the decoders that produce Tf::Linear).
+        let ref_nits = self
+            .encoding
+            .luminances
+            .map(|l| l.reference)
+            .unwrap_or(80.0) as f32;
+
+        let (convert, encoding): (Box<dyn Fn(f32) -> f32>, _) = if !linear {
+            // Electrical signal already; just requantize.
+            (Box::new(|v: f32| v), self.encoding)
+        } else if pq_supported {
+            (
+                Box::new(move |v: f32| crate::color::pq_oetf(v.max(0.0) * ref_nits / 10000.0)),
+                ColorEncoding {
+                    tf: Tf::Pq,
+                    primaries: self.encoding.primaries,
+                    luminances: None,
+                },
+            )
+        } else {
+            (
+                Box::new(move |v: f32| sdr_tf.oetf(v.clamp(0.0, 1.0))),
+                ColorEncoding {
+                    tf: sdr_tf,
+                    primaries: self.encoding.primaries,
+                    luminances: None,
+                },
+            )
+        };
+
+        let mut out = Vec::with_capacity(d.len());
+        for px in d.chunks_exact(4) {
+            let a = px[3].to_f32().clamp(0.0, 1.0);
+            for &c in &px[..3] {
+                // Through straight alpha: transform the straight value,
+                // re-premultiply the encoded result.
+                let v = if a > 0.0 { convert(c.to_f32() / a) * a } else { 0.0 };
+                out.push(q(v));
+            }
+            out.push(q(a));
+        }
+        DecodedImage {
+            pixels: Pixels::Rgba16(out),
+            encoding,
             ..self.clone()
         }
     }
@@ -432,6 +521,14 @@ mod jxr_probe {
                     }
                 }
             }
+            super::Pixels::Rgba16(d) => {
+                for px in d.chunks_exact(4) {
+                    for &c in &px[..3] {
+                        let v = c as f32 / 65535.0;
+                        mn = mn.min(v); mx = mx.max(v); sum += v as f64; n += 1;
+                    }
+                }
+            }
             super::Pixels::RgbaF16(d) => {
                 for px in d.chunks_exact(4) {
                     for &c in &px[..3] {
@@ -570,5 +667,97 @@ mod reencode_tests {
         assert_eq!(q.encoding.tf, Tf::Gamma22);
         let Pixels::Rgba8(d) = &q.pixels else { panic!() };
         assert_eq!(&d[..], &[186, 0, 255, 255]);
+    }
+}
+
+#[cfg(test)]
+mod repack_tests {
+    use super::*;
+    use crate::color::{pq_eotf, ColorEncoding, Luminances, PrimaryVolume, Tf};
+
+    fn scrgb(vals: [f32; 4]) -> DecodedImage {
+        DecodedImage {
+            width: 1,
+            height: 1,
+            pixels: Pixels::RgbaF16(vals.iter().map(|&v| f16::from_f32(v)).collect()),
+            encoding: ColorEncoding {
+                tf: Tf::Linear,
+                primaries: PrimaryVolume::Srgb,
+                luminances: Some(Luminances {
+                    min: 0.0,
+                    max: 10000.0,
+                    reference: 80.0,
+                }),
+            },
+            has_alpha: false,
+        }
+    }
+
+    #[test]
+    fn linear_with_pq_keeps_absolute_luminance() {
+        // scRGB 1.0 = 80 nits; 5.0 = 400 nits. PQ round-trip must recover
+        // the nits (16-bit unorm + PQ is ~perceptually lossless).
+        let img = scrgb([1.0, 5.0, 0.0, 1.0]);
+        let out = img.repacked_unorm16(true, Tf::Gamma22);
+        assert_eq!(out.encoding.tf, Tf::Pq);
+        assert_eq!(out.encoding.primaries, PrimaryVolume::Srgb);
+        let Pixels::Rgba16(d) = &out.pixels else { panic!() };
+        let nits = |v: u16| pq_eotf(v as f32 / 65535.0) * 10000.0;
+        assert!((nits(d[0]) - 80.0).abs() < 0.1, "got {}", nits(d[0]));
+        assert!((nits(d[1]) - 400.0).abs() < 0.5, "got {}", nits(d[1]));
+        assert_eq!(d[2], 0);
+        assert_eq!(d[3], 65535);
+    }
+
+    #[test]
+    fn linear_without_pq_clips_to_sdr() {
+        // 0.5 linear → gamma2.2-encoded; 5.0 clips to 1.0.
+        let img = scrgb([0.5, 5.0, 0.0, 1.0]);
+        let out = img.repacked_unorm16(false, Tf::Gamma22);
+        assert_eq!(out.encoding.tf, Tf::Gamma22);
+        let Pixels::Rgba16(d) = &out.pixels else { panic!() };
+        let expect = (0.5f32.powf(1.0 / 2.2) * 65535.0 + 0.5) as u16;
+        assert_eq!(d[0], expect);
+        assert_eq!(d[1], 65535);
+    }
+
+    #[test]
+    fn electrical_fp16_requantizes_verbatim() {
+        // PQ-encoded fp16 (HDR AVIF/JXL path): signal is [0,1] electrical,
+        // repack must not touch the values or the tag.
+        let img = DecodedImage {
+            width: 1,
+            height: 1,
+            pixels: Pixels::RgbaF16(
+                [0.25f32, 0.5, 0.75, 1.0]
+                    .iter()
+                    .map(|&v| f16::from_f32(v))
+                    .collect(),
+            ),
+            encoding: ColorEncoding {
+                tf: Tf::Pq,
+                primaries: PrimaryVolume::Bt2020,
+                luminances: None,
+            },
+            has_alpha: false,
+        };
+        let out = img.repacked_unorm16(true, Tf::Gamma22);
+        assert_eq!(out.encoding.tf, Tf::Pq);
+        let Pixels::Rgba16(d) = &out.pixels else { panic!() };
+        assert_eq!(d[0], (0.25 * 65535.0 + 0.5) as u16);
+        assert_eq!(d[1], (0.5 * 65535.0 + 0.5) as u16);
+        assert_eq!(d[3], 65535);
+    }
+
+    #[test]
+    fn pq_oetf_eotf_roundtrip() {
+        for nits in [0.0f32, 0.1, 1.0, 80.0, 203.0, 1000.0, 10000.0] {
+            let e = crate::color::pq_oetf(nits / 10000.0);
+            let back = pq_eotf(e) * 10000.0;
+            assert!(
+                (back - nits).abs() < nits.max(1.0) * 1e-3,
+                "{nits} -> {e} -> {back}"
+            );
+        }
     }
 }

@@ -98,6 +98,8 @@ fn shm_format(img: &DecodedImage, wire: WireRgb8) -> wl_shm::Format {
         // RGBA byte order == DRM/shm ABGR little-endian.
         (Pixels::Rgba8(_), WireRgb8::Abgr) => wl_shm::Format::Abgr8888,
         (Pixels::Rgba8(_), WireRgb8::ArgbSwizzled) => wl_shm::Format::Argb8888,
+        // Rgba16 is only produced when the compositor advertised it.
+        (Pixels::Rgba16(_), _) => wl_shm::Format::Abgr16161616,
         (Pixels::RgbaF16(_), _) => wl_shm::Format::Abgr16161616f,
     }
 }
@@ -105,13 +107,14 @@ fn shm_format(img: &DecodedImage, wire: WireRgb8) -> wl_shm::Format {
 fn bytes_per_pixel(img: &DecodedImage) -> usize {
     match img.pixels {
         Pixels::Rgba8(_) => 4,
-        Pixels::RgbaF16(_) => 8,
+        Pixels::Rgba16(_) | Pixels::RgbaF16(_) => 8,
     }
 }
 
 fn pixel_bytes(img: &DecodedImage) -> &[u8] {
     match &img.pixels {
         Pixels::Rgba8(d) => d,
+        Pixels::Rgba16(d) => bytemuck::cast_slice(d),
         Pixels::RgbaF16(d) => bytemuck::cast_slice(d),
     }
 }

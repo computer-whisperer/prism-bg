@@ -118,22 +118,29 @@ fn main() -> Result<()> {
     }
 }
 
-/// Adapt loaded images to what the compositor can actually take:
-/// - without fp16 shm (`Abgr16161616f`), quantize to 8-bit;
-/// - when an image's TF isn't in the compositor's named-TF vocabulary,
-///   re-encode the pixels to one that is. KWin notably dropped the
-///   protocol-deprecated `srgb`, so plain sRGB images re-encode to
-///   gamma 2.2 there; linear sources clip at reference white when
-///   `ext_linear` is missing. PQ is never converted — failing loudly
-///   beats silently tone-mapping HDR.
+/// Adapt loaded images to what the compositor can actually take.
+///
+/// Two independent axes, in order:
+/// 1. **TF vocabulary** — when an image's TF isn't advertised, re-encode
+///    the pixels to one that is (KWin dropped the protocol-deprecated
+///    `srgb`, so plain sRGB re-encodes to gamma 2.2 there). Linear sources
+///    clip at reference white when `ext_linear` is missing; PQ without
+///    compositor PQ fails loudly rather than tone-mapping client-side.
+/// 2. **Buffer container** — fp16 shm (`Abgr16161616f`) when advertised;
+///    else 16-bit unorm (`Abgr16161616`), PQ-encoding linear HDR content
+///    so the luminance range survives (the KWin path — real HDR, no
+///    fp16); else quantize to 8-bit.
 fn adapt_images_to_caps(app: &mut App) -> Result<()> {
     use crate::color::Tf;
     use smithay_client_toolkit::shm::ShmHandler as _;
+    use wayland_client::protocol::wl_shm::Format;
 
-    let fp16_ok = app
-        .shm_state()
-        .formats()
-        .contains(&wayland_client::protocol::wl_shm::Format::Abgr16161616f);
+    let formats = app.shm_state().formats().to_vec();
+    // PRISM_BG_FORCE_NO_FP16=1 pretends fp16 shm is missing, to exercise
+    // the unorm16/8-bit ladder on compositors that do support it.
+    let fp16_ok = formats.contains(&Format::Abgr16161616f)
+        && std::env::var_os("PRISM_BG_FORCE_NO_FP16").is_none();
+    let unorm16_ok = formats.contains(&Format::Abgr16161616);
 
     // The display-referred TF we re-encode into when we must. Preference
     // order keeps pixels untouched on compositors that accept sRGB.
@@ -147,43 +154,65 @@ fn adapt_images_to_caps(app: &mut App) -> Result<()> {
     };
 
     for (path, loaded) in app.images.iter_mut() {
-        if !fp16_ok && matches!(loaded.image.pixels, decode::Pixels::RgbaF16(_)) {
+        // Axis 1: TF vocabulary (before any container change, while the
+        // pixels still carry full precision).
+        if let Some(color) = &app.color {
+            let tf = loaded.image.encoding.tf;
+            if !color.supports_tf(tf) {
+                match tf {
+                    Tf::Srgb | Tf::Gamma22 | Tf::Bt1886 | Tf::Linear => {
+                        let target =
+                            sdr_tf.context("compositor supports no display-referred TF")?;
+                        if tf == Tf::Linear {
+                            tracing::warn!(
+                                path = %path.display(),
+                                ?target,
+                                "compositor lacks ext_linear; re-encoding (HDR clips at \
+                                 reference white)"
+                            );
+                        } else {
+                            tracing::info!(
+                                path = %path.display(),
+                                from = ?tf,
+                                to = ?target,
+                                "re-encoding to a TF the compositor supports"
+                            );
+                        }
+                        loaded.image = Arc::new(loaded.image.reencoded_tf(target));
+                    }
+                    Tf::Pq => anyhow::bail!(
+                        "{}: compositor does not support the PQ transfer function",
+                        path.display()
+                    ),
+                }
+            }
+        }
+
+        // Axis 2: buffer container.
+        if fp16_ok || !matches!(loaded.image.pixels, decode::Pixels::RgbaF16(_)) {
+            continue;
+        }
+        if unorm16_ok {
+            let pq_ok = app
+                .color
+                .as_ref()
+                .is_some_and(|c| c.supports_tf(Tf::Pq));
+            let target = sdr_tf.context("compositor supports no display-referred TF")?;
+            let hdr = loaded.image.encoding.tf == Tf::Linear;
+            tracing::info!(
+                path = %path.display(),
+                pq = pq_ok && hdr,
+                "compositor lacks fp16 shm; repacking as 16-bit unorm"
+            );
+            loaded.image = Arc::new(loaded.image.repacked_unorm16(pq_ok, target));
+        } else {
             let target = sdr_tf.context("compositor supports no display-referred TF")?;
             tracing::warn!(
                 path = %path.display(),
                 ?target,
-                "compositor lacks fp16 shm buffers; quantizing to 8-bit"
+                "compositor lacks fp16 and 16-bit shm; quantizing to 8-bit"
             );
             loaded.image = Arc::new(loaded.image.quantized_to_8bit(target));
-        }
-        let Some(color) = &app.color else { continue };
-        let tf = loaded.image.encoding.tf;
-        if color.supports_tf(tf) {
-            continue;
-        }
-        match tf {
-            Tf::Srgb | Tf::Gamma22 | Tf::Bt1886 | Tf::Linear => {
-                let target = sdr_tf.context("compositor supports no display-referred TF")?;
-                if tf == Tf::Linear {
-                    tracing::warn!(
-                        path = %path.display(),
-                        ?target,
-                        "compositor lacks ext_linear; re-encoding (HDR clips at reference white)"
-                    );
-                } else {
-                    tracing::info!(
-                        path = %path.display(),
-                        from = ?tf,
-                        to = ?target,
-                        "re-encoding to a TF the compositor supports"
-                    );
-                }
-                loaded.image = Arc::new(loaded.image.reencoded_tf(target));
-            }
-            Tf::Pq => anyhow::bail!(
-                "{}: compositor does not support the PQ transfer function",
-                path.display()
-            ),
         }
     }
     Ok(())

@@ -170,6 +170,34 @@ impl Tf {
     }
 }
 
+/// ST 2084 PQ inverse EOTF. `y` is display luminance normalized to 10000
+/// cd/m² (i.e. nits/10000), result is the PQ electrical signal in [0, 1].
+/// Used to repack linear HDR content into integer buffers on compositors
+/// without fp16 shm — PQ is perceptually transparent at ≥12 bits.
+pub fn pq_oetf(y: f32) -> f32 {
+    const M1: f32 = 2610.0 / 16384.0;
+    const M2: f32 = 2523.0 / 4096.0 * 128.0;
+    const C1: f32 = 3424.0 / 4096.0;
+    const C2: f32 = 2413.0 / 4096.0 * 32.0;
+    const C3: f32 = 2392.0 / 4096.0 * 32.0;
+    let y = y.clamp(0.0, 1.0);
+    let ym = y.powf(M1);
+    ((C1 + C2 * ym) / (1.0 + C3 * ym)).powf(M2)
+}
+
+/// ST 2084 PQ EOTF (inverse of [`pq_oetf`]); for tests.
+#[cfg(test)]
+pub fn pq_eotf(e: f32) -> f32 {
+    const M1: f32 = 2610.0 / 16384.0;
+    const M2: f32 = 2523.0 / 4096.0 * 128.0;
+    const C1: f32 = 3424.0 / 4096.0;
+    const C2: f32 = 2413.0 / 4096.0 * 32.0;
+    const C3: f32 = 2392.0 / 4096.0 * 32.0;
+    let e = e.clamp(0.0, 1.0);
+    let em = e.powf(1.0 / M2);
+    ((em - C1).max(0.0) / (C2 - C3 * em)).powf(1.0 / M1)
+}
+
 /// Map CICP code points (H.273) to a [`ColorEncoding`], for sources that
 /// carry them (PNG `cICP`, JXL, ICC v4.4 `cicp` tag). Returns `None` when
 /// the code points name something we can't express losslessly (we'd rather
