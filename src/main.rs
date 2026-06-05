@@ -34,33 +34,57 @@ fn main() -> Result<()> {
 
     let args = cli::parse(std::env::args().skip(1))?;
 
-    // Decode every referenced image up front (deduplicated by path), before
-    // touching the display — a bad file should fail fast.
+    // Decode every referenced image up front, before touching the display —
+    // a bad file should fail fast. Deduplicated by (path, luminance
+    // treatment): the raw decode is shared, the treated pixels are not.
     let mut images: HashMap<_, _> = HashMap::new();
+    let mut raw_cache: HashMap<&std::path::PathBuf, Arc<decode::DecodedImage>> = HashMap::new();
     for spec in &args.specs {
-        let Some(path) = &spec.image else { continue };
-        if images.contains_key(path) {
+        let Some(key) = app::image_key(spec) else { continue };
+        if images.contains_key(&key) {
             continue;
         }
-        let img = decode::load(path)?;
-        tracing::info!(
-            path = %path.display(),
-            width = img.width,
-            height = img.height,
-            tf = ?img.encoding.tf,
-            primaries = ?img.encoding.primaries,
-            luminances = ?img.encoding.luminances,
-            fp16 = matches!(img.pixels, decode::Pixels::RgbaF16(_)),
-            "image loaded"
-        );
+        let path = spec.image.as_ref().unwrap();
+        let base = match raw_cache.get(path) {
+            Some(img) => img.clone(),
+            None => {
+                let img = Arc::new(decode::load(path)?);
+                tracing::info!(
+                    path = %path.display(),
+                    width = img.width,
+                    height = img.height,
+                    tf = ?img.encoding.tf,
+                    primaries = ?img.encoding.primaries,
+                    luminances = ?img.encoding.luminances,
+                    fp16 = matches!(img.pixels, decode::Pixels::RgbaF16(_)),
+                    "image loaded"
+                );
+                raw_cache.insert(path, img.clone());
+                img
+            }
+        };
+        let image = match spec.luminance {
+            Some(ctrl) => {
+                let treated = base.luminance_controlled(ctrl);
+                tracing::info!(
+                    path = %path.display(),
+                    ?ctrl,
+                    luminances = ?treated.encoding.luminances,
+                    "luminance control applied"
+                );
+                Arc::new(treated)
+            }
+            None => base,
+        };
         images.insert(
-            path.clone(),
+            key,
             LoadedImage {
-                image: Arc::new(img),
+                image,
                 description: None,
             },
         );
     }
+    drop(raw_cache);
 
     let conn = Connection::connect_to_env().context("connecting to Wayland display")?;
     let (globals, mut queue) = registry_queue_init::<App>(&conn)?;
@@ -82,19 +106,19 @@ fn main() -> Result<()> {
     if app.color.is_some() {
         let color = app.color.as_ref().unwrap();
         let mut descriptions = Vec::new();
-        for (path, loaded) in &app.images {
+        for (key, loaded) in &app.images {
             let desc = color
                 .create_description(&qh, &loaded.image.encoding)
-                .with_context(|| format!("describing {}", path.display()))?;
-            descriptions.push((path.clone(), desc));
+                .with_context(|| format!("describing {}", key.0.display()))?;
+            descriptions.push((key.clone(), desc));
         }
-        for (path, desc) in descriptions {
-            app.images.get_mut(&path).unwrap().description = Some(desc);
+        for (key, desc) in descriptions {
+            app.images.get_mut(&key).unwrap().description = Some(desc);
         }
         while !app.descriptions_settled() {
             queue.roundtrip(&mut app).context("waiting for image descriptions")?;
         }
-        for (path, loaded) in &app.images {
+        for ((path, _), loaded) in &app.images {
             if let Some(desc) = &loaded.description {
                 if let Status::Failed(msg) = desc.status() {
                     bail!(
@@ -153,7 +177,7 @@ fn adapt_images_to_caps(app: &mut App) -> Result<()> {
         None => Some(Tf::Srgb),
     };
 
-    for (path, loaded) in app.images.iter_mut() {
+    for ((path, _), loaded) in app.images.iter_mut() {
         // Axis 1: TF vocabulary (before any container change, while the
         // pixels still carry full precision).
         if let Some(color) = &app.color {

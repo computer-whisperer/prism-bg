@@ -46,9 +46,19 @@ prism-bg -o DP-1 -i left.avif -m fill -o DP-2 -c 002030
 
 `-i`/`-m`/`-c` apply to the most recent `-o` (or to all outputs before any
 `-o`). Modes: `stretch` (default), `fit`, `fill`, `center`, `tile`,
-`solid_color`. Extras beyond swaybg: `--intent
-perceptual|relative|absolute` (default perceptual) and
-`--no-color-management` (debug escape hatch).
+`solid_color`.
+
+Extras beyond swaybg (also per-output-group):
+
+- `--cap-luminance <nits>` — hard-clip HDR content above this luminance.
+- `--scale-luminance <nits>` — scale HDR content linearly so its measured
+  peak is at most this (preserves highlight structure; no-op if already
+  below). Both operate in absolute nits on linear and PQ sources, update
+  the declared luminance maximum so compositor tone mapping sees an
+  honest ceiling, and warn+pass-through on SDR images. For HDR
+  wallpapers mastered with absurd peaks.
+- `--intent perceptual|relative|absolute` (default perceptual).
+- `--no-color-management` (debug escape hatch).
 
 Formats: PNG, JPEG, WebP, JPEG XL, AVIF (needs libdav1d), JPEG XR
 (Windows HDR wallpapers/screenshots — scRGB), OpenEXR, Radiance HDR.

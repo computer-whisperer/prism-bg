@@ -44,6 +44,17 @@ use crate::colormgmt::{ColorState, DescriptionHandle};
 use crate::decode::DecodedImage;
 use crate::surfaces::{place, upload, upload_tiled, WireRgb8};
 
+/// Image identity for deduplication: path + luminance treatment (the same
+/// file capped differently for different outputs is different pixels).
+pub type ImageKey = (PathBuf, Option<(u8, u64)>);
+
+/// The dedup key for `spec`'s image, if it has one.
+pub fn image_key(spec: &OutputSpec) -> Option<ImageKey> {
+    spec.image
+        .as_ref()
+        .map(|p| (p.clone(), spec.luminance.map(|l| l.key())))
+}
+
 /// A decoded image plus its (shared) compositor-side description.
 pub struct LoadedImage {
     pub image: Arc<DecodedImage>,
@@ -87,7 +98,7 @@ pub struct App {
     pub color: Option<ColorState>,
     pub intent: Intent,
     pub specs: Vec<OutputSpec>,
-    pub images: HashMap<PathBuf, LoadedImage>,
+    pub images: HashMap<ImageKey, LoadedImage>,
     /// False until main() has created the image descriptions; gates
     /// wallpaper creation for outputs announced during the setup
     /// roundtrips (main sweeps them once descriptions settle).
@@ -102,7 +113,7 @@ impl App {
         globals: &GlobalList,
         qh: &QueueHandle<App>,
         args: &Args,
-        images: HashMap<PathBuf, LoadedImage>,
+        images: HashMap<ImageKey, LoadedImage>,
     ) -> Result<App> {
         let compositor =
             CompositorState::bind(globals, qh).context("wl_compositor not available")?;
@@ -188,9 +199,9 @@ impl App {
         let viewport = self.get_viewport(qh, layer.wl_surface());
 
         let mode = spec.effective_mode();
-        let image_part = match (&spec.image, mode) {
-            (Some(path), m) if m != Mode::SolidColor => {
-                let loaded = &self.images[path];
+        let image_part = match (image_key(&spec), mode) {
+            (Some(key), m) if m != Mode::SolidColor => {
+                let loaded = &self.images[&key];
                 let (subsurface, child) = self
                     .subcompositor
                     .create_subsurface(layer.wl_surface().clone(), qh);

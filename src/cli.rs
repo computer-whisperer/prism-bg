@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 
+use crate::color::LuminanceControl;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Stretch,
@@ -76,6 +78,8 @@ pub struct OutputSpec {
     pub image: Option<PathBuf>,
     pub mode: Option<Mode>,
     pub color: Option<Color>,
+    /// HDR luminance shaping (`--cap-luminance` / `--scale-luminance`).
+    pub luminance: Option<LuminanceControl>,
 }
 
 impl OutputSpec {
@@ -85,6 +89,7 @@ impl OutputSpec {
             image: None,
             mode: None,
             color: None,
+            luminance: None,
         }
     }
 
@@ -117,6 +122,11 @@ Usage: prism-bg <options...>
                          (stretch|fit|fill|center|tile|solid_color).
   -o, --output <name>    Set the output to operate on or * for all,
                          starting a new per-output group.
+      --cap-luminance <nits>
+                         Hard-clip HDR content above this luminance.
+      --scale-luminance <nits>
+                         Scale HDR content linearly so its peak luminance
+                         is at most this (preserves highlight structure).
       --intent <intent>  Rendering intent (perceptual|relative|absolute).
                          Default: perceptual.
       --no-color-management
@@ -162,6 +172,17 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
                 current.color = Some(Color::parse(&value("--color")?)?);
                 current_touched = true;
             }
+            "--cap-luminance" => {
+                current.luminance =
+                    Some(LuminanceControl::Cap(parse_nits(&value("--cap-luminance")?)?));
+                current_touched = true;
+            }
+            "--scale-luminance" => {
+                current.luminance = Some(LuminanceControl::ScaleMax(parse_nits(
+                    &value("--scale-luminance")?,
+                )?));
+                current_touched = true;
+            }
             "--intent" => {
                 intent = match value("--intent")?.as_str() {
                     "perceptual" => Intent::Perceptual,
@@ -202,6 +223,16 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
         intent,
         no_color_management,
     })
+}
+
+fn parse_nits(s: &str) -> Result<f64> {
+    let n: f64 = s
+        .parse()
+        .with_context(|| format!("invalid luminance {s:?} (expected nits)"))?;
+    if !n.is_finite() || n <= 0.0 || n > 10_000.0 {
+        bail!("luminance {n} out of range (0, 10000] cd/m²");
+    }
+    Ok(n)
 }
 
 /// Pick the spec that applies to output `name`: an exact match wins over
@@ -264,5 +295,33 @@ mod tests {
     #[test]
     fn mode_without_image_is_rejected() {
         assert!(parse(["-m", "fill"].iter().map(|s| s.to_string())).is_err());
+    }
+}
+
+#[cfg(test)]
+mod luminance_cli_tests {
+    use super::*;
+
+    #[test]
+    fn luminance_flags_follow_output_groups() {
+        let args = parse(
+            ["-i", "a.jxr", "--cap-luminance", "600", "-o", "DP-2", "-i", "a.jxr",
+             "--scale-luminance", "1000"]
+                .iter()
+                .map(|s| s.to_string()),
+        )
+        .unwrap();
+        assert_eq!(args.specs[0].luminance, Some(LuminanceControl::Cap(600.0)));
+        assert_eq!(
+            args.specs[1].luminance,
+            Some(LuminanceControl::ScaleMax(1000.0))
+        );
+    }
+
+    #[test]
+    fn nits_bounds_are_enforced() {
+        assert!(parse(["-i", "a.png", "--cap-luminance", "0"].iter().map(|s| s.to_string())).is_err());
+        assert!(parse(["-i", "a.png", "--cap-luminance", "20000"].iter().map(|s| s.to_string())).is_err());
+        assert!(parse(["-i", "a.png", "--scale-luminance", "abc"].iter().map(|s| s.to_string())).is_err());
     }
 }

@@ -185,8 +185,29 @@ pub fn pq_oetf(y: f32) -> f32 {
     ((C1 + C2 * ym) / (1.0 + C3 * ym)).powf(M2)
 }
 
-/// ST 2084 PQ EOTF (inverse of [`pq_oetf`]); for tests.
-#[cfg(test)]
+/// User-requested luminance shaping for HDR content (some HDR wallpapers
+/// declare absurd peaks). Values are target nits; applied to linear and PQ
+/// sources in absolute luminance, before anything else sees the pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LuminanceControl {
+    /// Hard-clip channels above this many nits.
+    Cap(f64),
+    /// Scale linearly so the content peak lands at most here (no-op when
+    /// already below; preserves highlight relationships).
+    ScaleMax(f64),
+}
+
+impl LuminanceControl {
+    /// Stable hash key (f64 isn't Eq) for image deduplication.
+    pub fn key(&self) -> (u8, u64) {
+        match self {
+            LuminanceControl::Cap(n) => (0, n.to_bits()),
+            LuminanceControl::ScaleMax(n) => (1, n.to_bits()),
+        }
+    }
+}
+
+/// ST 2084 PQ EOTF (inverse of [`pq_oetf`]).
 pub fn pq_eotf(e: f32) -> f32 {
     const M1: f32 = 2610.0 / 16384.0;
     const M2: f32 = 2523.0 / 4096.0 * 128.0;

@@ -185,6 +185,108 @@ impl DecodedImage {
         }
     }
 
+    /// Apply a user-requested luminance cap/scale (`--cap-luminance` /
+    /// `--scale-luminance`), in absolute nits. Operates on HDR sources:
+    /// Linear (nits = value × declared reference) and PQ (through the PQ
+    /// EOTF). Display-referred SDR content passes through with a warning —
+    /// its luminance is the compositor's business. The declared luminance
+    /// maximum shrinks to the target so downstream tone mapping sees an
+    /// honest ceiling.
+    pub fn luminance_controlled(&self, ctrl: crate::color::LuminanceControl) -> DecodedImage {
+        use crate::color::{pq_eotf, pq_oetf, LuminanceControl, Luminances};
+
+        let (Pixels::RgbaF16(d), Tf::Linear | Tf::Pq) = (&self.pixels, self.encoding.tf)
+        else {
+            tracing::warn!(
+                tf = ?self.encoding.tf,
+                "luminance control has no effect on display-referred SDR content"
+            );
+            return self.clone();
+        };
+
+        // Straight-value channel ↔ nits, per TF.
+        let ref_nits = self
+            .encoding
+            .luminances
+            .map(|l| l.reference)
+            .unwrap_or(80.0) as f32;
+        let pq = self.encoding.tf == Tf::Pq;
+        let nits_of = |v: f32| {
+            if pq {
+                pq_eotf(v) * 10000.0
+            } else {
+                v.max(0.0) * ref_nits
+            }
+        };
+        let v_of = |nits: f32| {
+            if pq {
+                pq_oetf(nits / 10000.0)
+            } else {
+                nits / ref_nits
+            }
+        };
+
+        let target = match ctrl {
+            LuminanceControl::Cap(n) => n,
+            LuminanceControl::ScaleMax(n) => n,
+        } as f32;
+        let scale = match ctrl {
+            LuminanceControl::Cap(_) => 1.0,
+            LuminanceControl::ScaleMax(_) => {
+                // Content peak over straight channel values.
+                let mut peak = 0f32;
+                for px in d.chunks_exact(4) {
+                    let a = px[3].to_f32().clamp(0.0, 1.0);
+                    if a <= 0.0 {
+                        continue;
+                    }
+                    for &c in &px[..3] {
+                        peak = peak.max(nits_of(c.to_f32() / a));
+                    }
+                }
+                tracing::info!(peak_nits = peak, target_nits = target, "content peak measured");
+                if peak <= target {
+                    1.0
+                } else {
+                    target / peak
+                }
+            }
+        };
+
+        let transform = |v: f32| v_of((nits_of(v) * scale).min(target));
+        let mut out = Vec::with_capacity(d.len());
+        for px in d.chunks_exact(4) {
+            let a = px[3].to_f32().clamp(0.0, 1.0);
+            for &c in &px[..3] {
+                // Through straight alpha (cap is non-linear).
+                let v = if a > 0.0 {
+                    transform(c.to_f32() / a) * a
+                } else {
+                    0.0
+                };
+                out.push(f16::from_f32(v));
+            }
+            out.push(px[3]);
+        }
+
+        let old = self.encoding.luminances.unwrap_or(Luminances {
+            min: 0.0,
+            max: 10000.0,
+            reference: if pq { 203.0 } else { 80.0 },
+        });
+        DecodedImage {
+            pixels: Pixels::RgbaF16(out),
+            encoding: ColorEncoding {
+                luminances: Some(Luminances {
+                    max: old.max.min(target as f64),
+                    ..old
+                }),
+                ..self.encoding
+            },
+            ..self.clone()
+        }
+    }
+
     /// Repack fp16 pixels into 16-bit unorm (`Abgr16161616`) for
     /// compositors with deep integer shm but no fp16 (KWin). Electrical
     /// content ([0,1] by definition) converts losslessly-for-display;
@@ -759,5 +861,110 @@ mod repack_tests {
                 "{nits} -> {e} -> {back}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod luminance_tests {
+    use super::*;
+    use crate::color::{
+        pq_eotf, pq_oetf, ColorEncoding, LuminanceControl, Luminances, PrimaryVolume, Tf,
+    };
+
+    fn scrgb(vals: [f32; 4]) -> DecodedImage {
+        DecodedImage {
+            width: 1,
+            height: 1,
+            pixels: Pixels::RgbaF16(vals.iter().map(|&v| f16::from_f32(v)).collect()),
+            encoding: ColorEncoding {
+                tf: Tf::Linear,
+                primaries: PrimaryVolume::Srgb,
+                luminances: Some(Luminances {
+                    min: 0.0,
+                    max: 10000.0,
+                    reference: 80.0,
+                }),
+            },
+            has_alpha: false,
+        }
+    }
+
+    fn rgb_nits(img: &DecodedImage) -> [f32; 3] {
+        let Pixels::RgbaF16(d) = &img.pixels else { panic!() };
+        [
+            d[0].to_f32() * 80.0,
+            d[1].to_f32() * 80.0,
+            d[2].to_f32() * 80.0,
+        ]
+    }
+
+    #[test]
+    fn cap_clips_above_target_only() {
+        // 80 / 400 / 1600 nits, cap at 200.
+        let img = scrgb([1.0, 5.0, 20.0, 1.0]);
+        let out = img.luminance_controlled(LuminanceControl::Cap(200.0));
+        let n = rgb_nits(&out);
+        assert!((n[0] - 80.0).abs() < 0.1, "{n:?}");
+        assert!((n[1] - 200.0).abs() < 0.2, "{n:?}");
+        assert!((n[2] - 200.0).abs() < 0.2, "{n:?}");
+        assert_eq!(out.encoding.luminances.unwrap().max, 200.0);
+    }
+
+    #[test]
+    fn scale_preserves_ratios() {
+        // Peak 1600 nits scaled to 400: everything halves twice.
+        let img = scrgb([1.0, 5.0, 20.0, 1.0]);
+        let out = img.luminance_controlled(LuminanceControl::ScaleMax(400.0));
+        let n = rgb_nits(&out);
+        assert!((n[0] - 20.0).abs() < 0.05, "{n:?}");
+        assert!((n[1] - 100.0).abs() < 0.2, "{n:?}");
+        assert!((n[2] - 400.0).abs() < 0.5, "{n:?}");
+        assert_eq!(out.encoding.luminances.unwrap().max, 400.0);
+    }
+
+    #[test]
+    fn scale_is_noop_below_target() {
+        let img = scrgb([1.0, 2.0, 0.5, 1.0]); // peak 160 nits
+        let out = img.luminance_controlled(LuminanceControl::ScaleMax(400.0));
+        let n = rgb_nits(&out);
+        assert!((n[1] - 160.0).abs() < 0.2, "{n:?}");
+    }
+
+    #[test]
+    fn pq_content_caps_in_absolute_nits() {
+        let sig = |nits: f32| f16::from_f32(pq_oetf(nits / 10000.0));
+        let img = DecodedImage {
+            width: 1,
+            height: 1,
+            pixels: Pixels::RgbaF16(vec![sig(100.0), sig(1000.0), sig(4000.0), f16::ONE]),
+            encoding: ColorEncoding {
+                tf: Tf::Pq,
+                primaries: PrimaryVolume::Bt2020,
+                luminances: None,
+            },
+            has_alpha: false,
+        };
+        let out = img.luminance_controlled(LuminanceControl::Cap(500.0));
+        let Pixels::RgbaF16(d) = &out.pixels else { panic!() };
+        let nits = |v: f16| pq_eotf(v.to_f32()) * 10000.0;
+        assert!((nits(d[0]) - 100.0).abs() < 0.5);
+        assert!((nits(d[1]) - 500.0).abs() < 1.0);
+        assert!((nits(d[2]) - 500.0).abs() < 1.0);
+        assert_eq!(out.encoding.luminances.unwrap().max, 500.0);
+    }
+
+    #[test]
+    fn sdr_content_is_untouched() {
+        let img = DecodedImage {
+            width: 1,
+            height: 1,
+            pixels: Pixels::Rgba8(vec![10, 20, 30, 255]),
+            encoding: ColorEncoding::SRGB,
+            has_alpha: false,
+        };
+        let out = img.luminance_controlled(LuminanceControl::Cap(200.0));
+        assert_eq!(out.encoding, ColorEncoding::SRGB);
+        let Pixels::Rgba8(d) = &out.pixels else { panic!() };
+        assert_eq!(&d[..], &[10, 20, 30, 255]);
     }
 }
