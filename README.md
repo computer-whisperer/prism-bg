@@ -46,8 +46,8 @@ prism-bg -o DP-1 -i left.avif -m fill -o DP-2 -c 002030
 perceptual|relative|absolute` (default perceptual) and
 `--no-color-management` (debug escape hatch).
 
-Formats: PNG, JPEG, WebP, JPEG XL, AVIF (needs libdav1d), OpenEXR,
-Radiance HDR.
+Formats: PNG, JPEG, WebP, JPEG XL, AVIF (needs libdav1d), JPEG XR
+(Windows HDR wallpapers/screenshots — scRGB), OpenEXR, Radiance HDR.
 
 ## Known gaps
 
