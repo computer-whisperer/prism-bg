@@ -6,10 +6,14 @@
 //! Hand-parsed — clap can't express the positional grouping.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
 use crate::color::LuminanceControl;
+
+/// Rotation period when `--image-list` is given without `--rotate-every`.
+pub const DEFAULT_ROTATE_EVERY: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -85,6 +89,16 @@ pub enum ToneMap {
 pub struct OutputSpec {
     pub output: String,
     pub image: Option<PathBuf>,
+    /// Playlist file (`--image-list`): one image path per line, rotated
+    /// on a timer. Mutually exclusive with `image`.
+    pub image_list: Option<PathBuf>,
+    /// Index into `App::playlists`, assigned by `main` after the list
+    /// file is loaded. `None` until then (and always for `-i` specs).
+    pub playlist: Option<usize>,
+    /// `--rotate-every`; `None` means [`DEFAULT_ROTATE_EVERY`].
+    pub rotate_every: Option<Duration>,
+    /// `--randomize`: shuffle the playlist order.
+    pub randomize: bool,
     pub mode: Option<Mode>,
     pub color: Option<Color>,
     /// HDR luminance shaping (`--cap-luminance` / `--scale-luminance`).
@@ -98,6 +112,10 @@ impl OutputSpec {
         OutputSpec {
             output,
             image: None,
+            image_list: None,
+            playlist: None,
+            rotate_every: None,
+            randomize: false,
             mode: None,
             color: None,
             luminance: None,
@@ -108,7 +126,7 @@ impl OutputSpec {
     /// Effective mode: explicit, else stretch with an image (swaybg's
     /// default), else solid color.
     pub fn effective_mode(&self) -> Mode {
-        self.mode.unwrap_or(if self.image.is_some() {
+        self.mode.unwrap_or(if self.image.is_some() || self.image_list.is_some() {
             Mode::Stretch
         } else {
             Mode::SolidColor
@@ -134,6 +152,16 @@ Usage: prism-bg <options...>
                          (stretch|fit|fill|center|tile|solid_color).
   -o, --output <name>    Set the output to operate on or * for all,
                          starting a new per-output group.
+      --image-list <file>
+                         Rotate through the images listed in <file>, one
+                         path per line (relative to the file's directory;
+                         blank lines and # comments ignored). Outputs
+                         sharing the group rotate in lockstep.
+      --rotate-every <duration>
+                         Rotation period for --image-list, e.g. 90s, 15m,
+                         1h (bare number = seconds). Default: 15m.
+      --randomize        Shuffle the playlist order; reshuffles each pass
+                         without immediate repeats.
       --cap-luminance <nits>
                          Hard-clip HDR content above this luminance.
       --scale-luminance <nits>
@@ -183,6 +211,18 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
             }
             "-i" | "--image" => {
                 current.image = Some(PathBuf::from(value("--image")?));
+                current_touched = true;
+            }
+            "--image-list" => {
+                current.image_list = Some(PathBuf::from(value("--image-list")?));
+                current_touched = true;
+            }
+            "--rotate-every" => {
+                current.rotate_every = Some(parse_duration(&value("--rotate-every")?)?);
+                current_touched = true;
+            }
+            "--randomize" => {
+                current.randomize = true;
                 current_touched = true;
             }
             "-m" | "--mode" => {
@@ -243,7 +283,22 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
         bail!("no outputs configured\n{USAGE}");
     }
     for spec in &specs {
-        if spec.effective_mode() != Mode::SolidColor && spec.image.is_none() {
+        if spec.image.is_some() && spec.image_list.is_some() {
+            bail!(
+                "output {:?}: --image and --image-list are mutually exclusive",
+                spec.output
+            );
+        }
+        if (spec.rotate_every.is_some() || spec.randomize) && spec.image_list.is_none() {
+            bail!(
+                "output {:?}: --rotate-every/--randomize require --image-list",
+                spec.output
+            );
+        }
+        if spec.effective_mode() != Mode::SolidColor
+            && spec.image.is_none()
+            && spec.image_list.is_none()
+        {
             bail!(
                 "output {:?}: mode {:?} requires an image",
                 spec.output,
@@ -256,6 +311,24 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
         intent,
         no_color_management,
     })
+}
+
+/// `90s`, `15m`, `1.5h`; a bare number is seconds.
+fn parse_duration(s: &str) -> Result<Duration> {
+    let (num, mult) = match s.as_bytes().last() {
+        Some(b's') => (&s[..s.len() - 1], 1.0),
+        Some(b'm') => (&s[..s.len() - 1], 60.0),
+        Some(b'h') => (&s[..s.len() - 1], 3600.0),
+        _ => (s, 1.0),
+    };
+    let n: f64 = num
+        .parse()
+        .with_context(|| format!("invalid duration {s:?} (expected e.g. 90s, 15m, 1h)"))?;
+    let secs = n * mult;
+    if !secs.is_finite() || secs < 1.0 || secs > 86_400.0 * 365.0 {
+        bail!("duration {s:?} out of range (1s ..= 365 days)");
+    }
+    Ok(Duration::from_secs_f64(secs))
 }
 
 fn parse_nits(s: &str) -> Result<f64> {
@@ -328,6 +401,55 @@ mod tests {
     #[test]
     fn mode_without_image_is_rejected() {
         assert!(parse(["-m", "fill"].iter().map(|s| s.to_string())).is_err());
+    }
+
+    #[test]
+    fn image_list_flags() {
+        let args = parse_ok(&[
+            "--image-list", "walls.txt", "--rotate-every", "90s", "--randomize", "-m", "fill",
+        ]);
+        let spec = &args.specs[0];
+        assert_eq!(spec.image_list.as_deref(), Some(std::path::Path::new("walls.txt")));
+        assert_eq!(spec.rotate_every, Some(Duration::from_secs(90)));
+        assert!(spec.randomize);
+        assert_eq!(spec.effective_mode(), Mode::Fill);
+    }
+
+    #[test]
+    fn image_list_defaults_to_stretch() {
+        let args = parse_ok(&["--image-list", "walls.txt"]);
+        assert_eq!(args.specs[0].effective_mode(), Mode::Stretch);
+        assert_eq!(args.specs[0].rotate_every, None); // default applied in main
+    }
+
+    #[test]
+    fn duration_suffixes() {
+        let parse_dur = |d: &str| {
+            parse(["--image-list", "w.txt", "--rotate-every", d].iter().map(|s| s.to_string()))
+                .map(|a| a.specs[0].rotate_every.unwrap())
+        };
+        assert_eq!(parse_dur("300").unwrap(), Duration::from_secs(300));
+        assert_eq!(parse_dur("15m").unwrap(), Duration::from_secs(900));
+        assert_eq!(parse_dur("1.5h").unwrap(), Duration::from_secs(5400));
+        assert!(parse_dur("0").is_err());
+        assert!(parse_dur("nope").is_err());
+    }
+
+    #[test]
+    fn image_and_image_list_are_mutually_exclusive() {
+        assert!(parse(
+            ["-i", "a.png", "--image-list", "w.txt"].iter().map(|s| s.to_string())
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rotate_flags_require_image_list() {
+        assert!(parse(["-i", "a.png", "--randomize"].iter().map(|s| s.to_string())).is_err());
+        assert!(parse(
+            ["-i", "a.png", "--rotate-every", "5m"].iter().map(|s| s.to_string())
+        )
+        .is_err());
     }
 }
 

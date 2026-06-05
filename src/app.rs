@@ -4,7 +4,7 @@
 //! (viewport) and all color conversion (each image surface is tagged with
 //! its source description via `wp_color_management_v1`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -42,6 +42,7 @@ use wayland_protocols::wp::viewporter::client::{
 use crate::cli::{Args, Color, Intent, Mode, OutputSpec};
 use crate::colormgmt::{ColorState, DescriptionHandle, Status};
 use crate::decode::DecodedImage;
+use crate::playlist::Playlist;
 use crate::surfaces::{place, upload, upload_tiled, WireRgb8};
 
 /// Image identity for deduplication: path + effective luminance treatment
@@ -70,14 +71,28 @@ pub struct LoadedImage {
 }
 
 struct ImagePart {
-    _subsurface: WlSubsurface,
+    subsurface: WlSubsurface,
     surface: WlSurface,
     viewport: WpViewport,
     /// Keeps the color-management surface wrapper (and with it the
     /// description binding) alive.
-    _cm: Option<WpColorManagementSurfaceV1>,
+    cm: Option<WpColorManagementSurfaceV1>,
     image: Arc<DecodedImage>,
     mode: Mode,
+}
+
+impl Drop for ImagePart {
+    /// wayland-client proxies don't send destructors on Drop; rotation
+    /// (and output removal) need the subsurface tree actually gone.
+    /// wl_subsurface.destroy unmaps the child immediately.
+    fn drop(&mut self) {
+        if let Some(cm) = &self.cm {
+            cm.destroy();
+        }
+        self.viewport.destroy();
+        self.subsurface.destroy();
+        self.surface.destroy();
+    }
 }
 
 struct Wallpaper {
@@ -127,6 +142,9 @@ pub struct App {
     /// In-flight info collection per output: (target_max_cll,
     /// target_luminance.max).
     pub pending_targets: HashMap<String, (Option<f64>, Option<f64>)>,
+    /// Rotation state per `--image-list` spec group, indexed by
+    /// `OutputSpec::playlist`. Advanced by per-playlist timers in `main`.
+    pub playlists: Vec<Playlist>,
     wallpapers: Vec<Wallpaper>,
 }
 
@@ -138,6 +156,7 @@ impl App {
         qh: &QueueHandle<App>,
         args: &Args,
         raw_images: HashMap<PathBuf, Arc<DecodedImage>>,
+        playlists: Vec<Playlist>,
     ) -> Result<App> {
         let compositor =
             CompositorState::bind(globals, qh).context("wl_compositor not available")?;
@@ -180,6 +199,7 @@ impl App {
             images: HashMap::new(),
             tone_targets: HashMap::new(),
             pending_targets: HashMap::new(),
+            playlists,
             wallpapers: Vec::new(),
         })
     }
@@ -224,8 +244,8 @@ impl App {
 
         // `--tone-map auto` needs the output's preferred description;
         // subscribe before the first service pass.
-        let wants_image =
-            spec.image.is_some() && spec.effective_mode() != Mode::SolidColor;
+        let wants_image = (spec.image.is_some() || spec.playlist.is_some())
+            && spec.effective_mode() != Mode::SolidColor;
         let feedback = match (&self.color, spec.tone_map, wants_image) {
             (Some(color), Some(crate::cli::ToneMap::Auto), true) => {
                 Some(color.watch_preferred(qh, layer.wl_surface(), name.clone()))
@@ -275,7 +295,14 @@ impl App {
             }
             let spec = wp.spec.clone();
             let name = wp.name.clone();
-            let Some(path) = spec.image.clone() else { continue };
+            // Playlist specs show the playlist's current entry.
+            let path = match spec.playlist {
+                Some(p) => self.playlists[p].current().to_path_buf(),
+                None => match spec.image.clone() {
+                    Some(path) => path,
+                    None => continue,
+                },
+            };
             if spec.effective_mode() == Mode::SolidColor {
                 continue;
             }
@@ -455,10 +482,10 @@ impl App {
             }
         }
         let part = ImagePart {
-            _subsurface: subsurface,
+            subsurface,
             surface: child,
             viewport,
-            _cm: cm,
+            cm,
             image: loaded.image.clone(),
             mode: wp.spec.effective_mode(),
         };
@@ -525,7 +552,7 @@ impl App {
             }
             part.viewport
                 .set_destination(placement.dest.0, placement.dest.1);
-            part._subsurface
+            part.subsurface
                 .set_position(placement.pos.0, placement.pos.1);
             part.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
             part.surface.commit();
@@ -550,6 +577,66 @@ impl App {
         wp.layer.commit();
         wp.color_buffer = Some(buffer);
         Ok(())
+    }
+
+    /// Advance playlist `idx` and re-attach every wallpaper showing it.
+    /// Called from the per-playlist rotation timer. Decoding is
+    /// synchronous — a slow decode stalls the event loop briefly, which
+    /// is fine at rotation cadence.
+    pub fn rotate(&mut self, qh: &QueueHandle<App>, idx: usize) {
+        let previous = self.playlists[idx].current().to_path_buf();
+
+        // Find the next decodable entry, skipping (with a warning) files
+        // that fail — a deleted or corrupt entry must not kill the daemon.
+        let mut next = None;
+        for _ in 0..self.playlists[idx].len() {
+            self.playlists[idx].advance();
+            let path = self.playlists[idx].current().to_path_buf();
+            if self.raw_images.contains_key(&path) {
+                next = Some(path);
+                break;
+            }
+            match crate::decode::load(&path) {
+                Ok(img) => {
+                    tracing::info!(path = %path.display(), "image loaded");
+                    self.raw_images.insert(path.clone(), Arc::new(img));
+                    next = Some(path);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), "skipping playlist entry: {e:#}")
+                }
+            }
+        }
+        let Some(next) = next else {
+            tracing::error!("playlist has no loadable entries; keeping current wallpaper");
+            return;
+        };
+        if next == previous {
+            return; // single-entry list (or every other entry failed)
+        }
+        tracing::info!(from = %previous.display(), to = %next.display(), "rotating wallpaper");
+
+        for wp in &mut self.wallpapers {
+            if wp.spec.playlist == Some(idx) {
+                wp.image_part = None; // Drop destroys the subsurface tree
+                wp.image_buffer = None;
+                wp.broken = false;
+            }
+        }
+        self.evict_unused_images();
+        self.service(qh);
+    }
+
+    /// Drop cached raw/treated images not reachable from any static spec
+    /// or current playlist position — keeps long-running rotation
+    /// memory-flat.
+    fn evict_unused_images(&mut self) {
+        let mut live: HashSet<PathBuf> =
+            self.specs.iter().filter_map(|s| s.image.clone()).collect();
+        live.extend(self.playlists.iter().map(|p| p.current().to_path_buf()));
+        self.raw_images.retain(|path, _| live.contains(path));
+        self.images.retain(|(path, _), _| live.contains(path));
     }
 
     fn remove_output(&mut self, output: &wl_output::WlOutput) {

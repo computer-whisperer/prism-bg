@@ -32,6 +32,9 @@ jxl-oxide = "0.12"
 # descriptions only, so ICC is resolved client-side).
 moxcms = "0.8"
 
+# playlist shuffle (--image-list --randomize).
+fastrand = "2"
+
 # JPEG XR (Windows HDR wallpapers/screenshots, scRGB) — vendored jxrlib C.
 jpegxr = "0.3"
 

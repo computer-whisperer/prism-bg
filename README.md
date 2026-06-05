@@ -64,6 +64,16 @@ Extras beyond swaybg (also per-output-group):
   compositor's preferred image description (`target_max_cll`, falling
   back to the target luminance) — the same numbers prism derives from
   its HDR config and EDID. Runs between scale and cap.
+- `--image-list <file>` — rotate through the images listed in `<file>`,
+  one path per line (relative paths resolve against the file's directory;
+  blank lines and `#` comments are ignored; `~/` expands). Mutually
+  exclusive with `-i`. All outputs matched by the group rotate in
+  lockstep, decoding each image once. Unloadable entries are skipped with
+  a warning, at startup and at rotation time.
+- `--rotate-every <duration>` — rotation period, e.g. `90s`, `15m`, `1h`
+  (bare number = seconds). Default 15m.
+- `--randomize` — shuffle the playlist; reshuffles each pass, never
+  repeating the same image back-to-back.
 - `--intent perceptual|relative|absolute` (default perceptual).
 - `--no-color-management` (debug escape hatch).
 
