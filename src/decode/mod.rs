@@ -1,0 +1,292 @@
+//! Image loading: file → pixels + [`ColorEncoding`].
+//!
+//! Decoders produce a [`RawImage`] — straight-alpha pixels in the source's
+//! own encoding, plus what we know about that encoding (a resolved
+//! [`ColorEncoding`], or an ICC profile still to be resolved). [`finish`]
+//! then runs ICC resolution (see [`crate::cms`]), premultiplies alpha, and
+//! packs into one of the two wire formats we ship to the compositor:
+//! 8-bit RGBA for ordinary SDR content, fp16 RGBA for everything that
+//! needs more range or precision (>8-bit sources, linear/PQ encodings).
+//!
+//! Format dispatch is by magic bytes, not extension.
+
+mod generic;
+mod jxl;
+mod png;
+
+use std::path::Path;
+
+use anyhow::{bail, Context, Result};
+use half::f16;
+
+use crate::cms;
+use crate::color::{ColorEncoding, Tf};
+
+/// Wire pixel formats — exactly the two wl_shm formats prism accepts
+/// beyond BGRA: `Abgr8888` (RGBA bytes) and `Abgr16161616f` (RGBA halfs).
+/// Premultiplied alpha, tightly packed.
+#[derive(Debug, Clone)]
+pub enum Pixels {
+    Rgba8(Vec<u8>),
+    RgbaF16(Vec<f16>),
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodedImage {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Pixels,
+    pub encoding: ColorEncoding,
+    /// Whether any pixel has alpha < 1 (drives the surface opaque region).
+    pub has_alpha: bool,
+}
+
+/// Straight-alpha RGBA pixels as decoded, before color resolution.
+#[derive(Debug)]
+pub enum RawPixels {
+    Rgba8(Vec<u8>),
+    /// 16-bit unorm (from 16-bit PNG, 10/12-bit AVIF upshifted by dav1d).
+    Rgba16(Vec<u16>),
+    /// Float values; electrical or linear depending on the encoding.
+    RgbaF32(Vec<f32>),
+}
+
+/// What the decoder learned about the encoding.
+#[derive(Debug)]
+pub enum RawColor {
+    /// Fully resolved (cICP, format convention, or known-default sRGB).
+    Encoding(ColorEncoding),
+    /// An ICC profile that still needs resolving against prism's
+    /// parametric vocabulary.
+    Icc(Vec<u8>),
+}
+
+#[derive(Debug)]
+pub struct RawImage {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: RawPixels,
+    pub color: RawColor,
+}
+
+pub fn load(path: &Path) -> Result<DecodedImage> {
+    let data = std::fs::read(path)
+        .with_context(|| format!("reading image {}", path.display()))?;
+    let raw = decode(&data).with_context(|| format!("decoding {}", path.display()))?;
+    finish(raw)
+}
+
+fn decode(data: &[u8]) -> Result<RawImage> {
+    match sniff(data) {
+        Some(Format::Png) => png::decode(data),
+        Some(Format::Jxl) => jxl::decode(data),
+        Some(f) => generic::decode(data, f),
+        None => bail!("unrecognized image format"),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Png,
+    Jpeg,
+    WebP,
+    Jxl,
+    Avif,
+    Exr,
+    Hdr,
+}
+
+fn sniff(data: &[u8]) -> Option<Format> {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(Format::Png)
+    } else if data.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some(Format::Jpeg)
+    } else if data.len() > 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        Some(Format::WebP)
+    } else if data.starts_with(&[0xff, 0x0a])
+        || data.starts_with(b"\x00\x00\x00\x0cJXL \x0d\x0a\x87\x0a")
+    {
+        Some(Format::Jxl)
+    } else if data.len() > 12 && &data[4..8] == b"ftyp" && &data[8..12] == b"avif" {
+        Some(Format::Avif)
+    } else if data.starts_with(&[0x76, 0x2f, 0x31, 0x01]) {
+        Some(Format::Exr)
+    } else if data.starts_with(b"#?RADIANCE") || data.starts_with(b"#?RGBE") {
+        Some(Format::Hdr)
+    } else {
+        None
+    }
+}
+
+/// Resolve color (ICC → parametric, possibly rewriting pixels), premultiply,
+/// and pack to a wire format.
+fn finish(raw: RawImage) -> Result<DecodedImage> {
+    let RawImage {
+        width,
+        height,
+        pixels,
+        color,
+    } = raw;
+
+    let (pixels, encoding) = match color {
+        RawColor::Encoding(enc) => (pixels, enc),
+        RawColor::Icc(icc) => cms::resolve_icc(&icc, pixels)?,
+    };
+
+    // Pack. 8-bit stays 8-bit only for plain display-referred TFs; linear
+    // and PQ data, and anything wider than 8 bits, rides fp16.
+    let keep_8bit = matches!(encoding.tf, Tf::Srgb | Tf::Gamma22 | Tf::Bt1886);
+    let (pixels, has_alpha) = match pixels {
+        RawPixels::Rgba8(data) if keep_8bit => {
+            let mut data = data;
+            let has_alpha = premultiply_u8(&mut data);
+            (Pixels::Rgba8(data), has_alpha)
+        }
+        other => {
+            let mut data = to_f16(other);
+            let has_alpha = premultiply_f16(&mut data);
+            (Pixels::RgbaF16(data), has_alpha)
+        }
+    };
+
+    Ok(DecodedImage {
+        width,
+        height,
+        pixels,
+        encoding,
+        has_alpha,
+    })
+}
+
+fn to_f16(pixels: RawPixels) -> Vec<f16> {
+    match pixels {
+        RawPixels::Rgba8(d) => d
+            .iter()
+            .map(|&v| f16::from_f32(v as f32 / 255.0))
+            .collect(),
+        RawPixels::Rgba16(d) => d
+            .iter()
+            .map(|&v| f16::from_f32(v as f32 / 65535.0))
+            .collect(),
+        RawPixels::RgbaF32(d) => d.iter().map(|&v| f16::from_f32(v)).collect(),
+    }
+}
+
+/// Premultiply straight alpha in place (electrical values — the Wayland
+/// convention without wp_color_representation is premultiplied-electrical).
+/// Returns whether any pixel was actually translucent.
+fn premultiply_u8(data: &mut [u8]) -> bool {
+    let mut has_alpha = false;
+    for px in data.chunks_exact_mut(4) {
+        let a = px[3];
+        if a == 255 {
+            continue;
+        }
+        has_alpha = true;
+        let a16 = a as u16;
+        px[0] = ((px[0] as u16 * a16 + 127) / 255) as u8;
+        px[1] = ((px[1] as u16 * a16 + 127) / 255) as u8;
+        px[2] = ((px[2] as u16 * a16 + 127) / 255) as u8;
+    }
+    has_alpha
+}
+
+fn premultiply_f16(data: &mut [f16]) -> bool {
+    let mut has_alpha = false;
+    for px in data.chunks_exact_mut(4) {
+        let a = px[3].to_f32();
+        if a >= 1.0 {
+            continue;
+        }
+        has_alpha = true;
+        px[0] = f16::from_f32(px[0].to_f32() * a);
+        px[1] = f16::from_f32(px[1].to_f32() * a);
+        px[2] = f16::from_f32(px[2].to_f32() * a);
+    }
+    has_alpha
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::color::{PrimaryVolume, Tf};
+
+    /// Synthesize an in-memory PNG with the given chunk setup.
+    fn make_png(set_info: impl FnOnce(&mut ::png::Encoder<&mut Vec<u8>>)) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut enc = ::png::Encoder::new(&mut out, 2, 2);
+        enc.set_color(::png::ColorType::Rgba);
+        enc.set_depth(::png::BitDepth::Eight);
+        set_info(&mut enc);
+        let mut writer = enc.write_header().unwrap();
+        writer
+            .write_image_data(&[255u8; 16])
+            .unwrap();
+        drop(writer);
+        out
+    }
+
+    #[test]
+    fn untagged_png_is_srgb_8bit() {
+        let img = finish(decode(&make_png(|_| {})).unwrap()).unwrap();
+        assert_eq!(img.encoding, crate::color::ColorEncoding::SRGB);
+        assert!(matches!(img.pixels, Pixels::Rgba8(_)));
+        assert!(!img.has_alpha);
+    }
+
+    #[test]
+    fn png_chrm_gama_yields_display_p3() {
+        let data = make_png(|enc| {
+            enc.set_source_gamma(::png::ScaledFloat::new(1.0 / 2.2));
+            enc.set_source_chromaticities(::png::SourceChromaticities::new(
+                (0.3127, 0.3290),
+                (0.680, 0.320),
+                (0.265, 0.690),
+                (0.150, 0.060),
+            ));
+        });
+        let img = finish(decode(&data).unwrap()).unwrap();
+        assert_eq!(img.encoding.tf, Tf::Gamma22);
+        assert_eq!(img.encoding.primaries, PrimaryVolume::DisplayP3);
+    }
+
+    #[test]
+    fn premultiply_is_electrical_and_flags_alpha() {
+        let mut px = vec![200u8, 100, 50, 128];
+        assert!(premultiply_u8(&mut px));
+        assert_eq!(&px, &[100, 50, 25, 128]);
+        let mut opaque = vec![200u8, 100, 50, 255];
+        assert!(!premultiply_u8(&mut opaque));
+        assert_eq!(&opaque, &[200, 100, 50, 255]);
+    }
+
+    /// Hand-rolled minimal AVIF box structure: meta(fullbox){iprp{ipco{colr}}}.
+    fn boxed(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut out = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn avif_colr_nclx_parses() {
+        // nclx: primaries=9 (BT.2020), tf=16 (PQ), matrix=9, full-range bit.
+        let mut nclx = b"nclx".to_vec();
+        nclx.extend_from_slice(&9u16.to_be_bytes());
+        nclx.extend_from_slice(&16u16.to_be_bytes());
+        nclx.extend_from_slice(&9u16.to_be_bytes());
+        nclx.push(0x80);
+        let colr = boxed(b"colr", &nclx);
+        let ipco = boxed(b"ipco", &colr);
+        let iprp = boxed(b"iprp", &ipco);
+        let mut meta_payload = vec![0u8; 4]; // FullBox version/flags
+        meta_payload.extend_from_slice(&iprp);
+        let mut file = boxed(b"ftyp", b"avifpayload");
+        file.extend_from_slice(&boxed(b"meta", &meta_payload));
+
+        match generic::test_parse_avif_colr(&file) {
+            Some((9, 16, true)) => {}
+            other => panic!("unexpected colr parse: {other:?}"),
+        }
+    }
+}

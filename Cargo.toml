@@ -1,0 +1,33 @@
+[package]
+name = "prism-bg"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+description = "Color-managed wallpaper client for Wayland — swaybg, in Rust, HDR-aware"
+repository = "https://github.com/computer-whisperer/prism-bg"
+authors = ["Christian Balcom"]
+
+[dependencies]
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+half = { version = "2.6", features = ["bytemuck"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# wayland client stack. Color management is hand-wired from the staging
+# bindings; SCTK covers registry/output/shm/layer-shell boilerplate.
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
+
+# image decoding. `png` is used directly (cICP/iCCP/gAMA/cHRM access);
+# jxl-oxide likewise for its native color encoding metadata. The `image`
+# crate covers JPEG/WebP/AVIF/EXR/Radiance-HDR, with ICC via ImageDecoder.
+png = "0.18"
+image = { version = "0.25", default-features = false, features = ["jpeg", "webp", "exr", "hdr", "avif-native"] }
+jxl-oxide = "0.12"
+
+# pure-Rust CMS for ICC profile handling (prism takes parametric
+# descriptions only, so ICC is resolved client-side).
+moxcms = "0.8"

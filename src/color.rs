@@ -1,0 +1,200 @@
+//! Internal color description types — the renderer-/protocol-independent
+//! middle ground between image metadata (cICP chunks, ICC profiles, format
+//! conventions) and the `wp_color_management_v1` parametric description we
+//! hand to the compositor.
+//!
+//! The vocabulary deliberately mirrors what prism advertises (see
+//! `prism-protocols/src/color_management.rs`): named TFs {sRGB, gamma 2.2,
+//! BT.1886, PQ, extended linear}, named primaries {sRGB, Display-P3,
+//! BT.2020} plus custom chromaticities, and optional luminances.
+
+/// CIE 1931 xy chromaticity coordinates for an RGB primary set + white point.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Chromaticities {
+    pub r: (f64, f64),
+    pub g: (f64, f64),
+    pub b: (f64, f64),
+    pub w: (f64, f64),
+}
+
+/// D65 white point (used by all primary sets we name).
+pub const D65: (f64, f64) = (0.3127, 0.3290);
+
+pub const SRGB_CHROMA: Chromaticities = Chromaticities {
+    r: (0.640, 0.330),
+    g: (0.300, 0.600),
+    b: (0.150, 0.060),
+    w: D65,
+};
+
+/// Display-P3 = DCI-P3 primaries with D65 white.
+pub const DISPLAY_P3_CHROMA: Chromaticities = Chromaticities {
+    r: (0.680, 0.320),
+    g: (0.265, 0.690),
+    b: (0.150, 0.060),
+    w: D65,
+};
+
+pub const BT2020_CHROMA: Chromaticities = Chromaticities {
+    r: (0.708, 0.292),
+    g: (0.170, 0.797),
+    b: (0.131, 0.046),
+    w: D65,
+};
+
+impl Chromaticities {
+    /// True if all eight coordinates are within `tol` of `other`'s.
+    pub fn approx_eq(&self, other: &Chromaticities, tol: f64) -> bool {
+        let pairs = [
+            (self.r, other.r),
+            (self.g, other.g),
+            (self.b, other.b),
+            (self.w, other.w),
+        ];
+        pairs
+            .iter()
+            .all(|(a, b)| (a.0 - b.0).abs() <= tol && (a.1 - b.1).abs() <= tol)
+    }
+}
+
+/// Transfer function of the encoded pixel data. Restricted to what prism
+/// advertises via `supported_tf_named`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tf {
+    /// The piecewise sRGB curve (IEC 61966-2-1).
+    Srgb,
+    /// Pure power 2.2.
+    Gamma22,
+    /// BT.1886 (pure power 2.4 against the protocol's reference display).
+    Bt1886,
+    /// SMPTE ST 2084 perceptual quantizer.
+    Pq,
+    /// Extended linear (scene/display-linear values, 1.0 = reference white
+    /// unless luminances say otherwise; negative/extended values allowed).
+    Linear,
+}
+
+/// Primary color volume: a named set the protocol knows, or custom
+/// chromaticities (prism advertises `set_primaries`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PrimaryVolume {
+    Srgb,
+    DisplayP3,
+    Bt2020,
+    Custom(Chromaticities),
+}
+
+impl PrimaryVolume {
+    /// Collapse custom chromaticities onto a named set when they match
+    /// within `tol` (named sets travel better and hit compositor fast paths).
+    pub fn snap_to_named(self, tol: f64) -> PrimaryVolume {
+        let PrimaryVolume::Custom(c) = self else {
+            return self;
+        };
+        for (named, reference) in [
+            (PrimaryVolume::Srgb, &SRGB_CHROMA),
+            (PrimaryVolume::DisplayP3, &DISPLAY_P3_CHROMA),
+            (PrimaryVolume::Bt2020, &BT2020_CHROMA),
+        ] {
+            if c.approx_eq(reference, tol) {
+                return named;
+            }
+        }
+        self
+    }
+}
+
+/// Primary color volume luminance + reference white, in cd/m².
+/// Maps to `set_luminances`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Luminances {
+    pub min: f64,
+    pub max: f64,
+    pub reference: f64,
+}
+
+/// A complete description of how pixel values encode color — everything the
+/// compositor needs to decode the buffer correctly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ColorEncoding {
+    pub tf: Tf,
+    pub primaries: PrimaryVolume,
+    /// `None` = protocol defaults for the TF.
+    pub luminances: Option<Luminances>,
+}
+
+impl ColorEncoding {
+    /// What an untagged image is assumed to be.
+    pub const SRGB: ColorEncoding = ColorEncoding {
+        tf: Tf::Srgb,
+        primaries: PrimaryVolume::Srgb,
+        luminances: None,
+    };
+}
+
+/// Map CICP code points (H.273) to a [`ColorEncoding`], for sources that
+/// carry them (PNG `cICP`, JXL, ICC v4.4 `cicp` tag). Returns `None` when
+/// the code points name something we can't express losslessly (we'd rather
+/// fall back to the ICC/assumed path than silently misrender).
+pub fn encoding_from_cicp(primaries: u8, tf: u8, full_range: bool) -> Option<ColorEncoding> {
+    // Wallpaper buffers are RGB; limited-range RGB is rare and we don't
+    // rescale for it. Reject so the caller falls back.
+    if !full_range {
+        return None;
+    }
+    let primaries = match primaries {
+        1 => PrimaryVolume::Srgb,
+        9 => PrimaryVolume::Bt2020,
+        12 => PrimaryVolume::DisplayP3,
+        _ => return None,
+    };
+    let tf = match tf {
+        // 13 = sRGB; 1/6/14/15 = BT.709/601/2020 camera OETF, which media
+        // convention displays through BT.1886.
+        13 => Tf::Srgb,
+        1 | 6 | 14 | 15 => Tf::Bt1886,
+        4 => Tf::Gamma22,
+        8 => Tf::Linear,
+        16 => Tf::Pq,
+        _ => return None,
+    };
+    Some(ColorEncoding {
+        tf,
+        primaries,
+        luminances: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cicp_maps_the_common_cases() {
+        // sRGB still image.
+        let e = encoding_from_cicp(1, 13, true).unwrap();
+        assert_eq!((e.tf, e.primaries), (Tf::Srgb, PrimaryVolume::Srgb));
+        // HDR10 still.
+        let e = encoding_from_cicp(9, 16, true).unwrap();
+        assert_eq!((e.tf, e.primaries), (Tf::Pq, PrimaryVolume::Bt2020));
+        // P3 + sRGB TF.
+        let e = encoding_from_cicp(12, 13, true).unwrap();
+        assert_eq!(e.primaries, PrimaryVolume::DisplayP3);
+        // Narrow range refused.
+        assert!(encoding_from_cicp(1, 13, false).is_none());
+        // Unknown primaries refused.
+        assert!(encoding_from_cicp(22, 13, true).is_none());
+    }
+
+    #[test]
+    fn snapping_tolerates_quantized_chromaticities() {
+        // Slightly-off sRGB (as you'd get from ICC s15Fixed16 colorants).
+        let c = Chromaticities {
+            r: (0.6401, 0.3299),
+            g: (0.3001, 0.6001),
+            b: (0.1499, 0.0601),
+            w: (0.3128, 0.3291),
+        };
+        assert_eq!(PrimaryVolume::Custom(c).snap_to_named(2e-3), PrimaryVolume::Srgb);
+    }
+}
