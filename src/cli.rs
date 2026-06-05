@@ -127,6 +127,9 @@ Usage: prism-bg <options...>
       --scale-luminance <nits>
                          Scale HDR content linearly so its peak luminance
                          is at most this (preserves highlight structure).
+                         Combines with --cap-luminance: scale first, then
+                         clip — tames overall level and white outliers
+                         independently.
       --intent <intent>  Rendering intent (perceptual|relative|absolute).
                          Default: perceptual.
       --no-color-management
@@ -173,14 +176,17 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
                 current_touched = true;
             }
             "--cap-luminance" => {
-                current.luminance =
-                    Some(LuminanceControl::Cap(parse_nits(&value("--cap-luminance")?)?));
+                current
+                    .luminance
+                    .get_or_insert(LuminanceControl::default())
+                    .cap = Some(parse_nits(&value("--cap-luminance")?)?);
                 current_touched = true;
             }
             "--scale-luminance" => {
-                current.luminance = Some(LuminanceControl::ScaleMax(parse_nits(
-                    &value("--scale-luminance")?,
-                )?));
+                current
+                    .luminance
+                    .get_or_insert(LuminanceControl::default())
+                    .scale_max = Some(parse_nits(&value("--scale-luminance")?)?);
                 current_touched = true;
             }
             "--intent" => {
@@ -311,10 +317,10 @@ mod luminance_cli_tests {
                 .map(|s| s.to_string()),
         )
         .unwrap();
-        assert_eq!(args.specs[0].luminance, Some(LuminanceControl::Cap(600.0)));
+        assert_eq!(args.specs[0].luminance, Some(LuminanceControl { cap: Some(600.0), scale_max: None }));
         assert_eq!(
             args.specs[1].luminance,
-            Some(LuminanceControl::ScaleMax(1000.0))
+            Some(LuminanceControl { scale_max: Some(1000.0), cap: None })
         );
     }
 

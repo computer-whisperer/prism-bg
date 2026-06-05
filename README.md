@@ -53,10 +53,11 @@ Extras beyond swaybg (also per-output-group):
 - `--cap-luminance <nits>` — hard-clip HDR content above this luminance.
 - `--scale-luminance <nits>` — scale HDR content linearly so its measured
   peak is at most this (preserves highlight structure; no-op if already
-  below). Both operate in absolute nits on linear and PQ sources, update
-  the declared luminance maximum so compositor tone mapping sees an
-  honest ceiling, and warn+pass-through on SDR images. For HDR
-  wallpapers mastered with absurd peaks.
+  below). The two compose, scale first: a generous scale plus a tight cap
+  tames "color is sane, white peaks are crazy" masters. Both operate in
+  absolute nits on linear and PQ sources, update the declared luminance
+  maximum to the honest post-treatment ceiling (the measured peak, even
+  when nothing changed), and warn+pass-through on SDR images.
 - `--intent perceptual|relative|absolute` (default perceptual).
 - `--no-color-management` (debug escape hatch).
 

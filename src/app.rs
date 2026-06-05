@@ -46,7 +46,7 @@ use crate::surfaces::{place, upload, upload_tiled, WireRgb8};
 
 /// Image identity for deduplication: path + luminance treatment (the same
 /// file capped differently for different outputs is different pixels).
-pub type ImageKey = (PathBuf, Option<(u8, u64)>);
+pub type ImageKey = (PathBuf, Option<(u64, u64)>);
 
 /// The dedup key for `spec`'s image, if it has one.
 pub fn image_key(spec: &OutputSpec) -> Option<ImageKey> {

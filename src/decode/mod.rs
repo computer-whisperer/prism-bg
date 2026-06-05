@@ -185,15 +185,15 @@ impl DecodedImage {
         }
     }
 
-    /// Apply a user-requested luminance cap/scale (`--cap-luminance` /
-    /// `--scale-luminance`), in absolute nits. Operates on HDR sources:
+    /// Apply user-requested luminance shaping (`--scale-luminance` then
+    /// `--cap-luminance`), in absolute nits. Operates on HDR sources:
     /// Linear (nits = value × declared reference) and PQ (through the PQ
     /// EOTF). Display-referred SDR content passes through with a warning —
     /// its luminance is the compositor's business. The declared luminance
-    /// maximum shrinks to the target so downstream tone mapping sees an
-    /// honest ceiling.
+    /// maximum shrinks to the resulting content ceiling so downstream tone
+    /// mapping sees an honest value.
     pub fn luminance_controlled(&self, ctrl: crate::color::LuminanceControl) -> DecodedImage {
-        use crate::color::{pq_eotf, pq_oetf, LuminanceControl, Luminances};
+        use crate::color::{pq_eotf, pq_oetf, Luminances};
 
         let (Pixels::RgbaF16(d), Tf::Linear | Tf::Pq) = (&self.pixels, self.encoding.tf)
         else {
@@ -226,13 +226,13 @@ impl DecodedImage {
             }
         };
 
-        let target = match ctrl {
-            LuminanceControl::Cap(n) => n,
-            LuminanceControl::ScaleMax(n) => n,
-        } as f32;
-        let scale = match ctrl {
-            LuminanceControl::Cap(_) => 1.0,
-            LuminanceControl::ScaleMax(_) => {
+        // Stage 1: whole-image scale to put the measured peak at most at
+        // `scale_max`.
+        let mut peak_after = None;
+        let scale = match ctrl.scale_max {
+            None => 1.0,
+            Some(target) => {
+                let target = target as f32;
                 // Content peak over straight channel values.
                 let mut peak = 0f32;
                 for px in d.chunks_exact(4) {
@@ -245,15 +245,15 @@ impl DecodedImage {
                     }
                 }
                 tracing::info!(peak_nits = peak, target_nits = target, "content peak measured");
-                if peak <= target {
-                    1.0
-                } else {
-                    target / peak
-                }
+                let s = if peak <= target { 1.0 } else { target / peak };
+                peak_after = Some((peak * s) as f64);
+                s
             }
         };
+        // Stage 2: hard clip after scaling.
+        let cap = ctrl.cap.map(|c| c as f32).unwrap_or(f32::INFINITY);
 
-        let transform = |v: f32| v_of((nits_of(v) * scale).min(target));
+        let transform = |v: f32| v_of((nits_of(v) * scale).min(cap));
         let mut out = Vec::with_capacity(d.len());
         for px in d.chunks_exact(4) {
             let a = px[3].to_f32().clamp(0.0, 1.0);
@@ -274,11 +274,17 @@ impl DecodedImage {
             max: 10000.0,
             reference: if pq { 203.0 } else { 80.0 },
         });
+        // The honest content ceiling: the post-scale peak when measured,
+        // clipped by the cap, never above the original declaration.
+        let new_max = [Some(old.max), peak_after, ctrl.cap]
+            .into_iter()
+            .flatten()
+            .fold(f64::INFINITY, f64::min);
         DecodedImage {
             pixels: Pixels::RgbaF16(out),
             encoding: ColorEncoding {
                 luminances: Some(Luminances {
-                    max: old.max.min(target as f64),
+                    max: new_max,
                     ..old
                 }),
                 ..self.encoding
@@ -902,7 +908,7 @@ mod luminance_tests {
     fn cap_clips_above_target_only() {
         // 80 / 400 / 1600 nits, cap at 200.
         let img = scrgb([1.0, 5.0, 20.0, 1.0]);
-        let out = img.luminance_controlled(LuminanceControl::Cap(200.0));
+        let out = img.luminance_controlled(LuminanceControl { cap: Some(200.0), scale_max: None });
         let n = rgb_nits(&out);
         assert!((n[0] - 80.0).abs() < 0.1, "{n:?}");
         assert!((n[1] - 200.0).abs() < 0.2, "{n:?}");
@@ -914,7 +920,7 @@ mod luminance_tests {
     fn scale_preserves_ratios() {
         // Peak 1600 nits scaled to 400: everything halves twice.
         let img = scrgb([1.0, 5.0, 20.0, 1.0]);
-        let out = img.luminance_controlled(LuminanceControl::ScaleMax(400.0));
+        let out = img.luminance_controlled(LuminanceControl { scale_max: Some(400.0), cap: None });
         let n = rgb_nits(&out);
         assert!((n[0] - 20.0).abs() < 0.05, "{n:?}");
         assert!((n[1] - 100.0).abs() < 0.2, "{n:?}");
@@ -925,7 +931,7 @@ mod luminance_tests {
     #[test]
     fn scale_is_noop_below_target() {
         let img = scrgb([1.0, 2.0, 0.5, 1.0]); // peak 160 nits
-        let out = img.luminance_controlled(LuminanceControl::ScaleMax(400.0));
+        let out = img.luminance_controlled(LuminanceControl { scale_max: Some(400.0), cap: None });
         let n = rgb_nits(&out);
         assert!((n[1] - 160.0).abs() < 0.2, "{n:?}");
     }
@@ -944,7 +950,7 @@ mod luminance_tests {
             },
             has_alpha: false,
         };
-        let out = img.luminance_controlled(LuminanceControl::Cap(500.0));
+        let out = img.luminance_controlled(LuminanceControl { cap: Some(500.0), scale_max: None });
         let Pixels::RgbaF16(d) = &out.pixels else { panic!() };
         let nits = |v: f16| pq_eotf(v.to_f32()) * 10000.0;
         assert!((nits(d[0]) - 100.0).abs() < 0.5);
@@ -962,9 +968,82 @@ mod luminance_tests {
             encoding: ColorEncoding::SRGB,
             has_alpha: false,
         };
-        let out = img.luminance_controlled(LuminanceControl::Cap(200.0));
+        let out = img.luminance_controlled(LuminanceControl { cap: Some(200.0), scale_max: None });
         assert_eq!(out.encoding, ColorEncoding::SRGB);
         let Pixels::Rgba8(d) = &out.pixels else { panic!() };
         assert_eq!(&d[..], &[10, 20, 30, 255]);
+    }
+}
+
+#[cfg(test)]
+mod combined_luminance_tests {
+    use super::*;
+    use crate::color::{ColorEncoding, LuminanceControl, Luminances, PrimaryVolume, Tf};
+
+    #[test]
+    fn scale_then_cap_compose() {
+        // 80 / 400 / 1600 nits. Scale to peak 800 (s = 0.5) → 40/200/800,
+        // then cap 300 → 40/200/300. Declared max = 300.
+        let img = DecodedImage {
+            width: 1,
+            height: 1,
+            pixels: Pixels::RgbaF16(
+                [1.0f32, 5.0, 20.0, 1.0]
+                    .iter()
+                    .map(|&v| f16::from_f32(v))
+                    .collect(),
+            ),
+            encoding: ColorEncoding {
+                tf: Tf::Linear,
+                primaries: PrimaryVolume::Srgb,
+                luminances: Some(Luminances {
+                    min: 0.0,
+                    max: 10000.0,
+                    reference: 80.0,
+                }),
+            },
+            has_alpha: false,
+        };
+        let out = img.luminance_controlled(LuminanceControl {
+            scale_max: Some(800.0),
+            cap: Some(300.0),
+        });
+        let Pixels::RgbaF16(d) = &out.pixels else { panic!() };
+        let n: Vec<f32> = d[..3].iter().map(|v| v.to_f32() * 80.0).collect();
+        assert!((n[0] - 40.0).abs() < 0.1, "{n:?}");
+        assert!((n[1] - 200.0).abs() < 0.3, "{n:?}");
+        assert!((n[2] - 300.0).abs() < 0.4, "{n:?}");
+        assert_eq!(out.encoding.luminances.unwrap().max, 300.0);
+    }
+
+    #[test]
+    fn scale_only_declares_measured_peak() {
+        // Peak 160 nits, scale target 400 → no-op, but the declared max
+        // should now be the honest measured 160, not the original 10000.
+        let img = DecodedImage {
+            width: 1,
+            height: 1,
+            pixels: Pixels::RgbaF16(
+                [1.0f32, 2.0, 0.5, 1.0]
+                    .iter()
+                    .map(|&v| f16::from_f32(v))
+                    .collect(),
+            ),
+            encoding: ColorEncoding {
+                tf: Tf::Linear,
+                primaries: PrimaryVolume::Srgb,
+                luminances: Some(Luminances {
+                    min: 0.0,
+                    max: 10000.0,
+                    reference: 80.0,
+                }),
+            },
+            has_alpha: false,
+        };
+        let out = img.luminance_controlled(LuminanceControl {
+            scale_max: Some(400.0),
+            cap: None,
+        });
+        assert_eq!(out.encoding.luminances.unwrap().max, 160.0);
     }
 }

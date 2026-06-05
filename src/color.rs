@@ -188,22 +188,33 @@ pub fn pq_oetf(y: f32) -> f32 {
 /// User-requested luminance shaping for HDR content (some HDR wallpapers
 /// declare absurd peaks). Values are target nits; applied to linear and PQ
 /// sources in absolute luminance, before anything else sees the pixels.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum LuminanceControl {
-    /// Hard-clip channels above this many nits.
-    Cap(f64),
+///
+/// The two stages compose, scale first: `scale_max` normalizes the whole
+/// image so its measured peak lands at most there (preserving highlight
+/// structure), then `cap` hard-clips whatever still exceeds it — the
+/// "color is sane but the white peaks are crazy" recipe is a generous
+/// scale plus a tight cap.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LuminanceControl {
     /// Scale linearly so the content peak lands at most here (no-op when
-    /// already below; preserves highlight relationships).
-    ScaleMax(f64),
+    /// already below).
+    pub scale_max: Option<f64>,
+    /// Hard-clip channels above this many nits (after scaling).
+    pub cap: Option<f64>,
 }
 
 impl LuminanceControl {
-    /// Stable hash key (f64 isn't Eq) for image deduplication.
-    pub fn key(&self) -> (u8, u64) {
-        match self {
-            LuminanceControl::Cap(n) => (0, n.to_bits()),
-            LuminanceControl::ScaleMax(n) => (1, n.to_bits()),
-        }
+    pub fn is_empty(&self) -> bool {
+        self.scale_max.is_none() && self.cap.is_none()
+    }
+
+    /// Stable hash key (f64 isn't Eq) for image deduplication. Zero bits
+    /// can't collide with a real value — nits are validated positive.
+    pub fn key(&self) -> (u64, u64) {
+        (
+            self.scale_max.map_or(0, f64::to_bits),
+            self.cap.map_or(0, f64::to_bits),
+        )
     }
 }
 
