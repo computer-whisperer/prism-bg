@@ -44,21 +44,55 @@ pub struct DecodedImage {
 
 impl DecodedImage {
     /// Lossy fallback for compositors that don't accept fp16 shm buffers:
-    /// clamp + quantize to 8-bit, keeping the encoding tag. Banding on
-    /// >8-bit sources and clipped HDR highlights — but it displays.
+    /// quantize to 8-bit. Linear-light content is sRGB-encoded first and
+    /// retagged (8-bit linear bands horribly in the darks); values above
+    /// 1.0 clip to reference white. Display-referred TFs just clamp.
     pub fn quantized_to_8bit(&self) -> DecodedImage {
-        let pixels = match &self.pixels {
-            Pixels::Rgba8(d) => Pixels::Rgba8(d.clone()),
-            Pixels::RgbaF16(d) => Pixels::Rgba8(
-                d.iter()
-                    .map(|v| (v.to_f32().clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
-                    .collect(),
-            ),
+        let Pixels::RgbaF16(d) = &self.pixels else {
+            return self.clone();
+        };
+        let linear = self.encoding.tf == Tf::Linear;
+        let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        let mut out = Vec::with_capacity(d.len());
+        for px in d.chunks_exact(4) {
+            let a = px[3].to_f32().clamp(0.0, 1.0);
+            for &c in &px[..3] {
+                let mut v = c.to_f32();
+                if linear {
+                    // Pixels are premultiplied; the OETF applies to the
+                    // straight value, premultiplication to the encoded one.
+                    if a > 0.0 {
+                        v = srgb_oetf((v / a).clamp(0.0, 1.0)) * a;
+                    }
+                } else {
+                    v = v.clamp(0.0, 1.0);
+                }
+                out.push(q(v));
+            }
+            out.push(q(a));
+        }
+        let encoding = if linear {
+            ColorEncoding {
+                tf: Tf::Srgb,
+                primaries: self.encoding.primaries,
+                luminances: None,
+            }
+        } else {
+            self.encoding
         };
         DecodedImage {
-            pixels,
+            pixels: Pixels::Rgba8(out),
+            encoding,
             ..self.clone()
         }
+    }
+}
+
+fn srgb_oetf(x: f32) -> f32 {
+    if x <= 0.0031308 {
+        x * 12.92
+    } else {
+        1.055 * x.powf(1.0 / 2.4) - 0.055
     }
 }
 
@@ -348,5 +382,67 @@ mod jxr_probe {
             "{}x{} encoding={:?} has_alpha={} rgb min={mn} max={mx} mean={}",
             img.width, img.height, img.encoding, img.has_alpha, sum / n as f64
         );
+    }
+}
+
+#[cfg(test)]
+mod quantize_tests {
+    use super::*;
+    use crate::color::{ColorEncoding, Luminances, PrimaryVolume, Tf};
+
+    #[test]
+    fn linear_fp16_quantizes_to_srgb_encoded_8bit() {
+        // 0.5 linear → ~0.7354 sRGB-encoded → 188; 2.0 clips to 255.
+        let d: Vec<f16> = [0.5f32, 0.0, 2.0, 1.0]
+            .iter()
+            .map(|&v| f16::from_f32(v))
+            .collect();
+        let img = DecodedImage {
+            width: 1,
+            height: 1,
+            pixels: Pixels::RgbaF16(d),
+            encoding: ColorEncoding {
+                tf: Tf::Linear,
+                primaries: PrimaryVolume::Srgb,
+                luminances: Some(Luminances {
+                    min: 0.0,
+                    max: 10000.0,
+                    reference: 80.0,
+                }),
+            },
+            has_alpha: false,
+        };
+        let q = img.quantized_to_8bit();
+        assert_eq!(q.encoding.tf, Tf::Srgb);
+        assert!(q.encoding.luminances.is_none());
+        let Pixels::Rgba8(d) = &q.pixels else {
+            panic!("expected 8-bit")
+        };
+        assert_eq!(&d[..], &[188, 0, 255, 255]);
+    }
+
+    #[test]
+    fn display_referred_fp16_just_clamps() {
+        let d: Vec<f16> = [0.5f32, 1.5, 0.25, 1.0]
+            .iter()
+            .map(|&v| f16::from_f32(v))
+            .collect();
+        let img = DecodedImage {
+            width: 1,
+            height: 1,
+            pixels: Pixels::RgbaF16(d),
+            encoding: ColorEncoding {
+                tf: Tf::Pq,
+                primaries: PrimaryVolume::Bt2020,
+                luminances: None,
+            },
+            has_alpha: false,
+        };
+        let q = img.quantized_to_8bit();
+        assert_eq!(q.encoding.tf, Tf::Pq);
+        let Pixels::Rgba8(d) = &q.pixels else {
+            panic!("expected 8-bit")
+        };
+        assert_eq!(&d[..], &[128, 255, 64, 255]);
     }
 }

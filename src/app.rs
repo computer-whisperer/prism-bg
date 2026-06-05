@@ -42,7 +42,7 @@ use wayland_protocols::wp::viewporter::client::{
 use crate::cli::{Args, Color, Intent, Mode, OutputSpec};
 use crate::colormgmt::{ColorState, DescriptionHandle};
 use crate::decode::DecodedImage;
-use crate::surfaces::{place, upload, upload_tiled};
+use crate::surfaces::{place, upload, upload_tiled, WireRgb8};
 
 /// A decoded image plus its (shared) compositor-side description.
 pub struct LoadedImage {
@@ -267,6 +267,18 @@ impl App {
             return Ok(());
         }
 
+        // 8-bit wire format: Abgr8888 matches RGBA memory directly but is
+        // optional (KWin lacks it); fall back to swizzling into the
+        // spec-mandatory Argb8888. PRISM_BG_FORCE_ARGB=1 forces the
+        // swizzle path for testing.
+        let wire = if self.shm.formats().contains(&wl_shm::Format::Abgr8888)
+            && std::env::var_os("PRISM_BG_FORCE_ARGB").is_none()
+        {
+            WireRgb8::Abgr
+        } else {
+            WireRgb8::ArgbSwizzled
+        };
+
         // Image subsurface first; as a synchronized subsurface its state is
         // latched by the parent commit below.
         if let Some(part) = &wp.image_part {
@@ -277,8 +289,8 @@ impl App {
                 (part.image.width, part.image.height),
             );
             let buffer = match placement.tile {
-                Some((tw, th)) => upload_tiled(&mut self.pool, &part.image, tw, th)?,
-                None => upload(&mut self.pool, &part.image)?,
+                Some((tw, th)) => upload_tiled(&mut self.pool, &part.image, tw, th, wire)?,
+                None => upload(&mut self.pool, &part.image, wire)?,
             };
             buffer
                 .attach_to(&part.surface)

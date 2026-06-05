@@ -84,11 +84,21 @@ pub fn place(mode: Mode, out: (u32, u32), scale: i32, img: (u32, u32)) -> Placem
     }
 }
 
-fn shm_format(img: &DecodedImage) -> wl_shm::Format {
-    match img.pixels {
+/// How 8-bit pixels go on the wire. `Abgr8888` matches our RGBA memory
+/// order directly but is optional (KWin doesn't advertise it); `Argb8888`
+/// is spec-mandatory and needs an R↔B swizzle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireRgb8 {
+    Abgr,
+    ArgbSwizzled,
+}
+
+fn shm_format(img: &DecodedImage, wire: WireRgb8) -> wl_shm::Format {
+    match (&img.pixels, wire) {
         // RGBA byte order == DRM/shm ABGR little-endian.
-        Pixels::Rgba8(_) => wl_shm::Format::Abgr8888,
-        Pixels::RgbaF16(_) => wl_shm::Format::Abgr16161616f,
+        (Pixels::Rgba8(_), WireRgb8::Abgr) => wl_shm::Format::Abgr8888,
+        (Pixels::Rgba8(_), WireRgb8::ArgbSwizzled) => wl_shm::Format::Argb8888,
+        (Pixels::RgbaF16(_), _) => wl_shm::Format::Abgr16161616f,
     }
 }
 
@@ -106,8 +116,15 @@ fn pixel_bytes(img: &DecodedImage) -> &[u8] {
     }
 }
 
+/// Swap R and B in RGBA-ordered bytes (RGBA → BGRA memory order).
+fn swizzle_rb(bytes: &mut [u8]) {
+    for px in bytes.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+}
+
 /// Upload the image at native size.
-pub fn upload(pool: &mut SlotPool, img: &DecodedImage) -> Result<Buffer> {
+pub fn upload(pool: &mut SlotPool, img: &DecodedImage, wire: WireRgb8) -> Result<Buffer> {
     let bpp = bytes_per_pixel(img);
     let stride = img.width as usize * bpp;
     let (buffer, canvas) = pool
@@ -115,13 +132,16 @@ pub fn upload(pool: &mut SlotPool, img: &DecodedImage) -> Result<Buffer> {
             img.width as i32,
             img.height as i32,
             stride as i32,
-            shm_format(img),
+            shm_format(img, wire),
         )
         .context("creating shm buffer")?;
     // The pool may hand back a canvas larger than requested (minimum slot
     // size); fill only the buffer's own bytes.
     let bytes = pixel_bytes(img);
     canvas[..bytes.len()].copy_from_slice(bytes);
+    if matches!(img.pixels, Pixels::Rgba8(_)) && wire == WireRgb8::ArgbSwizzled {
+        swizzle_rb(&mut canvas[..bytes.len()]);
+    }
     Ok(buffer)
 }
 
@@ -132,13 +152,27 @@ pub fn upload_tiled(
     img: &DecodedImage,
     width: u32,
     height: u32,
+    wire: WireRgb8,
 ) -> Result<Buffer> {
     let bpp = bytes_per_pixel(img);
     let stride = width as usize * bpp;
     let (buffer, canvas) = pool
-        .create_buffer(width as i32, height as i32, stride as i32, shm_format(img))
+        .create_buffer(
+            width as i32,
+            height as i32,
+            stride as i32,
+            shm_format(img, wire),
+        )
         .context("creating tiled shm buffer")?;
-    let src = pixel_bytes(img);
+    let swizzled;
+    let src = if matches!(img.pixels, Pixels::Rgba8(_)) && wire == WireRgb8::ArgbSwizzled {
+        let mut copy = pixel_bytes(img).to_vec();
+        swizzle_rb(&mut copy);
+        swizzled = copy;
+        &swizzled[..]
+    } else {
+        pixel_bytes(img)
+    };
     let src_stride = img.width as usize * bpp;
     for y in 0..height as usize {
         let src_row = &src[(y % img.height as usize) * src_stride..][..src_stride];
@@ -201,5 +235,17 @@ mod tests {
         let p = place(Mode::Tile, (1920, 1080), 2, (512, 512));
         assert_eq!(p.tile, Some((3840, 2160)));
         assert_eq!(p.dest, (1920, 1080));
+    }
+}
+
+#[cfg(test)]
+mod swizzle_tests {
+    use super::*;
+
+    #[test]
+    fn swizzle_swaps_r_and_b_only() {
+        let mut px = vec![1u8, 2, 3, 4, 10, 20, 30, 40];
+        swizzle_rb(&mut px);
+        assert_eq!(px, &[3, 2, 1, 4, 30, 20, 10, 40]);
     }
 }
