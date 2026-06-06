@@ -34,9 +34,7 @@ impl Mode {
             "center" => Mode::Center,
             "tile" => Mode::Tile,
             "solid_color" => Mode::SolidColor,
-            _ => bail!(
-                "invalid mode {s:?} (expected stretch|fit|fill|center|tile|solid_color)"
-            ),
+            _ => bail!("invalid mode {s:?} (expected stretch|fit|fill|center|tile|solid_color)"),
         })
     }
 }
@@ -64,9 +62,8 @@ impl Color {
         if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
             bail!("invalid color {s:?} (expected [#]RRGGBB)");
         }
-        let chan = |i: usize| -> f64 {
-            u8::from_str_radix(&hex[i..i + 2], 16).unwrap() as f64 / 255.0
-        };
+        let chan =
+            |i: usize| -> f64 { u8::from_str_radix(&hex[i..i + 2], 16).unwrap() as f64 / 255.0 };
         Ok(Color {
             r: chan(0),
             g: chan(2),
@@ -126,11 +123,12 @@ impl OutputSpec {
     /// Effective mode: explicit, else stretch with an image (swaybg's
     /// default), else solid color.
     pub fn effective_mode(&self) -> Mode {
-        self.mode.unwrap_or(if self.image.is_some() || self.image_list.is_some() {
-            Mode::Stretch
-        } else {
-            Mode::SolidColor
-        })
+        self.mode
+            .unwrap_or(if self.image.is_some() || self.image_list.is_some() {
+                Mode::Stretch
+            } else {
+                Mode::SolidColor
+            })
     }
 }
 
@@ -198,7 +196,8 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
 
     while let Some(arg) = argv.next() {
         let mut value = |flag: &str| -> Result<String> {
-            argv.next().with_context(|| format!("{flag} requires a value"))
+            argv.next()
+                .with_context(|| format!("{flag} requires a value"))
         };
         match arg.as_str() {
             "-o" | "--output" => {
@@ -325,7 +324,7 @@ fn parse_duration(s: &str) -> Result<Duration> {
         .parse()
         .with_context(|| format!("invalid duration {s:?} (expected e.g. 90s, 15m, 1h)"))?;
     let secs = n * mult;
-    if !secs.is_finite() || secs < 1.0 || secs > 86_400.0 * 365.0 {
+    if !secs.is_finite() || !(1.0..=86_400.0 * 365.0).contains(&secs) {
         bail!("duration {s:?} out of range (1s ..= 365 days)");
     }
     Ok(Duration::from_secs_f64(secs))
@@ -363,8 +362,20 @@ mod tests {
     #[test]
     fn swaybg_style_groups() {
         let args = parse_ok(&[
-            "-i", "default.png", "-m", "fill", "-o", "DP-1", "-i", "left.png", "-m", "tile",
-            "-o", "DP-2", "-c", "#336699",
+            "-i",
+            "default.png",
+            "-m",
+            "fill",
+            "-o",
+            "DP-1",
+            "-i",
+            "left.png",
+            "-m",
+            "tile",
+            "-o",
+            "DP-2",
+            "-c",
+            "#336699",
         ]);
         assert_eq!(args.specs.len(), 3);
         assert_eq!(args.specs[0].output, "*");
@@ -380,7 +391,10 @@ mod tests {
     fn output_matching_prefers_exact_over_wildcard() {
         let args = parse_ok(&["-i", "a.png", "-o", "DP-1", "-c", "112233"]);
         assert_eq!(spec_for_output(&args.specs, "DP-1").unwrap().output, "DP-1");
-        assert_eq!(spec_for_output(&args.specs, "HDMI-A-1").unwrap().output, "*");
+        assert_eq!(
+            spec_for_output(&args.specs, "HDMI-A-1").unwrap().output,
+            "*"
+        );
     }
 
     #[test]
@@ -406,10 +420,19 @@ mod tests {
     #[test]
     fn image_list_flags() {
         let args = parse_ok(&[
-            "--image-list", "walls.txt", "--rotate-every", "90s", "--randomize", "-m", "fill",
+            "--image-list",
+            "walls.txt",
+            "--rotate-every",
+            "90s",
+            "--randomize",
+            "-m",
+            "fill",
         ]);
         let spec = &args.specs[0];
-        assert_eq!(spec.image_list.as_deref(), Some(std::path::Path::new("walls.txt")));
+        assert_eq!(
+            spec.image_list.as_deref(),
+            Some(std::path::Path::new("walls.txt"))
+        );
         assert_eq!(spec.rotate_every, Some(Duration::from_secs(90)));
         assert!(spec.randomize);
         assert_eq!(spec.effective_mode(), Mode::Fill);
@@ -425,8 +448,12 @@ mod tests {
     #[test]
     fn duration_suffixes() {
         let parse_dur = |d: &str| {
-            parse(["--image-list", "w.txt", "--rotate-every", d].iter().map(|s| s.to_string()))
-                .map(|a| a.specs[0].rotate_every.unwrap())
+            parse(
+                ["--image-list", "w.txt", "--rotate-every", d]
+                    .iter()
+                    .map(|s| s.to_string()),
+            )
+            .map(|a| a.specs[0].rotate_every.unwrap())
         };
         assert_eq!(parse_dur("300").unwrap(), Duration::from_secs(300));
         assert_eq!(parse_dur("15m").unwrap(), Duration::from_secs(900));
@@ -438,7 +465,9 @@ mod tests {
     #[test]
     fn image_and_image_list_are_mutually_exclusive() {
         assert!(parse(
-            ["-i", "a.png", "--image-list", "w.txt"].iter().map(|s| s.to_string())
+            ["-i", "a.png", "--image-list", "w.txt"]
+                .iter()
+                .map(|s| s.to_string())
         )
         .is_err());
     }
@@ -447,7 +476,9 @@ mod tests {
     fn rotate_flags_require_image_list() {
         assert!(parse(["-i", "a.png", "--randomize"].iter().map(|s| s.to_string())).is_err());
         assert!(parse(
-            ["-i", "a.png", "--rotate-every", "5m"].iter().map(|s| s.to_string())
+            ["-i", "a.png", "--rotate-every", "5m"]
+                .iter()
+                .map(|s| s.to_string())
         )
         .is_err());
     }
@@ -460,23 +491,59 @@ mod luminance_cli_tests {
     #[test]
     fn luminance_flags_follow_output_groups() {
         let args = parse(
-            ["-i", "a.jxr", "--cap-luminance", "600", "-o", "DP-2", "-i", "a.jxr",
-             "--scale-luminance", "1000"]
-                .iter()
-                .map(|s| s.to_string()),
+            [
+                "-i",
+                "a.jxr",
+                "--cap-luminance",
+                "600",
+                "-o",
+                "DP-2",
+                "-i",
+                "a.jxr",
+                "--scale-luminance",
+                "1000",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
         )
         .unwrap();
-        assert_eq!(args.specs[0].luminance, Some(LuminanceControl { cap: Some(600.0), scale_max: None, tone_map: None }));
+        assert_eq!(
+            args.specs[0].luminance,
+            Some(LuminanceControl {
+                cap: Some(600.0),
+                scale_max: None,
+                tone_map: None
+            })
+        );
         assert_eq!(
             args.specs[1].luminance,
-            Some(LuminanceControl { scale_max: Some(1000.0), cap: None, tone_map: None })
+            Some(LuminanceControl {
+                scale_max: Some(1000.0),
+                cap: None,
+                tone_map: None
+            })
         );
     }
 
     #[test]
     fn nits_bounds_are_enforced() {
-        assert!(parse(["-i", "a.png", "--cap-luminance", "0"].iter().map(|s| s.to_string())).is_err());
-        assert!(parse(["-i", "a.png", "--cap-luminance", "20000"].iter().map(|s| s.to_string())).is_err());
-        assert!(parse(["-i", "a.png", "--scale-luminance", "abc"].iter().map(|s| s.to_string())).is_err());
+        assert!(parse(
+            ["-i", "a.png", "--cap-luminance", "0"]
+                .iter()
+                .map(|s| s.to_string())
+        )
+        .is_err());
+        assert!(parse(
+            ["-i", "a.png", "--cap-luminance", "20000"]
+                .iter()
+                .map(|s| s.to_string())
+        )
+        .is_err());
+        assert!(parse(
+            ["-i", "a.png", "--scale-luminance", "abc"]
+                .iter()
+                .map(|s| s.to_string())
+        )
+        .is_err());
     }
 }

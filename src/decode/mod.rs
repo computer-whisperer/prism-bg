@@ -198,8 +198,7 @@ impl DecodedImage {
     pub fn luminance_controlled(&self, ctrl: crate::color::LuminanceControl) -> DecodedImage {
         use crate::color::{bt2390_eetf, pq_eotf, pq_oetf, Luminances};
 
-        let (Pixels::RgbaF16(d), Tf::Linear | Tf::Pq) = (&self.pixels, self.encoding.tf)
-        else {
+        let (Pixels::RgbaF16(d), Tf::Linear | Tf::Pq) = (&self.pixels, self.encoding.tf) else {
             tracing::warn!(
                 tf = ?self.encoding.tf,
                 "luminance control has no effect on display-referred SDR content"
@@ -249,17 +248,17 @@ impl DecodedImage {
         };
 
         // Stage 1: whole-image scale to put the peak at most at scale_max.
-        let mut ceiling = None; // honest content ceiling, tracked per stage
-        let scale = match (ctrl.scale_max, peak) {
+        // `ceiling` is the honest content ceiling, tracked per stage.
+        let (scale, mut ceiling) = match (ctrl.scale_max, peak) {
             (Some(target), Some(peak)) => {
-                let s = if peak <= target as f32 { 1.0 } else { target as f32 / peak };
-                ceiling = Some((peak * s) as f64);
-                s
+                let s = if peak <= target as f32 {
+                    1.0
+                } else {
+                    target as f32 / peak
+                };
+                (s, Some((peak * s) as f64))
             }
-            _ => {
-                ceiling = peak.map(|p| p as f64);
-                1.0
-            }
+            _ => (1.0, peak.map(|p| p as f64)),
         };
 
         // Stage 2: BT.2390 EETF toward the tone-map target. Max-RGB: the
@@ -374,7 +373,11 @@ impl DecodedImage {
             for &c in &px[..3] {
                 // Through straight alpha: transform the straight value,
                 // re-premultiply the encoded result.
-                let v = if a > 0.0 { convert(c.to_f32() / a) * a } else { 0.0 };
+                let v = if a > 0.0 {
+                    convert(c.to_f32() / a) * a
+                } else {
+                    0.0
+                };
                 out.push(q(v));
             }
             out.push(q(a));
@@ -416,8 +419,7 @@ pub struct RawImage {
 }
 
 pub fn load(path: &Path) -> Result<DecodedImage> {
-    let data = std::fs::read(path)
-        .with_context(|| format!("reading image {}", path.display()))?;
+    let data = std::fs::read(path).with_context(|| format!("reading image {}", path.display()))?;
     let raw = decode(&data).with_context(|| format!("decoding {}", path.display()))?;
     finish(raw)
 }
@@ -511,10 +513,7 @@ fn finish(raw: RawImage) -> Result<DecodedImage> {
 
 fn to_f16(pixels: RawPixels) -> Vec<f16> {
     match pixels {
-        RawPixels::Rgba8(d) => d
-            .iter()
-            .map(|&v| f16::from_f32(v as f32 / 255.0))
-            .collect(),
+        RawPixels::Rgba8(d) => d.iter().map(|&v| f16::from_f32(v as f32 / 255.0)).collect(),
         RawPixels::Rgba16(d) => d
             .iter()
             .map(|&v| f16::from_f32(v as f32 / 65535.0))
@@ -570,9 +569,7 @@ mod tests {
         enc.set_depth(::png::BitDepth::Eight);
         set_info(&mut enc);
         let mut writer = enc.write_header().unwrap();
-        writer
-            .write_image_data(&[255u8; 16])
-            .unwrap();
+        writer.write_image_data(&[255u8; 16]).unwrap();
         drop(writer);
         out
     }
@@ -656,7 +653,10 @@ mod jxr_probe {
                 for px in d.chunks_exact(4) {
                     for &c in &px[..3] {
                         let v = c as f32 / 255.0;
-                        mn = mn.min(v); mx = mx.max(v); sum += v as f64; n += 1;
+                        mn = mn.min(v);
+                        mx = mx.max(v);
+                        sum += v as f64;
+                        n += 1;
                     }
                 }
             }
@@ -664,7 +664,10 @@ mod jxr_probe {
                 for px in d.chunks_exact(4) {
                     for &c in &px[..3] {
                         let v = c as f32 / 65535.0;
-                        mn = mn.min(v); mx = mx.max(v); sum += v as f64; n += 1;
+                        mn = mn.min(v);
+                        mx = mx.max(v);
+                        sum += v as f64;
+                        n += 1;
                     }
                 }
             }
@@ -672,14 +675,21 @@ mod jxr_probe {
                 for px in d.chunks_exact(4) {
                     for &c in &px[..3] {
                         let v = c.to_f32();
-                        mn = mn.min(v); mx = mx.max(v); sum += v as f64; n += 1;
+                        mn = mn.min(v);
+                        mx = mx.max(v);
+                        sum += v as f64;
+                        n += 1;
                     }
                 }
             }
         }
         println!(
             "{}x{} encoding={:?} has_alpha={} rgb min={mn} max={mx} mean={}",
-            img.width, img.height, img.encoding, img.has_alpha, sum / n as f64
+            img.width,
+            img.height,
+            img.encoding,
+            img.has_alpha,
+            sum / n as f64
         );
     }
 }
@@ -767,7 +777,9 @@ mod reencode_tests {
         let img = srgb_image(Pixels::Rgba8(vec![188, 0, 255, 255]));
         let out = img.reencoded_tf(Tf::Gamma22);
         assert_eq!(out.encoding.tf, Tf::Gamma22);
-        let Pixels::Rgba8(d) = &out.pixels else { panic!() };
+        let Pixels::Rgba8(d) = &out.pixels else {
+            panic!()
+        };
         assert_eq!(&d[..], &[187, 0, 255, 255]);
     }
 
@@ -778,7 +790,9 @@ mod reencode_tests {
         // re-premultiply → round(187 * 128/255) = 94.
         let img = srgb_image(Pixels::Rgba8(vec![94, 0, 128, 128]));
         let out = img.reencoded_tf(Tf::Gamma22);
-        let Pixels::Rgba8(d) = &out.pixels else { panic!() };
+        let Pixels::Rgba8(d) = &out.pixels else {
+            panic!()
+        };
         // straight 94/(128/255)=187.3→ converted ≈186.5 → ×0.502 ≈ 94
         assert!((d[0] as i32 - 94).abs() <= 1, "got {}", d[0]);
         assert_eq!(d[3], 128);
@@ -804,7 +818,9 @@ mod reencode_tests {
         };
         let q = img.quantized_to_8bit(Tf::Gamma22);
         assert_eq!(q.encoding.tf, Tf::Gamma22);
-        let Pixels::Rgba8(d) = &q.pixels else { panic!() };
+        let Pixels::Rgba8(d) = &q.pixels else {
+            panic!()
+        };
         assert_eq!(&d[..], &[186, 0, 255, 255]);
     }
 }
@@ -840,7 +856,9 @@ mod repack_tests {
         let out = img.repacked_unorm16(true, Tf::Gamma22);
         assert_eq!(out.encoding.tf, Tf::Pq);
         assert_eq!(out.encoding.primaries, PrimaryVolume::Srgb);
-        let Pixels::Rgba16(d) = &out.pixels else { panic!() };
+        let Pixels::Rgba16(d) = &out.pixels else {
+            panic!()
+        };
         let nits = |v: u16| pq_eotf(v as f32 / 65535.0) * 10000.0;
         assert!((nits(d[0]) - 80.0).abs() < 0.1, "got {}", nits(d[0]));
         assert!((nits(d[1]) - 400.0).abs() < 0.5, "got {}", nits(d[1]));
@@ -854,7 +872,9 @@ mod repack_tests {
         let img = scrgb([0.5, 5.0, 0.0, 1.0]);
         let out = img.repacked_unorm16(false, Tf::Gamma22);
         assert_eq!(out.encoding.tf, Tf::Gamma22);
-        let Pixels::Rgba16(d) = &out.pixels else { panic!() };
+        let Pixels::Rgba16(d) = &out.pixels else {
+            panic!()
+        };
         let expect = (0.5f32.powf(1.0 / 2.2) * 65535.0 + 0.5) as u16;
         assert_eq!(d[0], expect);
         assert_eq!(d[1], 65535);
@@ -882,7 +902,9 @@ mod repack_tests {
         };
         let out = img.repacked_unorm16(true, Tf::Gamma22);
         assert_eq!(out.encoding.tf, Tf::Pq);
-        let Pixels::Rgba16(d) = &out.pixels else { panic!() };
+        let Pixels::Rgba16(d) = &out.pixels else {
+            panic!()
+        };
         assert_eq!(d[0], (0.25 * 65535.0 + 0.5) as u16);
         assert_eq!(d[1], (0.5 * 65535.0 + 0.5) as u16);
         assert_eq!(d[3], 65535);
@@ -927,7 +949,9 @@ mod luminance_tests {
     }
 
     fn rgb_nits(img: &DecodedImage) -> [f32; 3] {
-        let Pixels::RgbaF16(d) = &img.pixels else { panic!() };
+        let Pixels::RgbaF16(d) = &img.pixels else {
+            panic!()
+        };
         [
             d[0].to_f32() * 80.0,
             d[1].to_f32() * 80.0,
@@ -939,7 +963,11 @@ mod luminance_tests {
     fn cap_clips_above_target_only() {
         // 80 / 400 / 1600 nits, cap at 200.
         let img = scrgb([1.0, 5.0, 20.0, 1.0]);
-        let out = img.luminance_controlled(LuminanceControl { cap: Some(200.0), scale_max: None, tone_map: None });
+        let out = img.luminance_controlled(LuminanceControl {
+            cap: Some(200.0),
+            scale_max: None,
+            tone_map: None,
+        });
         let n = rgb_nits(&out);
         assert!((n[0] - 80.0).abs() < 0.1, "{n:?}");
         assert!((n[1] - 200.0).abs() < 0.2, "{n:?}");
@@ -951,7 +979,11 @@ mod luminance_tests {
     fn scale_preserves_ratios() {
         // Peak 1600 nits scaled to 400: everything halves twice.
         let img = scrgb([1.0, 5.0, 20.0, 1.0]);
-        let out = img.luminance_controlled(LuminanceControl { scale_max: Some(400.0), cap: None, tone_map: None });
+        let out = img.luminance_controlled(LuminanceControl {
+            scale_max: Some(400.0),
+            cap: None,
+            tone_map: None,
+        });
         let n = rgb_nits(&out);
         assert!((n[0] - 20.0).abs() < 0.05, "{n:?}");
         assert!((n[1] - 100.0).abs() < 0.2, "{n:?}");
@@ -962,7 +994,11 @@ mod luminance_tests {
     #[test]
     fn scale_is_noop_below_target() {
         let img = scrgb([1.0, 2.0, 0.5, 1.0]); // peak 160 nits
-        let out = img.luminance_controlled(LuminanceControl { scale_max: Some(400.0), cap: None, tone_map: None });
+        let out = img.luminance_controlled(LuminanceControl {
+            scale_max: Some(400.0),
+            cap: None,
+            tone_map: None,
+        });
         let n = rgb_nits(&out);
         assert!((n[1] - 160.0).abs() < 0.2, "{n:?}");
     }
@@ -981,8 +1017,14 @@ mod luminance_tests {
             },
             has_alpha: false,
         };
-        let out = img.luminance_controlled(LuminanceControl { cap: Some(500.0), scale_max: None, tone_map: None });
-        let Pixels::RgbaF16(d) = &out.pixels else { panic!() };
+        let out = img.luminance_controlled(LuminanceControl {
+            cap: Some(500.0),
+            scale_max: None,
+            tone_map: None,
+        });
+        let Pixels::RgbaF16(d) = &out.pixels else {
+            panic!()
+        };
         let nits = |v: f16| pq_eotf(v.to_f32()) * 10000.0;
         assert!((nits(d[0]) - 100.0).abs() < 0.5);
         assert!((nits(d[1]) - 500.0).abs() < 1.0);
@@ -999,9 +1041,15 @@ mod luminance_tests {
             encoding: ColorEncoding::SRGB,
             has_alpha: false,
         };
-        let out = img.luminance_controlled(LuminanceControl { cap: Some(200.0), scale_max: None, tone_map: None });
+        let out = img.luminance_controlled(LuminanceControl {
+            cap: Some(200.0),
+            scale_max: None,
+            tone_map: None,
+        });
         assert_eq!(out.encoding, ColorEncoding::SRGB);
-        let Pixels::Rgba8(d) = &out.pixels else { panic!() };
+        let Pixels::Rgba8(d) = &out.pixels else {
+            panic!()
+        };
         assert_eq!(&d[..], &[10, 20, 30, 255]);
     }
 }
@@ -1040,7 +1088,9 @@ mod combined_luminance_tests {
             cap: Some(300.0),
             tone_map: None,
         });
-        let Pixels::RgbaF16(d) = &out.pixels else { panic!() };
+        let Pixels::RgbaF16(d) = &out.pixels else {
+            panic!()
+        };
         let n: Vec<f32> = d[..3].iter().map(|v| v.to_f32() * 80.0).collect();
         assert!((n[0] - 40.0).abs() < 0.1, "{n:?}");
         assert!((n[1] - 200.0).abs() < 0.3, "{n:?}");
@@ -1137,7 +1187,9 @@ mod tone_map_tests {
             tone_map: Some(400.0),
             cap: None,
         });
-        let Pixels::RgbaF16(d) = &out.pixels else { panic!() };
+        let Pixels::RgbaF16(d) = &out.pixels else {
+            panic!()
+        };
         let v: Vec<f32> = d.iter().map(|x| x.to_f32()).collect();
         // Bright pixel compressed below target: max channel ≤ 400 nits.
         let max_nits = v[0].max(v[1]).max(v[2]) * 80.0;

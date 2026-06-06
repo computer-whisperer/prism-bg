@@ -329,6 +329,9 @@ mod tests {
             b: (0.1499, 0.0601),
             w: (0.3128, 0.3291),
         };
-        assert_eq!(PrimaryVolume::Custom(c).snap_to_named(2e-3), PrimaryVolume::Srgb);
+        assert_eq!(
+            PrimaryVolume::Custom(c).snap_to_named(2e-3),
+            PrimaryVolume::Srgb
+        );
     }
 }

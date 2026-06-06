@@ -81,8 +81,8 @@ pub fn decode(data: &[u8]) -> Result<RawImage> {
             (RawPixels::RgbaF32(out), RawColor::Encoding(SCRGB))
         }
         // SDR 8-bit, possibly BGR-ordered.
-        PixelFormat24bppBGR | PixelFormat24bppRGB | PixelFormat32bppBGR
-        | PixelFormat32bppBGRA | PixelFormat32bppRGBA => {
+        PixelFormat24bppBGR | PixelFormat24bppRGB | PixelFormat32bppBGR | PixelFormat32bppBGRA
+        | PixelFormat32bppRGBA => {
             let comps = info.bits_per_pixel() / 8;
             let bgr = info.bgr();
             let has_alpha = info.has_alpha();
@@ -96,9 +96,7 @@ pub fn decode(data: &[u8]) -> Result<RawImage> {
                 RawColor::Encoding(ColorEncoding::SRGB),
             )
         }
-        other => bail!(
-            "unsupported JXR pixel format {other:?} — please report with a sample file"
-        ),
+        other => bail!("unsupported JXR pixel format {other:?} — please report with a sample file"),
     };
 
     Ok(RawImage {

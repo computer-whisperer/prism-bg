@@ -17,9 +17,7 @@ use anyhow::{bail, Context, Result};
 use image::{DynamicImage, ImageDecoder};
 
 use super::{Format, RawColor, RawImage, RawPixels};
-use crate::color::{
-    encoding_from_cicp, ColorEncoding, Luminances, PrimaryVolume, Tf,
-};
+use crate::color::{encoding_from_cicp, ColorEncoding, Luminances, PrimaryVolume, Tf};
 
 /// Reference white for scene-linear sources (EXR / Radiance), in cd/m².
 /// 1.0 in the file maps to this many nits; prism takes ExtLinear
@@ -30,22 +28,21 @@ const SCENE_LINEAR_REF_NITS: f64 = 203.0;
 pub fn decode(data: &[u8], format: Format) -> Result<RawImage> {
     let reader = std::io::Cursor::new(data);
     let mut decoder: Box<dyn ImageDecoder> = match format {
-        Format::Jpeg => Box::new(
-            image::codecs::jpeg::JpegDecoder::new(reader).context("reading JPEG header")?,
-        ),
-        Format::WebP => Box::new(
-            image::codecs::webp::WebPDecoder::new(reader).context("reading WebP header")?,
-        ),
-        Format::Avif => Box::new(
-            image::codecs::avif::AvifDecoder::new(reader).context("reading AVIF header")?,
-        ),
+        Format::Jpeg => {
+            Box::new(image::codecs::jpeg::JpegDecoder::new(reader).context("reading JPEG header")?)
+        }
+        Format::WebP => {
+            Box::new(image::codecs::webp::WebPDecoder::new(reader).context("reading WebP header")?)
+        }
+        Format::Avif => {
+            Box::new(image::codecs::avif::AvifDecoder::new(reader).context("reading AVIF header")?)
+        }
         Format::Exr => Box::new(
-            image::codecs::openexr::OpenExrDecoder::new(reader)
-                .context("reading EXR header")?,
+            image::codecs::openexr::OpenExrDecoder::new(reader).context("reading EXR header")?,
         ),
-        Format::Hdr => Box::new(
-            image::codecs::hdr::HdrDecoder::new(reader).context("reading HDR header")?,
-        ),
+        Format::Hdr => {
+            Box::new(image::codecs::hdr::HdrDecoder::new(reader).context("reading HDR header")?)
+        }
         Format::Png | Format::Jxl | Format::Jxr => {
             unreachable!("handled by dedicated decoders")
         }

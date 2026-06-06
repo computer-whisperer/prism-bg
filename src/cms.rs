@@ -41,16 +41,26 @@ pub fn resolve_icc(icc: &[u8], pixels: RawPixels) -> Result<(RawPixels, ColorEnc
         if let Some(enc) = encoding_from_cicp(p, t, true) {
             return Ok((pixels, enc));
         }
-        tracing::debug!(primaries = p, tf = t, "ICC cicp tag not expressible; continuing");
+        tracing::debug!(
+            primaries = p,
+            tf = t,
+            "ICC cicp tag not expressible; continuing"
+        );
     }
 
     if profile.is_matrix_shaper() && !has_luts(&profile) {
-        let primaries = PrimaryVolume::Custom(profile_chromaticities(&profile))
-            .snap_to_named(5e-3);
+        let primaries = PrimaryVolume::Custom(profile_chromaticities(&profile)).snap_to_named(5e-3);
 
         // Case 2: named TRC → tag only.
         if let Some(tf) = classify_trc(&profile) {
-            return Ok((pixels, ColorEncoding { tf, primaries, luminances: None }));
+            return Ok((
+                pixels,
+                ColorEncoding {
+                    tf,
+                    primaries,
+                    luminances: None,
+                },
+            ));
         }
 
         // Case 3: rewrite the curve, keep the gamut.
@@ -64,7 +74,11 @@ pub fn resolve_icc(icc: &[u8], pixels: RawPixels) -> Result<(RawPixels, ColorEnc
         let pixels = convert(&profile, &dst, pixels)?;
         return Ok((
             pixels,
-            ColorEncoding { tf: Tf::Srgb, primaries, luminances: None },
+            ColorEncoding {
+                tf: Tf::Srgb,
+                primaries,
+                luminances: None,
+            },
         ));
     }
 
@@ -121,10 +135,7 @@ fn profile_chromaticities(p: &ColorProfile) -> Chromaticities {
     let r = [p.red_colorant.x, p.red_colorant.y, p.red_colorant.z];
     let g = [p.green_colorant.x, p.green_colorant.y, p.green_colorant.z];
     let b = [p.blue_colorant.x, p.blue_colorant.y, p.blue_colorant.z];
-    let media = p
-        .media_white_point
-        .map(|w| [w.x, w.y, w.z])
-        .unwrap_or(D50);
+    let media = p.media_white_point.map(|w| [w.x, w.y, w.z]).unwrap_or(D50);
 
     let sum = [r[0] + g[0] + b[0], r[1] + g[1] + b[1], r[2] + g[2] + b[2]];
     let near = |a: [f64; 3], b: [f64; 3]| {
@@ -138,7 +149,11 @@ fn profile_chromaticities(p: &ColorProfile) -> Chromaticities {
         if plausible_chad(&chad) {
             let inv = chad.inverse();
             // v4: white tag is D50 and the real white sits behind chad.
-            let w = if near(media, D50) { inv.mul_vec(D50) } else { media };
+            let w = if near(media, D50) {
+                inv.mul_vec(D50)
+            } else {
+                media
+            };
             (inv.mul_vec(r), inv.mul_vec(g), inv.mul_vec(b), w)
         } else {
             unadapt_via_bradford(r, g, b, media)
@@ -258,10 +273,15 @@ impl Mat3 {
 /// so tagging instead of converting can never shift a displayed 8-bit
 /// value by more than the quantization it already carries.
 fn classify_trc(p: &ColorProfile) -> Option<Tf> {
-    let (r, g, b) = (p.red_trc.as_ref()?, p.green_trc.as_ref()?, p.blue_trc.as_ref()?);
+    let (r, g, b) = (
+        p.red_trc.as_ref()?,
+        p.green_trc.as_ref()?,
+        p.blue_trc.as_ref()?,
+    );
 
     const TOL: f32 = 0.5 / 255.0;
-    let candidates: [(Tf, fn(f32) -> f32); 4] = [
+    type Eotf = fn(f32) -> f32;
+    let candidates: [(Tf, Eotf); 4] = [
         (Tf::Srgb, srgb_eotf),
         (Tf::Gamma22, |x| x.powf(2.2)),
         (Tf::Bt1886, |x| x.powf(2.4)),
@@ -317,16 +337,32 @@ fn eval_parametric(p: &[f32], x: f32) -> f32 {
     match *p {
         [g] => x.powf(g),
         [g, a, b] => {
-            if x >= -b / a { (a * x + b).powf(g) } else { 0.0 }
+            if x >= -b / a {
+                (a * x + b).powf(g)
+            } else {
+                0.0
+            }
         }
         [g, a, b, c] => {
-            if x >= -b / a { (a * x + b).powf(g) + c } else { c }
+            if x >= -b / a {
+                (a * x + b).powf(g) + c
+            } else {
+                c
+            }
         }
         [g, a, b, c, d] => {
-            if x >= d { (a * x + b).powf(g) } else { c * x }
+            if x >= d {
+                (a * x + b).powf(g)
+            } else {
+                c * x
+            }
         }
         [g, a, b, c, d, e, f] => {
-            if x >= d { (a * x + b).powf(g) + e } else { c * x + f }
+            if x >= d {
+                (a * x + b).powf(g) + e
+            } else {
+                c * x + f
+            }
         }
         _ => x,
     }

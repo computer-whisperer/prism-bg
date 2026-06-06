@@ -168,8 +168,8 @@ impl App {
         )?;
         let shm = Shm::bind(globals, qh).context("wl_shm not available")?;
         let pool = SlotPool::new(4096, &shm).context("creating shm pool")?;
-        let viewporter = SimpleViewporter::bind(globals, qh)
-            .context("wp_viewporter not available")?;
+        let viewporter =
+            SimpleViewporter::bind(globals, qh).context("wp_viewporter not available")?;
         let color = if args.no_color_management {
             None
         } else {
@@ -239,7 +239,9 @@ impl App {
         // solid color itself).
         if let Ok(region) = Region::new(&self.compositor) {
             region.add(0, 0, i32::MAX, i32::MAX);
-            layer.wl_surface().set_opaque_region(Some(region.wl_region()));
+            layer
+                .wl_surface()
+                .set_opaque_region(Some(region.wl_region()));
         }
 
         // `--tone-map auto` needs the output's preferred description;
@@ -265,7 +267,11 @@ impl App {
         layer.commit();
 
         tracing::info!(output = name, mode = ?spec.effective_mode(), "wallpaper surface created");
-        let color = spec.color.unwrap_or(Color { r: 0.0, g: 0.0, b: 0.0 });
+        let color = spec.color.unwrap_or(Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+        });
         self.wallpapers.push(Wallpaper {
             output,
             name,
@@ -434,9 +440,7 @@ impl App {
                         }
                         image = Arc::new(image.reencoded_tf(target));
                     }
-                    Tf::Pq => anyhow::bail!(
-                        "compositor does not support the PQ transfer function"
-                    ),
+                    Tf::Pq => anyhow::bail!("compositor does not support the PQ transfer function"),
                 }
             }
         }
@@ -445,17 +449,17 @@ impl App {
         if !fp16_ok && matches!(image.pixels, crate::decode::Pixels::RgbaF16(_)) {
             let target = sdr_tf.context("compositor supports no display-referred TF")?;
             if unorm16_ok {
-                let pq_ok = self
-                    .color
-                    .as_ref()
-                    .is_some_and(|c| c.supports_tf(Tf::Pq));
+                let pq_ok = self.color.as_ref().is_some_and(|c| c.supports_tf(Tf::Pq));
                 tracing::info!(
                     pq = pq_ok && image.encoding.tf == Tf::Linear,
                     "compositor lacks fp16 shm; repacking as 16-bit unorm"
                 );
                 image = Arc::new(image.repacked_unorm16(pq_ok, target));
             } else {
-                tracing::warn!(?target, "compositor lacks fp16 and 16-bit shm; quantizing to 8-bit");
+                tracing::warn!(
+                    ?target,
+                    "compositor lacks fp16 and 16-bit shm; quantizing to 8-bit"
+                );
                 image = Arc::new(image.quantized_to_8bit(target));
             }
         }
@@ -573,7 +577,9 @@ impl App {
             .attach_to(wp.layer.wl_surface())
             .context("attaching color buffer")?;
         wp.viewport.set_destination(w as i32, h as i32);
-        wp.layer.wl_surface().damage_buffer(0, 0, i32::MAX, i32::MAX);
+        wp.layer
+            .wl_surface()
+            .damage_buffer(0, 0, i32::MAX, i32::MAX);
         wp.layer.commit();
         wp.color_buffer = Some(buffer);
         Ok(())

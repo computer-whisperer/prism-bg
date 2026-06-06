@@ -5,9 +5,7 @@
 use anyhow::{bail, Context, Result};
 
 use super::{RawColor, RawImage, RawPixels};
-use crate::color::{
-    encoding_from_cicp, Chromaticities, ColorEncoding, PrimaryVolume, Tf,
-};
+use crate::color::{encoding_from_cicp, Chromaticities, ColorEncoding, PrimaryVolume, Tf};
 
 pub fn decode(data: &[u8]) -> Result<RawImage> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
@@ -75,9 +73,7 @@ fn to_rgba<T: Copy>(
     for px in samples[..n * channels].chunks_exact(channels) {
         match color_type {
             png::ColorType::Grayscale => out.extend_from_slice(&[px[0], px[0], px[0], opaque]),
-            png::ColorType::GrayscaleAlpha => {
-                out.extend_from_slice(&[px[0], px[0], px[0], px[1]])
-            }
+            png::ColorType::GrayscaleAlpha => out.extend_from_slice(&[px[0], px[0], px[0], px[1]]),
             png::ColorType::Rgb => out.extend_from_slice(&[px[0], px[1], px[2], opaque]),
             png::ColorType::Rgba => out.extend_from_slice(px),
             png::ColorType::Indexed => unreachable!(),

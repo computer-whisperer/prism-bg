@@ -6,9 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Result};
-use wayland_client::{
-    globals::GlobalList, Connection, Dispatch, Proxy, QueueHandle, WEnum,
-};
+use wayland_client::{globals::GlobalList, Connection, Dispatch, Proxy, QueueHandle, WEnum};
 use wayland_protocols::wp::color_management::v1::client::{
     wp_color_management_surface_feedback_v1::{self, WpColorManagementSurfaceFeedbackV1},
     wp_color_management_surface_v1::WpColorManagementSurfaceV1,
@@ -36,7 +34,9 @@ pub struct ColorState {
 
 impl ColorState {
     pub fn bind(globals: &GlobalList, qh: &QueueHandle<App>) -> Option<ColorState> {
-        let manager = globals.bind::<WpColorManagerV1, App, ()>(qh, 1..=1, ()).ok()?;
+        let manager = globals
+            .bind::<WpColorManagerV1, App, ()>(qh, 1..=1, ())
+            .ok()?;
         Some(ColorState {
             manager,
             tfs: Vec::new(),
@@ -83,9 +83,7 @@ impl ColorState {
 
         match enc.primaries {
             PrimaryVolume::Srgb => self.set_named_primaries(&params, Primaries::Srgb)?,
-            PrimaryVolume::DisplayP3 => {
-                self.set_named_primaries(&params, Primaries::DisplayP3)?
-            }
+            PrimaryVolume::DisplayP3 => self.set_named_primaries(&params, Primaries::DisplayP3)?,
             PrimaryVolume::Bt2020 => self.set_named_primaries(&params, Primaries::Bt2020)?,
             PrimaryVolume::Custom(c) => {
                 if !self.feature(Feature::SetPrimaries) {
@@ -238,14 +236,18 @@ impl Dispatch<WpColorManagerV1, ()> for App {
         };
         use wp_color_manager_v1::Event;
         match event {
-            Event::SupportedTfNamed { tf: WEnum::Value(tf) } => color.tfs.push(tf),
-            Event::SupportedPrimariesNamed { primaries: WEnum::Value(p) } => {
-                color.primaries.push(p)
-            }
-            Event::SupportedFeature { feature: WEnum::Value(f) } => color.features.push(f),
-            Event::SupportedIntent { render_intent: WEnum::Value(i) } => {
-                color.intents.push(i)
-            }
+            Event::SupportedTfNamed {
+                tf: WEnum::Value(tf),
+            } => color.tfs.push(tf),
+            Event::SupportedPrimariesNamed {
+                primaries: WEnum::Value(p),
+            } => color.primaries.push(p),
+            Event::SupportedFeature {
+                feature: WEnum::Value(f),
+            } => color.features.push(f),
+            Event::SupportedIntent {
+                render_intent: WEnum::Value(i),
+            } => color.intents.push(i),
             Event::Done => color.done = true,
             _ => {}
         }
@@ -265,7 +267,12 @@ impl Dispatch<WpImageDescriptionV1, DescStatus> for App {
         match event {
             Event::Ready { .. } => *status.lock().unwrap() = Status::Ready,
             Event::Failed { cause, msg } => {
-                tracing::error!(?cause, msg, id = desc.id().protocol_id(), "image description failed");
+                tracing::error!(
+                    ?cause,
+                    msg,
+                    id = desc.id().protocol_id(),
+                    "image description failed"
+                );
                 *status.lock().unwrap() = Status::Failed(msg);
             }
             _ => {}
@@ -336,16 +343,13 @@ impl Dispatch<WpImageDescriptionInfoV1, FeedbackData> for App {
         let output = &data.0;
         match event {
             Event::TargetMaxCll { max_cll } => {
-                state.pending_targets.entry(output.clone()).or_default().0 =
-                    Some(max_cll as f64);
+                state.pending_targets.entry(output.clone()).or_default().0 = Some(max_cll as f64);
             }
             Event::TargetLuminance { max_lum, .. } => {
-                state.pending_targets.entry(output.clone()).or_default().1 =
-                    Some(max_lum as f64);
+                state.pending_targets.entry(output.clone()).or_default().1 = Some(max_lum as f64);
             }
             Event::Done => {
-                let (cll, lum_max) =
-                    state.pending_targets.remove(output).unwrap_or_default();
+                let (cll, lum_max) = state.pending_targets.remove(output).unwrap_or_default();
                 // max_cll is the tighter "content light level the display
                 // handles" bound when present; target_luminance.max is
                 // always sent.

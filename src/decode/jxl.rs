@@ -20,9 +20,7 @@ pub fn decode(data: &[u8]) -> Result<RawImage> {
 
     if image.hdr_type() == Some(HdrType::Hlg) {
         // prism has no HLG TF; ask jxl-oxide for PQ instead.
-        image.request_color_encoding(EnumColourEncoding::bt2100_pq(
-            RenderingIntent::Relative,
-        ));
+        image.request_color_encoding(EnumColourEncoding::bt2100_pq(RenderingIntent::Relative));
     }
 
     let render = image

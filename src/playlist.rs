@@ -97,7 +97,8 @@ mod tests {
     use std::collections::HashSet;
 
     fn write_list(name: &str, contents: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("prism-bg-test-{}-{name}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("prism-bg-test-{}-{name}", std::process::id()));
         std::fs::write(&path, contents).unwrap();
         path
     }

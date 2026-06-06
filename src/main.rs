@@ -70,7 +70,9 @@ fn main() -> Result<()> {
     // files); only the initial entry is decoded fail-fast below.
     let mut playlists: Vec<playlist::Playlist> = Vec::new();
     for spec in &mut args.specs {
-        let Some(list) = &spec.image_list else { continue };
+        let Some(list) = &spec.image_list else {
+            continue;
+        };
         let pl = playlist::Playlist::load(
             list,
             spec.rotate_every.unwrap_or(cli::DEFAULT_ROTATE_EVERY),
@@ -101,17 +103,15 @@ fn main() -> Result<()> {
     // daemon — rotation skips them too): seek each list to its first
     // decodable entry, failing only if none decodes.
     for (i, pl) in playlists.iter_mut().enumerate() {
-        let loaded = (0..pl.len()).any(|_| {
-            match load_raw(&mut raw_images, pl.current()) {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::warn!(
-                        path = %pl.current().display(),
-                        "skipping playlist entry: {e:#}"
-                    );
-                    pl.advance();
-                    false
-                }
+        let loaded = (0..pl.len()).any(|_| match load_raw(&mut raw_images, pl.current()) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    path = %pl.current().display(),
+                    "skipping playlist entry: {e:#}"
+                );
+                pl.advance();
+                false
             }
         });
         if !loaded {
@@ -136,7 +136,9 @@ fn main() -> Result<()> {
     // waits on these (capability adaptation needs the caps).
     queue.roundtrip(&mut app).context("initial roundtrip")?;
     if app.color.as_ref().is_some_and(|c| !c.done) {
-        queue.roundtrip(&mut app).context("waiting for color manager caps")?;
+        queue
+            .roundtrip(&mut app)
+            .context("waiting for color manager caps")?;
     }
 
     // Wallpapers for the outputs we already know about (hotplug arrives
