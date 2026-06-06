@@ -7,8 +7,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use smithay_client_toolkit::reexports::calloop::{
+    timer::{TimeoutAction, Timer},
+    LoopHandle,
+};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
@@ -33,6 +38,9 @@ use wayland_client::{
     globals::GlobalList,
     protocol::{wl_output, wl_shm, wl_subsurface::WlSubsurface, wl_surface::WlSurface},
     Connection, QueueHandle,
+};
+use wayland_protocols::wp::alpha_modifier::v1::client::{
+    wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1, wp_alpha_modifier_v1::WpAlphaModifierV1,
 };
 use wayland_protocols::wp::color_management::v1::client::wp_color_management_surface_v1::WpColorManagementSurfaceV1;
 use wayland_protocols::wp::viewporter::client::{
@@ -74,11 +82,16 @@ struct ImagePart {
     subsurface: WlSubsurface,
     surface: WlSurface,
     viewport: WpViewport,
+    /// `wp_alpha_modifier_surface_v1`, created only for parts attached
+    /// with a crossfade (the multiplier ramps 0 → max).
+    alpha: Option<WpAlphaModifierSurfaceV1>,
     /// Keeps the color-management surface wrapper (and with it the
     /// description binding) alive.
     cm: Option<WpColorManagementSurfaceV1>,
     image: Arc<DecodedImage>,
     mode: Mode,
+    /// What this part shows, for change detection in [`App::service`].
+    key: ImageKey,
 }
 
 impl Drop for ImagePart {
@@ -89,10 +102,27 @@ impl Drop for ImagePart {
         if let Some(cm) = &self.cm {
             cm.destroy();
         }
+        // The protocol requires destroying this before the wl_surface.
+        if let Some(alpha) = &self.alpha {
+            alpha.destroy();
+        }
         self.viewport.destroy();
         self.subsurface.destroy();
         self.surface.destroy();
     }
+}
+
+/// An in-flight crossfade: the outgoing part stays mapped (stacked below
+/// the incoming one) while the incoming surface's alpha multiplier ramps
+/// up, then both are dropped here at completion. The compositor does the
+/// blend — prism in linear fp16, so the dissolve is gamma-correct.
+struct Fade {
+    start: Instant,
+    duration: Duration,
+    /// Outgoing subsurface tree, destroyed when the fade finishes.
+    _old_part: ImagePart,
+    /// The outgoing part's pixels must outlive its surface.
+    _old_buffer: Option<Buffer>,
 }
 
 struct Wallpaper {
@@ -105,6 +135,9 @@ struct Wallpaper {
     /// Built lazily by [`App::service`] once the tone target (if `auto`)
     /// and the image description are resolved.
     image_part: Option<ImagePart>,
+    /// Crossfade in progress (`--fade`), stepped by frame callbacks on
+    /// the layer surface.
+    fade: Option<Fade>,
     /// Image preparation failed; don't retry every service pass.
     broken: bool,
     /// Keeps the preferred-description subscription alive (auto mode).
@@ -128,6 +161,9 @@ pub struct App {
     pub subcompositor: SubcompositorState,
     pub layer_shell: LayerShell,
     pub viewporter: SimpleViewporter,
+    /// `wp_alpha_modifier_v1` if the compositor has it; `--fade` degrades
+    /// to a hard cut without it.
+    pub alpha_modifier: Option<WpAlphaModifierV1>,
     pub color: Option<ColorState>,
     pub intent: Intent,
     pub specs: Vec<OutputSpec>,
@@ -145,8 +181,15 @@ pub struct App {
     /// Rotation state per `--image-list` spec group, indexed by
     /// `OutputSpec::playlist`. Advanced by per-playlist timers in `main`.
     pub playlists: Vec<Playlist>,
+    /// For inserting the fade ticker when a crossfade starts.
+    loop_handle: LoopHandle<'static, App>,
+    /// A fade ticker is currently inserted (one drives all fades).
+    fade_timer_armed: bool,
     wallpapers: Vec<Wallpaper>,
 }
+
+/// Crossfade tick period, ~60 Hz.
+const FADE_TICK: Duration = Duration::from_millis(16);
 
 pub type SimpleViewporter = smithay_client_toolkit::registry::SimpleGlobal<WpViewporter, 1>;
 
@@ -157,6 +200,7 @@ impl App {
         args: &Args,
         raw_images: HashMap<PathBuf, Arc<DecodedImage>>,
         playlists: Vec<Playlist>,
+        loop_handle: LoopHandle<'static, App>,
     ) -> Result<App> {
         let compositor =
             CompositorState::bind(globals, qh).context("wl_compositor not available")?;
@@ -170,6 +214,12 @@ impl App {
         let pool = SlotPool::new(4096, &shm).context("creating shm pool")?;
         let viewporter =
             SimpleViewporter::bind(globals, qh).context("wp_viewporter not available")?;
+        let alpha_modifier: Option<WpAlphaModifierV1> = globals.bind(qh, 1..=1, ()).ok();
+        if alpha_modifier.is_none() && args.specs.iter().any(|s| s.fade.is_some()) {
+            tracing::warn!(
+                "compositor lacks wp_alpha_modifier_v1; --fade disabled (rotation cuts hard)"
+            );
+        }
         let color = if args.no_color_management {
             None
         } else {
@@ -192,6 +242,7 @@ impl App {
             subcompositor,
             layer_shell,
             viewporter,
+            alpha_modifier,
             color,
             intent: args.intent,
             specs: args.specs.clone(),
@@ -200,6 +251,8 @@ impl App {
             tone_targets: HashMap::new(),
             pending_targets: HashMap::new(),
             playlists,
+            loop_handle,
+            fade_timer_armed: false,
             wallpapers: Vec::new(),
         })
     }
@@ -280,6 +333,7 @@ impl App {
             viewport,
             color,
             image_part: None,
+            fade: None,
             broken: false,
             _feedback: feedback,
             size: (0, 0),
@@ -291,12 +345,14 @@ impl App {
 
     /// Attach images to wallpapers whose prerequisites have resolved:
     /// the tone target (when `--tone-map auto`) and the image description
-    /// readiness. Called from the main loop after every dispatch — cheap
-    /// when nothing is pending.
+    /// readiness. A wallpaper needs attention when its desired image (the
+    /// playlist's current entry) differs from the attached one — the old
+    /// part keeps showing until the new one is ready. Called from the
+    /// main loop after every dispatch — cheap when nothing is pending.
     pub fn service(&mut self, qh: &QueueHandle<App>) {
         for i in 0..self.wallpapers.len() {
             let wp = &self.wallpapers[i];
-            if wp.image_part.is_some() || wp.broken {
+            if wp.broken {
                 continue;
             }
             let spec = wp.spec.clone();
@@ -331,6 +387,13 @@ impl App {
 
             let treatment = resolve_treatment(&spec, tone);
             let key: ImageKey = (path, treatment.map(|t| t.key()));
+            if self.wallpapers[i]
+                .image_part
+                .as_ref()
+                .is_some_and(|p| p.key == key)
+            {
+                continue; // already showing it
+            }
             if let Err(e) = self.ensure_image(qh, &key, treatment) {
                 tracing::error!(output = name, "preparing image failed: {e:#}");
                 self.wallpapers[i].broken = true;
@@ -467,10 +530,22 @@ impl App {
     }
 
     /// Build the image subsurface for wallpaper `i` from the prepared
-    /// image at `key`, tag it, and draw.
+    /// image at `key`, tag it, and draw. When this replaces an existing
+    /// part and `--fade` is in effect, the old part stays mapped (a new
+    /// subsurface stacks topmost, so the incoming one covers it) and the
+    /// incoming surface fades in over it.
     fn attach_image(&mut self, qh: &QueueHandle<App>, i: usize, key: &ImageKey) {
-        let loaded = &self.images[key];
+        // A fade still running here means rotation outpaced it; cut it
+        // short so there is exactly one outgoing part.
+        self.finish_fade(i);
+
         let wp = &self.wallpapers[i];
+        let fade_duration = wp
+            .spec
+            .fade
+            .filter(|_| self.alpha_modifier.is_some() && wp.image_part.is_some());
+
+        let loaded = &self.images[key];
         let (subsurface, child) = self
             .subcompositor
             .create_subsurface(wp.layer.wl_surface().clone(), qh);
@@ -479,7 +554,19 @@ impl App {
             (Some(color), Some(desc)) => Some(color.tag_surface(qh, &child, desc, self.intent)),
             _ => None,
         };
-        if !loaded.image.has_alpha {
+        let alpha = fade_duration.map(|_| {
+            let alpha = self
+                .alpha_modifier
+                .as_ref()
+                .expect("checked above")
+                .get_surface(&child, qh, ());
+            alpha.set_multiplier(0);
+            alpha
+        });
+        // The opaque-region hint must reflect what the compositor may
+        // skip drawing under us: a fading part is translucent whatever
+        // its pixels say, so it gets the hint at fade completion instead.
+        if !loaded.image.has_alpha && fade_duration.is_none() {
             if let Ok(region) = Region::new(&self.compositor) {
                 region.add(0, 0, i32::MAX, i32::MAX);
                 child.set_opaque_region(Some(region.wl_region()));
@@ -489,13 +576,112 @@ impl App {
             subsurface,
             surface: child,
             viewport,
+            alpha,
             cm,
             image: loaded.image.clone(),
             mode: wp.spec.effective_mode(),
+            key: key.clone(),
         };
-        tracing::info!(output = wp.name, "image attached");
-        self.wallpapers[i].image_part = Some(part);
+        tracing::info!(output = wp.name, fade = ?fade_duration, "image attached");
+        let wp = &mut self.wallpapers[i];
+        let old_part = wp.image_part.replace(part);
+        let old_buffer = wp.image_buffer.take();
+        if let Some(duration) = fade_duration {
+            wp.fade = Some(Fade {
+                start: Instant::now(),
+                duration,
+                _old_part: old_part.expect("fade only replaces an existing part"),
+                _old_buffer: old_buffer,
+            });
+            self.arm_fade_timer();
+        }
         self.draw(i);
+    }
+
+    /// Insert the fade ticker if it isn't running. A calloop timer rather
+    /// than frame callbacks: an occluded surface gets no frame callbacks
+    /// (the parent is always hidden under its own opaque image part, and
+    /// the whole wallpaper may sit under a fullscreen window), which
+    /// would stall a callback-paced fade indefinitely.
+    fn arm_fade_timer(&mut self) {
+        if self.fade_timer_armed {
+            return;
+        }
+        let inserted = self.loop_handle.insert_source(
+            Timer::from_duration(FADE_TICK),
+            |_, _, app: &mut App| {
+                if app.step_fades() {
+                    TimeoutAction::ToDuration(FADE_TICK)
+                } else {
+                    app.fade_timer_armed = false;
+                    TimeoutAction::Drop
+                }
+            },
+        );
+        match inserted {
+            Ok(_) => self.fade_timer_armed = true,
+            Err(e) => {
+                // Can't animate; cut every pending fade to its end state.
+                tracing::error!("inserting fade timer: {e}; cutting hard");
+                for i in 0..self.wallpapers.len() {
+                    self.finish_fade(i);
+                    self.wallpapers[i].layer.commit();
+                }
+            }
+        }
+    }
+
+    /// Advance every running crossfade by one tick; returns whether any
+    /// is still running (keeps the ticker alive).
+    fn step_fades(&mut self) -> bool {
+        for i in 0..self.wallpapers.len() {
+            self.step_fade(i);
+        }
+        self.wallpapers.iter().any(|w| w.fade.is_some())
+    }
+
+    /// Advance wallpaper `i`'s crossfade: bump the incoming surface's
+    /// alpha multiplier and re-commit (the subsurface is sync, so the
+    /// parent commit latches it).
+    fn step_fade(&mut self, i: usize) {
+        let Some(fade) = &self.wallpapers[i].fade else {
+            return;
+        };
+        let t = fade.start.elapsed().as_secs_f64() / fade.duration.as_secs_f64();
+        tracing::trace!(output = self.wallpapers[i].name, t, "fade step");
+        if t >= 1.0 {
+            self.finish_fade(i);
+            self.wallpapers[i].layer.commit();
+            return;
+        }
+        let wp = &self.wallpapers[i];
+        let part = wp.image_part.as_ref().expect("fading wallpaper has a part");
+        let alpha = part.alpha.as_ref().expect("fading part has a multiplier");
+        alpha.set_multiplier((t * u32::MAX as f64) as u32);
+        part.surface.commit();
+        wp.layer.commit();
+    }
+
+    /// Complete wallpaper `i`'s crossfade, if one is running: full
+    /// opacity, the deferred opaque-region hint, and the outgoing part
+    /// dropped (destroying its subsurface tree). The caller commits the
+    /// parent to latch the child state.
+    fn finish_fade(&mut self, i: usize) {
+        let wp = &mut self.wallpapers[i];
+        let Some(_fade) = wp.fade.take() else {
+            return;
+        };
+        let part = wp.image_part.as_ref().expect("fading wallpaper has a part");
+        let alpha = part.alpha.as_ref().expect("fading part has a multiplier");
+        alpha.set_multiplier(u32::MAX);
+        if !part.image.has_alpha {
+            if let Ok(region) = Region::new(&self.compositor) {
+                region.add(0, 0, i32::MAX, i32::MAX);
+                part.surface.set_opaque_region(Some(region.wl_region()));
+            }
+        }
+        part.surface.commit();
+        // _fade drops here: outgoing subsurface destroyed, buffer freed.
     }
 
     fn get_viewport(&self, qh: &QueueHandle<App>, surface: &WlSurface) -> WpViewport {
@@ -623,11 +809,12 @@ impl App {
         }
         tracing::info!(from = %previous.display(), to = %next.display(), "rotating wallpaper");
 
+        // The old part stays attached (and displayed) until service()
+        // swaps in — or fades in — the new one; with the playlist
+        // advanced, the key comparison flags these wallpapers as stale.
         for wp in &mut self.wallpapers {
             if wp.spec.playlist == Some(idx) {
-                wp.image_part = None; // Drop destroys the subsurface tree
-                wp.image_buffer = None;
-                wp.broken = false;
+                wp.broken = false; // retry with the new entry
             }
         }
         self.evict_unused_images();
@@ -674,7 +861,9 @@ impl CompositorHandler for App {
     }
 
     fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: u32) {
-        // Static content; we never request frame callbacks.
+        // Static content; we never request frame callbacks (and an
+        // occluded wallpaper wouldn't receive them — fades tick on a
+        // calloop timer instead).
     }
 
     fn surface_enter(
@@ -726,6 +915,7 @@ impl OutputHandler for App {
                     .as_ref()
                     .is_some_and(|p| matches!(p.mode, Mode::Center | Mode::Tile));
                 if affected {
+                    self.finish_fade(i); // don't leave the outgoing part stale
                     self.draw(i);
                 }
             }
@@ -765,6 +955,9 @@ impl LayerShellHandler for App {
         if new_size == self.wallpapers[i].size && self.wallpapers[i].color_buffer.is_some() {
             return;
         }
+        // A resize mid-fade would leave the outgoing part at stale
+        // geometry (only the current part is redrawn); cut to the end.
+        self.finish_fade(i);
         self.wallpapers[i].size = new_size;
         self.draw(i);
     }
@@ -797,3 +990,5 @@ delegate_layer!(App);
 delegate_registry!(App);
 delegate_simple!(App, WpViewporter, 1);
 wayland_client::delegate_noop!(App: ignore WpViewport);
+wayland_client::delegate_noop!(App: WpAlphaModifierV1);
+wayland_client::delegate_noop!(App: WpAlphaModifierSurfaceV1);

@@ -96,6 +96,8 @@ pub struct OutputSpec {
     pub rotate_every: Option<Duration>,
     /// `--randomize`: shuffle the playlist order.
     pub randomize: bool,
+    /// `--fade`: crossfade duration on rotation; `None` is a hard cut.
+    pub fade: Option<Duration>,
     pub mode: Option<Mode>,
     pub color: Option<Color>,
     /// HDR luminance shaping (`--cap-luminance` / `--scale-luminance`).
@@ -113,6 +115,7 @@ impl OutputSpec {
             playlist: None,
             rotate_every: None,
             randomize: false,
+            fade: None,
             mode: None,
             color: None,
             luminance: None,
@@ -160,6 +163,9 @@ Usage: prism-bg <options...>
                          1h (bare number = seconds). Default: 15m.
       --randomize        Shuffle the playlist order; reshuffles each pass
                          without immediate repeats.
+      --fade <duration>  Crossfade on rotation instead of a hard cut, e.g.
+                         500ms, 2s. Needs --image-list and compositor
+                         support (wp_alpha_modifier_v1).
       --cap-luminance <nits>
                          Hard-clip HDR content above this luminance.
       --scale-luminance <nits>
@@ -222,6 +228,10 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
             }
             "--randomize" => {
                 current.randomize = true;
+                current_touched = true;
+            }
+            "--fade" => {
+                current.fade = Some(parse_fade(&value("--fade")?)?);
                 current_touched = true;
             }
             "-m" | "--mode" => {
@@ -288,9 +298,11 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
                 spec.output
             );
         }
-        if (spec.rotate_every.is_some() || spec.randomize) && spec.image_list.is_none() {
+        if (spec.rotate_every.is_some() || spec.randomize || spec.fade.is_some())
+            && spec.image_list.is_none()
+        {
             bail!(
-                "output {:?}: --rotate-every/--randomize require --image-list",
+                "output {:?}: --rotate-every/--randomize/--fade require --image-list",
                 spec.output
             );
         }
@@ -312,20 +324,38 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
     })
 }
 
-/// `90s`, `15m`, `1.5h`; a bare number is seconds.
-fn parse_duration(s: &str) -> Result<Duration> {
-    let (num, mult) = match s.as_bytes().last() {
-        Some(b's') => (&s[..s.len() - 1], 1.0),
-        Some(b'm') => (&s[..s.len() - 1], 60.0),
-        Some(b'h') => (&s[..s.len() - 1], 3600.0),
-        _ => (s, 1.0),
+/// `300ms`, `90s`, `15m`, `1.5h`; a bare number is seconds.
+fn parse_seconds(s: &str) -> Result<f64> {
+    let (num, mult) = if let Some(n) = s.strip_suffix("ms") {
+        (n, 0.001)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1.0)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60.0)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3600.0)
+    } else {
+        (s, 1.0)
     };
     let n: f64 = num
         .parse()
-        .with_context(|| format!("invalid duration {s:?} (expected e.g. 90s, 15m, 1h)"))?;
-    let secs = n * mult;
+        .with_context(|| format!("invalid duration {s:?} (expected e.g. 300ms, 90s, 15m, 1h)"))?;
+    Ok(n * mult)
+}
+
+fn parse_duration(s: &str) -> Result<Duration> {
+    let secs = parse_seconds(s)?;
     if !secs.is_finite() || !(1.0..=86_400.0 * 365.0).contains(&secs) {
         bail!("duration {s:?} out of range (1s ..= 365 days)");
+    }
+    Ok(Duration::from_secs_f64(secs))
+}
+
+/// Fades are frame-paced; sub-second values are the common case.
+fn parse_fade(s: &str) -> Result<Duration> {
+    let secs = parse_seconds(s)?;
+    if !secs.is_finite() || !(0.01..=60.0).contains(&secs) {
+        bail!("fade duration {s:?} out of range (10ms ..= 60s)");
     }
     Ok(Duration::from_secs_f64(secs))
 }
@@ -460,6 +490,34 @@ mod tests {
         assert_eq!(parse_dur("1.5h").unwrap(), Duration::from_secs(5400));
         assert!(parse_dur("0").is_err());
         assert!(parse_dur("nope").is_err());
+    }
+
+    #[test]
+    fn fade_durations() {
+        let parse_fade = |d: &str| {
+            parse(
+                ["--image-list", "w.txt", "--fade", d]
+                    .iter()
+                    .map(|s| s.to_string()),
+            )
+            .map(|a| a.specs[0].fade.unwrap())
+        };
+        assert_eq!(parse_fade("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_fade("2s").unwrap(), Duration::from_secs(2));
+        assert_eq!(parse_fade("2").unwrap(), Duration::from_secs(2));
+        assert!(parse_fade("5ms").is_err()); // below 10ms
+        assert!(parse_fade("2m").is_err()); // above 60s
+        assert!(parse_fade("nope").is_err());
+    }
+
+    #[test]
+    fn fade_requires_image_list() {
+        assert!(parse(
+            ["-i", "a.png", "--fade", "500ms"]
+                .iter()
+                .map(|s| s.to_string())
+        )
+        .is_err());
     }
 
     #[test]

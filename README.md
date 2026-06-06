@@ -74,6 +74,13 @@ Extras beyond swaybg (also per-output-group):
   (bare number = seconds). Default 15m.
 - `--randomize` — shuffle the playlist; reshuffles each pass, never
   repeating the same image back-to-back.
+- `--fade <duration>` — crossfade on rotation instead of a hard cut,
+  e.g. `500ms`, `2s`. The incoming image rides a second subsurface whose
+  `wp_alpha_modifier_v1` multiplier ramps up while the outgoing one stays
+  mapped beneath it — the compositor does the blend (prism in linear
+  fp16, so the dissolve is gamma-correct), and each image keeps its own
+  color description throughout. Without compositor support the flag
+  degrades to a hard cut with a warning.
 - `--intent perceptual|relative|absolute` (default perceptual).
 - `--no-color-management` (debug escape hatch).
 
