@@ -88,3 +88,19 @@ Formats: PNG, JPEG, WebP, JPEG XL, AVIF (needs libdav1d), JPEG XR
   wins (right for single-image files).
 - Fractional scale: `center`/`tile` use the integer output scale.
 - Animated outputs of any kind (this is a wallpaper).
+
+## Arch package
+
+An AUR-oriented `PKGBUILD` is provided for tagged releases. It installs the
+`prism-bg` binary; runtime dependencies are just `dav1d` (AVIF decode),
+`gcc-libs`, and `glibc` — the Wayland stack is pure Rust.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
