@@ -117,7 +117,12 @@ impl Drop for ImagePart {
 /// up, then both are dropped here at completion. The compositor does the
 /// blend — prism in linear fp16, so the dissolve is gamma-correct.
 struct Fade {
-    start: Instant,
+    /// Set on the first ticker step, not at attach: the buffer upload
+    /// for this output and image preparation for any other outputs in
+    /// the same service pass run synchronously after attach, and that
+    /// time must not be charged to the ramp (the dissolve would visibly
+    /// begin partway in).
+    start: Option<Instant>,
     duration: Duration,
     /// Outgoing subsurface tree, destroyed when the fade finishes.
     _old_part: ImagePart,
@@ -135,8 +140,8 @@ struct Wallpaper {
     /// Built lazily by [`App::service`] once the tone target (if `auto`)
     /// and the image description are resolved.
     image_part: Option<ImagePart>,
-    /// Crossfade in progress (`--fade`), stepped by frame callbacks on
-    /// the layer surface.
+    /// Crossfade in progress (`--fade`), stepped by the shared calloop
+    /// ticker (see [`App::arm_fade_timer`]).
     fade: Option<Fade>,
     /// Image preparation failed; don't retry every service pass.
     broken: bool,
@@ -588,7 +593,7 @@ impl App {
         let old_buffer = wp.image_buffer.take();
         if let Some(duration) = fade_duration {
             wp.fade = Some(Fade {
-                start: Instant::now(),
+                start: None,
                 duration,
                 _old_part: old_part.expect("fade only replaces an existing part"),
                 _old_buffer: old_buffer,
@@ -644,10 +649,11 @@ impl App {
     /// alpha multiplier and re-commit (the subsurface is sync, so the
     /// parent commit latches it).
     fn step_fade(&mut self, i: usize) {
-        let Some(fade) = &self.wallpapers[i].fade else {
+        let Some(fade) = &mut self.wallpapers[i].fade else {
             return;
         };
-        let t = fade.start.elapsed().as_secs_f64() / fade.duration.as_secs_f64();
+        let start = *fade.start.get_or_insert_with(Instant::now);
+        let t = start.elapsed().as_secs_f64() / fade.duration.as_secs_f64();
         tracing::trace!(output = self.wallpapers[i].name, t, "fade step");
         if t >= 1.0 {
             self.finish_fade(i);
