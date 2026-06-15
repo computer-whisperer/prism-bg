@@ -92,6 +92,10 @@ pub struct OutputSpec {
     /// Index into `App::playlists`, assigned by `main` after the list
     /// file is loaded. `None` until then (and always for `-i` specs).
     pub playlist: Option<usize>,
+    /// GLSL fragment shader file (`--shader`): rendered on the GPU into an
+    /// fp16 dmabuf and presented as a live wallpaper. Mutually exclusive
+    /// with `image`/`image_list`.
+    pub shader: Option<PathBuf>,
     /// `--rotate-every`; `None` means [`DEFAULT_ROTATE_EVERY`].
     pub rotate_every: Option<Duration>,
     /// `--randomize`: shuffle the playlist order.
@@ -112,6 +116,7 @@ impl OutputSpec {
             output,
             image: None,
             image_list: None,
+            shader: None,
             playlist: None,
             rotate_every: None,
             randomize: false,
@@ -149,6 +154,12 @@ Usage: prism-bg <options...>
 
   -c, --color RRGGBB     Set the background color.
   -i, --image <path>     Set the image to display.
+      --shader <file>    Render a GLSL fragment shader as a live wallpaper
+                         (GPU, fp16, color-managed). Shadertoy-style: define
+                         main() with iResolution/iTime; a shader that uses
+                         iTime animates (vsync-paced, paused when occluded),
+                         otherwise it renders a single frame. Mutually
+                         exclusive with --image/--image-list.
   -m, --mode <mode>      Set the mode to use for the image
                          (stretch|fit|fill|center|tile|solid_color).
   -o, --output <name>    Set the output to operate on or * for all,
@@ -220,6 +231,10 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
             }
             "--image-list" => {
                 current.image_list = Some(PathBuf::from(value("--image-list")?));
+                current_touched = true;
+            }
+            "--shader" => {
+                current.shader = Some(PathBuf::from(value("--shader")?));
                 current_touched = true;
             }
             "--rotate-every" => {
@@ -298,6 +313,12 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
                 spec.output
             );
         }
+        if spec.shader.is_some() && (spec.image.is_some() || spec.image_list.is_some()) {
+            bail!(
+                "output {:?}: --shader is mutually exclusive with --image/--image-list",
+                spec.output
+            );
+        }
         if (spec.rotate_every.is_some() || spec.randomize || spec.fade.is_some())
             && spec.image_list.is_none()
         {
@@ -306,7 +327,9 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
                 spec.output
             );
         }
-        if spec.effective_mode() != Mode::SolidColor
+        // A shader fills the whole surface, so geometry modes don't apply.
+        if spec.shader.is_none()
+            && spec.effective_mode() != Mode::SolidColor
             && spec.image.is_none()
             && spec.image_list.is_none()
         {

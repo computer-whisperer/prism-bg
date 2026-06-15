@@ -13,7 +13,9 @@ mod cms;
 mod color;
 mod colormgmt;
 mod decode;
+mod gpu;
 mod playlist;
+mod shader;
 mod surfaces;
 
 use std::collections::HashMap;

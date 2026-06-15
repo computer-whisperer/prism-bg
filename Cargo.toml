@@ -35,6 +35,20 @@ moxcms = "0.8"
 # playlist shuffle (--image-list --randomize).
 fastrand = "2"
 
+# GPU shader wallpapers (--shader). ash is thin Vulkan bindings: we drive
+# the dmabuf-export + drm-format-modifier path directly (no WSI swapchain),
+# so the client keeps control of the buffer and its color-management tag,
+# exactly as the shm path does. shaderc links system libshaderc for
+# GLSL→SPIR-V at load time; drm-fourcc names the DRM formats/modifiers
+# shared with the compositor.
+ash = "0.38"
+shaderc = "0.10"
+drm-fourcc = "2"
+# DRM device-node (dev_t) math for matching a Vulkan device to the GPU a
+# given output is on (VK_EXT_physical_device_drm ↔ dmabuf-feedback target),
+# and mmap of the dmabuf-feedback format table.
+libc = "0.2"
+
 # JPEG XR (Windows HDR wallpapers/screenshots, scRGB) — vendored jxrlib C.
 jpegxr = "0.3"
 

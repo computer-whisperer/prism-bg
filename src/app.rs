@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use smithay_client_toolkit::reexports::calloop::{
     timer::{TimeoutAction, Timer},
     LoopHandle,
@@ -47,10 +47,14 @@ use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
 
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
+
 use crate::cli::{Args, Color, Intent, Mode, OutputSpec};
 use crate::colormgmt::{ColorState, DescriptionHandle, Status};
 use crate::decode::DecodedImage;
+use crate::gpu::GpuPool;
 use crate::playlist::Playlist;
+use crate::shader::{DmabufState, ShaderSurface};
 use crate::surfaces::{place, upload, upload_tiled, WireRgb8};
 
 /// Image identity for deduplication: path + effective luminance treatment
@@ -155,6 +159,9 @@ struct Wallpaper {
     scale: i32,
     color_buffer: Option<Buffer>,
     image_buffer: Option<Buffer>,
+    /// GPU shader wallpaper (`--shader`); mutually exclusive with the image
+    /// path. Renders into dmabuf buffers attached to the layer surface.
+    shader: Option<ShaderSurface>,
 }
 
 pub struct App {
@@ -191,6 +198,13 @@ pub struct App {
     /// A fade ticker is currently inserted (one drives all fades).
     fade_timer_armed: bool,
     wallpapers: Vec<Wallpaper>,
+    // Declared after `wallpapers` so they drop *after* it: a ShaderSurface
+    // tears down its Vulkan objects in Drop using devices the pool owns.
+    /// Vulkan backend (one logical device per physical GPU), created lazily
+    /// only when a `--shader` spec exists.
+    pub gpus: Option<GpuPool>,
+    /// `zwp_linux_dmabuf_v1` (bound v4 for per-surface feedback).
+    pub dmabuf: Option<DmabufState>,
 }
 
 /// Crossfade tick period, ~60 Hz.
@@ -238,6 +252,26 @@ impl App {
             c
         };
 
+        // Shader wallpapers need the GPU backend and dmabuf import. Only pay
+        // for them when a --shader spec is present.
+        let wants_shader = args.specs.iter().any(|s| s.shader.is_some());
+        let gpus = if wants_shader {
+            Some(GpuPool::new().context("initializing GPU backend for --shader")?)
+        } else {
+            None
+        };
+        // Bind at version 4 for per-surface feedback (the output's GPU +
+        // importable modifiers). Required when shaders are requested.
+        let dmabuf = globals
+            .bind::<ZwpLinuxDmabufV1, _, _>(qh, 4..=4, ())
+            .ok()
+            .map(|proxy| DmabufState { proxy });
+        if wants_shader && dmabuf.is_none() {
+            bail!(
+                "compositor lacks zwp_linux_dmabuf_v1 v4; --shader needs it for GPU presentation"
+            );
+        }
+
         Ok(App {
             registry_state: RegistryState::new(globals),
             output_state: OutputState::new(globals, qh),
@@ -259,6 +293,8 @@ impl App {
             loop_handle,
             fade_timer_armed: false,
             wallpapers: Vec::new(),
+            gpus,
+            dmabuf,
         })
     }
 
@@ -320,6 +356,27 @@ impl App {
             _ => None,
         };
 
+        // A shader spec renders on the GPU instead of attaching an image.
+        // Compile it and subscribe to per-surface dmabuf feedback (which
+        // resolves the output's GPU); targets are built once feedback and
+        // the configure size are both in.
+        let shader = match &spec.shader {
+            Some(path) => match self.build_shader(qh, path) {
+                Ok(mut s) => {
+                    if let Some(dmabuf) = &self.dmabuf {
+                        s.request_feedback(dmabuf, qh, layer.wl_surface(), name.clone());
+                    }
+                    Some(s)
+                }
+                Err(e) => {
+                    tracing::error!(output = name, "shader setup failed: {e:#}");
+                    None
+                }
+            },
+            None => None,
+        };
+        let shader_broken = spec.shader.is_some() && shader.is_none();
+
         // Bare commit maps the layer surface; the configure callback draws
         // the color, service() attaches the image once it's prepared.
         layer.commit();
@@ -339,13 +396,45 @@ impl App {
             color,
             image_part: None,
             fade: None,
-            broken: false,
+            broken: shader_broken,
             _feedback: feedback,
             size: (0, 0),
             scale,
             color_buffer: None,
             image_buffer: None,
+            shader,
         });
+    }
+
+    /// Read and compile a shader file into a [`ShaderSurface`]. The GPU and
+    /// targets are chosen later, once dmabuf feedback resolves the output's
+    /// device and the configure size is known.
+    fn build_shader(&self, qh: &QueueHandle<App>, path: &std::path::Path) -> Result<ShaderSurface> {
+        let source = std::fs::read_to_string(path)
+            .with_context(|| format!("reading shader {}", path.display()))?;
+        ShaderSurface::new(qh, &source, self.color.as_ref())
+    }
+
+    /// Feed a dmabuf-feedback event to the named output's shader surface and
+    /// (re)draw if it resolved a new GPU/modifier set. Called from the
+    /// feedback dispatch handler.
+    pub fn on_shader_feedback(
+        &mut self,
+        qh: &QueueHandle<App>,
+        output: &str,
+        event: wayland_protocols::wp::linux_dmabuf::zv1::client
+            ::zwp_linux_dmabuf_feedback_v1::Event,
+    ) {
+        let Some(i) = self.wallpapers.iter().position(|w| w.name == output) else {
+            return;
+        };
+        let resolved = match self.wallpapers[i].shader.as_mut() {
+            Some(s) => s.feedback_event(event),
+            None => return,
+        };
+        if resolved {
+            self.draw(qh, i);
+        }
     }
 
     /// Attach images to wallpapers whose prerequisites have resolved:
@@ -357,8 +446,8 @@ impl App {
     pub fn service(&mut self, qh: &QueueHandle<App>) {
         for i in 0..self.wallpapers.len() {
             let wp = &self.wallpapers[i];
-            if wp.broken {
-                continue;
+            if wp.broken || wp.shader.is_some() {
+                continue; // shader wallpapers render via the GPU path, not here
             }
             let spec = wp.spec.clone();
             let name = wp.name.clone();
@@ -600,7 +689,7 @@ impl App {
             });
             self.arm_fade_timer();
         }
-        self.draw(i);
+        self.draw(qh, i);
     }
 
     /// Insert the fade ticker if it isn't running. A calloop timer rather
@@ -697,13 +786,66 @@ impl App {
             .get_viewport(surface, qh, ())
     }
 
-    fn draw(&mut self, index: usize) {
-        if let Err(e) = self.try_draw(index) {
+    fn draw(&mut self, qh: &QueueHandle<App>, index: usize) {
+        let result = if self.wallpapers[index].shader.is_some() {
+            self.try_draw_shader(qh, index)
+        } else {
+            self.try_draw(index)
+        };
+        if let Err(e) = result {
             tracing::error!(
                 output = self.wallpapers[index].name,
                 "drawing wallpaper failed: {e:#}"
             );
+            // A shader failure (e.g. modifier negotiation) won't fix itself;
+            // stop retrying every frame.
+            if self.wallpapers[index].shader.is_some() {
+                self.wallpapers[index].broken = true;
+            }
         }
+    }
+
+    /// Render one shader frame for wallpaper `index` on the GPU that drives
+    /// its output (per dmabuf feedback). No-op until both the configure size
+    /// and feedback have arrived. Disjoint field borrows (gpus / dmabuf /
+    /// color / wallpaper) keep the borrow checker happy.
+    fn try_draw_shader(&mut self, qh: &QueueHandle<App>, index: usize) -> Result<()> {
+        let (w, h) = self.wallpapers[index].size;
+        if w == 0 || h == 0 {
+            return Ok(()); // not configured yet
+        }
+        // Which GPU drives this output? Resolved from feedback; until then
+        // there's nothing to render.
+        let device_dev = match self.wallpapers[index]
+            .shader
+            .as_ref()
+            .and_then(|s| s.resolved_device())
+        {
+            Some(d) => d,
+            None => return Ok(()), // feedback pending
+        };
+
+        let pool = self.gpus.as_mut().context("GPU backend not initialized")?;
+        let gpu = pool.get_for_device(device_dev)?;
+        let dmabuf = self.dmabuf.as_ref().context("dmabuf not available")?;
+        let color = self.color.as_ref();
+        let intent = self.intent;
+        let wp = &mut self.wallpapers[index];
+        let scale = wp.scale.max(1) as u32;
+        let device_size = (w * scale, h * scale);
+        let shader = wp.shader.as_mut().context("not a shader wallpaper")?;
+        shader.render_frame(
+            gpu,
+            dmabuf,
+            qh,
+            wp.layer.wl_surface(),
+            &wp.viewport,
+            device_size,
+            (w, h),
+            color,
+            intent,
+        )?;
+        Ok(())
     }
 
     fn try_draw(&mut self, index: usize) -> Result<()> {
@@ -866,10 +1008,25 @@ impl CompositorHandler for App {
     ) {
     }
 
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: u32) {
-        // Static content; we never request frame callbacks (and an
-        // occluded wallpaper wouldn't receive them — fades tick on a
-        // calloop timer instead).
+    fn frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, surface: &WlSurface, _: u32) {
+        // Image wallpapers are static and never request frame callbacks.
+        // Animated shader wallpapers re-render here and arm the next
+        // callback; an occluded surface gets none, so animation pauses
+        // (and with it the GPU cost) until it's visible again.
+        if let Some(i) = self
+            .wallpapers
+            .iter()
+            .position(|w| w.layer.wl_surface() == surface)
+        {
+            let animate = !self.wallpapers[i].broken
+                && self.wallpapers[i]
+                    .shader
+                    .as_ref()
+                    .is_some_and(|s| s.animated());
+            if animate {
+                self.draw(qh, i);
+            }
+        }
     }
 
     fn surface_enter(
@@ -905,7 +1062,7 @@ impl OutputHandler for App {
     fn update_output(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
         let Some(info) = self.output_state.info(&output) else {
@@ -915,14 +1072,16 @@ impl OutputHandler for App {
             if self.wallpapers[i].scale != info.scale_factor {
                 self.wallpapers[i].scale = info.scale_factor;
                 // Scale affects center (1:1 pixels) and tile (assembled
-                // buffer); other modes are scale-independent.
-                let affected = self.wallpapers[i]
-                    .image_part
-                    .as_ref()
-                    .is_some_and(|p| matches!(p.mode, Mode::Center | Mode::Tile));
+                // buffer); other modes are scale-independent. A shader's
+                // device-pixel target size scales too, so it always redraws.
+                let affected = self.wallpapers[i].shader.is_some()
+                    || self.wallpapers[i]
+                        .image_part
+                        .as_ref()
+                        .is_some_and(|p| matches!(p.mode, Mode::Center | Mode::Tile));
                 if affected {
                     self.finish_fade(i); // don't leave the outgoing part stale
-                    self.draw(i);
+                    self.draw(qh, i);
                 }
             }
         }
@@ -949,7 +1108,7 @@ impl LayerShellHandler for App {
     fn configure(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
@@ -958,14 +1117,18 @@ impl LayerShellHandler for App {
             return;
         };
         let new_size = configure.new_size;
-        if new_size == self.wallpapers[i].size && self.wallpapers[i].color_buffer.is_some() {
+        // Already drawn at this size? (Shader wallpapers have no color
+        // buffer; their ring being built is the equivalent signal.)
+        let drawn =
+            self.wallpapers[i].color_buffer.is_some() || self.wallpapers[i].shader.is_some();
+        if new_size == self.wallpapers[i].size && drawn {
             return;
         }
         // A resize mid-fade would leave the outgoing part at stale
         // geometry (only the current part is redrawn); cut to the end.
         self.finish_fade(i);
         self.wallpapers[i].size = new_size;
-        self.draw(i);
+        self.draw(qh, i);
     }
 }
 
