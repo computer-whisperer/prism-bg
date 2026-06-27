@@ -129,6 +129,21 @@ Extras beyond swaybg (also per-output-group):
 
   See `examples/shaders/spectrum.frag` for a worked example. With no PipeWire
   (or no audio playing) the values are zero and the shader just renders silence.
+
+  A shader can also use **feedback** — sampling its own previous frame — for
+  trails, decay, reaction-diffusion, fluid, and other evolving effects.
+  Reference `iPrevFrame` and prism-bg renders the shader into a ping-pong
+  buffer, feeding last frame back in (the buffer is `RGBA16_SFLOAT` linear, so
+  trails keep HDR range — unlike Shadertoy's LDR buffers):
+
+  ```glsl
+  layout(set = 1, binding = 0) uniform sampler2D iPrevFrame;
+  // fragCoord is y-up but textures sample y-down, so flip y when reading:
+  vec3 prev(vec2 uv) { return texture(iPrevFrame, vec2(uv.x, 1.0 - uv.y)).rgb; }
+  ```
+
+  See `examples/shaders/feedback.frag`. Feedback shaders redraw every frame to
+  evolve (cap with `--fps`); on the first frame `iPrevFrame` is black.
 - `--fps <n>` — cap an animated shader's render rate (1..=1000); default is
   the compositor's vsync cadence. `iTime` stays real-time, so animation speed
   is unchanged — it's just sampled less often. Requires `--shader`.

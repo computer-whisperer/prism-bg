@@ -215,6 +215,9 @@ pub struct ShaderSurface {
     /// Whether the shader references the audio uniforms (`iAudio*`); if any
     /// surface does, the app spins up the PipeWire capture.
     uses_audio: bool,
+    /// Whether the shader samples `iPrevFrame` (feedback). Enables the
+    /// ping-pong feedback buffer + blit present path in the renderer.
+    uses_feedback: bool,
     /// iTime origin, set on the first rendered frame.
     started: Option<Instant>,
     /// `--fps` cap as a minimum interval between renders; `None` is uncapped
@@ -247,9 +250,11 @@ impl ShaderSurface {
         // bad shader fails at startup rather than silently on the GPU.
         crate::gpu::validate_fragment(fragment_glsl)?;
         let uses_audio = fragment_glsl.contains("iAudio");
-        // Audio-reactive shaders must redraw every frame to track the spectrum,
-        // so they count as animated even without `iTime`.
-        let animated = fragment_glsl.contains("iTime") || uses_audio;
+        let uses_feedback = fragment_glsl.contains("iPrevFrame");
+        // Audio-reactive and feedback shaders must redraw every frame (to track
+        // the spectrum / evolve the buffer), so they count as animated even
+        // without `iTime`.
+        let animated = fragment_glsl.contains("iTime") || uses_audio || uses_feedback;
         if fps.is_some() && !animated {
             tracing::warn!("--fps ignored: shader is static (no iTime), renders a single frame");
         }
@@ -273,6 +278,7 @@ impl ShaderSurface {
             source: fragment_glsl.to_string(),
             animated,
             uses_audio,
+            uses_feedback,
             started: None,
             min_interval,
             last_render: None,
@@ -399,7 +405,7 @@ impl ShaderSurface {
             self.state = Some(DeviceState {
                 device_dev,
                 device: gpu.device.clone(),
-                renderer: ShaderRenderer::new(gpu, &self.source, RING)?,
+                renderer: ShaderRenderer::new(gpu, &self.source, RING, self.uses_feedback)?,
                 ring: Vec::new(),
                 size: (0, 0),
             });
@@ -492,6 +498,9 @@ impl ShaderSurface {
                 available,
             });
         }
+        // Feedback shaders: (re)create the ping-pong textures at the same size.
+        // No-op for non-feedback renderers.
+        st.renderer.resize_feedback(gpu, size.0, size.1)?;
         st.size = size;
         tracing::info!(
             width = size.0,
