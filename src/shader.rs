@@ -20,7 +20,7 @@
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use ash::vk;
@@ -195,6 +195,11 @@ pub struct ShaderSurface {
     animated: bool,
     /// iTime origin, set on the first rendered frame.
     started: Option<Instant>,
+    /// `--fps` cap as a minimum interval between renders; `None` is uncapped
+    /// (vsync). Only throttles animated shaders.
+    min_interval: Option<Duration>,
+    /// Wall-clock of the last actual render, for the `--fps` throttle.
+    last_render: Option<Instant>,
     /// Extended-linear description for the surface; `None` without CM.
     description: Option<DescriptionHandle>,
     cm: Option<WpColorManagementSurfaceV1>,
@@ -214,11 +219,19 @@ impl ShaderSurface {
         qh: &QueueHandle<App>,
         fragment_glsl: &str,
         color: Option<&ColorState>,
+        fps: Option<u32>,
     ) -> Result<ShaderSurface> {
         // Validate the shader compiles up front (device-independent), so a
         // bad shader fails at startup rather than silently on the GPU.
         crate::gpu::validate_fragment(fragment_glsl)?;
         let animated = fragment_glsl.contains("iTime");
+        if fps.is_some() && !animated {
+            tracing::warn!("--fps ignored: shader is static (no iTime), renders a single frame");
+        }
+        // Cap as a minimum inter-render interval; only meaningful when animated.
+        let min_interval = fps
+            .filter(|_| animated)
+            .map(|n| Duration::from_secs_f64(1.0 / n as f64));
         let description = match color {
             Some(c) => match c.create_description(qh, &SHADER_ENCODING) {
                 Ok(d) => Some(d),
@@ -235,6 +248,8 @@ impl ShaderSurface {
             source: fragment_glsl.to_string(),
             animated,
             started: None,
+            min_interval,
+            last_render: None,
             description,
             cm: None,
             tagged: false,
@@ -308,6 +323,22 @@ impl ShaderSurface {
         if size.0 == 0 || size.1 == 0 {
             return Ok(self.animated);
         }
+
+        // --fps cap: if we rendered too recently, skip this callback's render
+        // but re-arm the next one with a cheap empty commit so animation keeps
+        // ticking. Staying frame-callback-driven preserves the occluded-surface
+        // pause (no callback while hidden → no wasted GPU). The 5% tolerance
+        // keeps a cap that's near a vsync divisor (e.g. 30 on 60Hz) from
+        // jittering down to the next-lower divisor; the cost is a hair of
+        // overshoot, never undershoot.
+        if let (Some(min), Some(last)) = (self.min_interval, self.last_render) {
+            if last.elapsed() < min.mul_f64(0.95) {
+                surface.frame(qh, surface.clone());
+                surface.commit();
+                return Ok(self.animated);
+            }
+        }
+
         let device_dev = self
             .resolved
             .as_ref()
@@ -379,6 +410,7 @@ impl ShaderSurface {
             .context("rendering shader frame")?;
         rt.available.store(false, Ordering::Release);
         surface.attach(Some(&rt.buffer), 0, 0);
+        self.last_render = Some(Instant::now());
         viewport.set_source(-1.0, -1.0, -1.0, -1.0);
         viewport.set_destination(logical.0 as i32, logical.1 as i32);
         surface.damage_buffer(0, 0, i32::MAX, i32::MAX);

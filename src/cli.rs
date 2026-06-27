@@ -96,6 +96,9 @@ pub struct OutputSpec {
     /// fp16 dmabuf and presented as a live wallpaper. Mutually exclusive
     /// with `image`/`image_list`.
     pub shader: Option<PathBuf>,
+    /// `--fps`: cap an animated shader's render rate (frames/second). `None`
+    /// renders at the compositor's vsync cadence. Ignored by static shaders.
+    pub fps: Option<u32>,
     /// `--rotate-every`; `None` means [`DEFAULT_ROTATE_EVERY`].
     pub rotate_every: Option<Duration>,
     /// `--randomize`: shuffle the playlist order.
@@ -117,6 +120,7 @@ impl OutputSpec {
             image: None,
             image_list: None,
             shader: None,
+            fps: None,
             playlist: None,
             rotate_every: None,
             randomize: false,
@@ -160,6 +164,9 @@ Usage: prism-bg <options...>
                          iTime animates (vsync-paced, paused when occluded),
                          otherwise it renders a single frame. Mutually
                          exclusive with --image/--image-list.
+      --fps <n>          Cap an animated shader's render rate (1..=1000).
+                         Default is the compositor's vsync cadence. Cuts GPU
+                         cost; iTime stays real-time. Requires --shader.
   -m, --mode <mode>      Set the mode to use for the image
                          (stretch|fit|fill|center|tile|solid_color).
   -o, --output <name>    Set the output to operate on or * for all,
@@ -235,6 +242,16 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
             }
             "--shader" => {
                 current.shader = Some(PathBuf::from(value("--shader")?));
+                current_touched = true;
+            }
+            "--fps" => {
+                let v = value("--fps")?;
+                let n: u32 = v
+                    .parse()
+                    .ok()
+                    .filter(|n| (1..=1000).contains(n))
+                    .with_context(|| format!("--fps expects an integer 1..=1000, got {v:?}"))?;
+                current.fps = Some(n);
                 current_touched = true;
             }
             "--rotate-every" => {
@@ -326,6 +343,9 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
                 "output {:?}: --rotate-every/--randomize/--fade require --image-list",
                 spec.output
             );
+        }
+        if spec.fps.is_some() && spec.shader.is_none() {
+            bail!("output {:?}: --fps requires --shader", spec.output);
         }
         // A shader fills the whole surface, so geometry modes don't apply.
         if spec.shader.is_none()
@@ -468,6 +488,20 @@ mod tests {
     #[test]
     fn mode_without_image_is_rejected() {
         assert!(parse(["-m", "fill"].iter().map(|s| s.to_string())).is_err());
+    }
+
+    #[test]
+    fn fps_requires_shader_and_validates_range() {
+        // Attaches to the shader's group.
+        let args = parse_ok(&["--shader", "s.frag", "--fps", "30"]);
+        assert_eq!(args.specs[0].fps, Some(30));
+        // No shader → rejected.
+        assert!(parse(["--fps", "30"].iter().map(|s| s.to_string())).is_err());
+        // Out of range / non-numeric → rejected.
+        let bad = |v: &str| parse(["--shader", "s.frag", "--fps", v].iter().map(|s| s.to_string()));
+        assert!(bad("0").is_err());
+        assert!(bad("1001").is_err());
+        assert!(bad("x").is_err());
     }
 
     #[test]

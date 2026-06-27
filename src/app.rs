@@ -361,7 +361,7 @@ impl App {
         // resolves the output's GPU); targets are built once feedback and
         // the configure size are both in.
         let shader = match &spec.shader {
-            Some(path) => match self.build_shader(qh, path) {
+            Some(path) => match self.build_shader(qh, path, spec.fps) {
                 Ok(mut s) => {
                     if let Some(dmabuf) = &self.dmabuf {
                         s.request_feedback(dmabuf, qh, layer.wl_surface(), name.clone());
@@ -409,10 +409,15 @@ impl App {
     /// Read and compile a shader file into a [`ShaderSurface`]. The GPU and
     /// targets are chosen later, once dmabuf feedback resolves the output's
     /// device and the configure size is known.
-    fn build_shader(&self, qh: &QueueHandle<App>, path: &std::path::Path) -> Result<ShaderSurface> {
+    fn build_shader(
+        &self,
+        qh: &QueueHandle<App>,
+        path: &std::path::Path,
+        fps: Option<u32>,
+    ) -> Result<ShaderSurface> {
         let source = std::fs::read_to_string(path)
             .with_context(|| format!("reading shader {}", path.display()))?;
-        ShaderSurface::new(qh, &source, self.color.as_ref())
+        ShaderSurface::new(qh, &source, self.color.as_ref(), fps)
     }
 
     /// Feed a dmabuf-feedback event to the named output's shader surface and
