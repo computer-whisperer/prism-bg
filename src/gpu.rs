@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use anyhow::{bail, Context, Result};
 use ash::vk;
@@ -48,8 +48,8 @@ const REQUIRED_DEVICE_EXTENSIONS: &[&CStr] = &[
     // Release the image to the compositor's queue family (FOREIGN) at the
     // end of each frame so the layout transition is well-defined.
     ash::ext::queue_family_foreign::NAME,
-    // Explicit GPU→compositor sync as a sync_file FD (used later; cheap to
-    // require since every modern driver has it).
+    // Export the render-completion semaphore as a sync_file FD, attached to
+    // the dmabuf for implicit GPU→compositor sync (see ShaderRenderer::render).
     ash::khr::external_semaphore_fd::NAME,
 ];
 
@@ -274,6 +274,9 @@ pub struct Gpu {
     pub drm_modifier_fn: ash::ext::image_drm_format_modifier::Device,
     /// Loader for `VK_KHR_external_memory_fd` device functions.
     pub external_memory_fd_fn: ash::khr::external_memory_fd::Device,
+    /// Loader for `VK_KHR_external_semaphore_fd` device functions (exports the
+    /// render-completion semaphore as a sync_file for implicit dmabuf sync).
+    pub external_semaphore_fd_fn: ash::khr::external_semaphore_fd::Device,
 }
 
 impl Gpu {
@@ -314,6 +317,8 @@ impl Gpu {
 
         let drm_modifier_fn = ash::ext::image_drm_format_modifier::Device::new(instance, &device);
         let external_memory_fd_fn = ash::khr::external_memory_fd::Device::new(instance, &device);
+        let external_semaphore_fd_fn =
+            ash::khr::external_semaphore_fd::Device::new(instance, &device);
 
         Ok(Gpu {
             instance: instance.clone(),
@@ -325,6 +330,7 @@ impl Gpu {
             memory_properties,
             drm_modifier_fn,
             external_memory_fd_fn,
+            external_semaphore_fd_fn,
         })
     }
 
@@ -675,6 +681,20 @@ fn compile_glsl(source: &str, kind: shaderc::ShaderKind, name: &str) -> Result<V
     Ok(artifact.as_binary().to_vec())
 }
 
+/// Per-ring-slot command resources. One set per [`RenderTarget`] in the ring
+/// so frames pipeline: while the compositor reads slot N's buffer, we can
+/// already record and submit slot N+1 without waiting on N's GPU work.
+struct Frame {
+    command_buffer: vk::CommandBuffer,
+    /// Signaled when this slot's submission completes. Awaited (cheaply — the
+    /// ring's `wl_buffer.release` recycle already implies completion) before
+    /// the command buffer is reset for reuse.
+    fence: vk::Fence,
+    /// Signaled by the same submission; exported as a sync_file and attached
+    /// to the dmabuf as its implicit write fence. Unused in CPU-wait mode.
+    semaphore: vk::Semaphore,
+}
+
 /// The render pass + graphics pipeline for one fragment shader. Renders a
 /// fullscreen triangle into an fp16 [`RenderTarget`]; viewport/scissor are
 /// dynamic so a resize reuses the pipeline.
@@ -685,14 +705,21 @@ pub struct ShaderRenderer {
     render_pass: vk::RenderPass,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
-    command_buffer: vk::CommandBuffer,
-    fence: vk::Fence,
+    /// One [`Frame`] per ring slot; indexed by the slot passed to [`Self::render`].
+    frames: Vec<Frame>,
+    /// Loader to export the render semaphore as a sync_file FD.
+    external_semaphore_fd_fn: ash::khr::external_semaphore_fd::Device,
+    /// True when the driver can export a SYNC_FD semaphore: we hand the
+    /// compositor an implicit fence and never block. False (rare) falls back
+    /// to a CPU fence wait before presenting.
+    sync_file: bool,
 }
 
 impl ShaderRenderer {
     /// Build the pipeline for `fragment_glsl` (a fragment shader providing
-    /// `main` and the `Push` uniform block — see [`DEFAULT_FRAGMENT_GLSL`]).
-    pub fn new(gpu: &Gpu, fragment_glsl: &str) -> Result<ShaderRenderer> {
+    /// `main` and the `Push` uniform block — see [`DEFAULT_FRAGMENT_GLSL`]),
+    /// with `frames` per-slot command resources (one per ring buffer).
+    pub fn new(gpu: &Gpu, fragment_glsl: &str, frames: usize) -> Result<ShaderRenderer> {
         let device = gpu.device.clone();
         let vert_spv = compile_glsl(VERTEX_GLSL, shaderc::ShaderKind::Vertex, "fullscreen.vert")?;
         let frag_spv = compile_glsl(
@@ -702,7 +729,7 @@ impl ShaderRenderer {
         )?;
 
         let render_pass = Self::create_render_pass(&device)?;
-        match Self::build(gpu, device.clone(), render_pass, &vert_spv, &frag_spv) {
+        match Self::build(gpu, device.clone(), render_pass, &vert_spv, &frag_spv, frames) {
             Ok(r) => Ok(r),
             Err(e) => {
                 // SAFETY: render_pass created just above, nothing else owns it.
@@ -710,6 +737,26 @@ impl ShaderRenderer {
                 Err(e)
             }
         }
+    }
+
+    /// Whether `gpu` can export a binary semaphore as a SYNC_FD sync_file —
+    /// the basis of the implicit-sync present path. Practically always true on
+    /// modern drivers; if not, [`Self::render`] falls back to a CPU wait.
+    fn sync_file_exportable(gpu: &Gpu) -> bool {
+        let info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        let mut props = vk::ExternalSemaphoreProperties::default();
+        // SAFETY: physical_device came from gpu.instance; props is owned here.
+        unsafe {
+            gpu.instance.get_physical_device_external_semaphore_properties(
+                gpu.physical_device,
+                &info,
+                &mut props,
+            )
+        };
+        props
+            .external_semaphore_features
+            .contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE)
     }
 
     fn create_render_pass(device: &ash::Device) -> Result<vk::RenderPass> {
@@ -757,6 +804,7 @@ impl ShaderRenderer {
         render_pass: vk::RenderPass,
         vert_spv: &[u32],
         frag_spv: &[u32],
+        frame_count: usize,
     ) -> Result<ShaderRenderer> {
         // SAFETY: SPIR-V slices are valid for the duration of module creation.
         let vert = unsafe {
@@ -800,23 +848,55 @@ impl ShaderRenderer {
             }
         };
 
-        // One reusable command buffer + fence (RESET_COMMAND_BUFFER pool).
+        let sync_file = Self::sync_file_exportable(gpu);
+        if !sync_file {
+            tracing::warn!(
+                "driver can't export a SYNC_FD semaphore; shader present falls back to a \
+                 blocking CPU fence wait each frame"
+            );
+        }
+
+        // One command buffer + fence + (export) semaphore per ring slot, so
+        // frames pipeline instead of serializing through a single fence.
         let alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(gpu.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
+            .command_buffer_count(frame_count as u32);
         // SAFETY: alloc references gpu.command_pool, valid for this device.
-        let command_buffer = unsafe { device.allocate_command_buffers(&alloc) }
-            .context("allocating command buffer")?[0];
-        // Pre-signaled: render() waits at the top of each frame, so the
-        // first frame must find it already signaled or it blocks forever.
-        let fence = unsafe {
-            device.create_fence(
-                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                None,
-            )
+        let command_buffers = unsafe { device.allocate_command_buffers(&alloc) }
+            .context("allocating command buffers")?;
+
+        let mut frames = Vec::with_capacity(frame_count);
+        for &command_buffer in &command_buffers {
+            // Pre-signaled: render() waits on the fence before reusing the
+            // slot, so the first use must find it already signaled.
+            let fence = unsafe {
+                device.create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )
+            }
+            .context("creating frame fence")?;
+            // Exportable as a sync_file when supported.
+            let mut export =
+                vk::ExportSemaphoreCreateInfo::default().handle_types(if sync_file {
+                    vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD
+                } else {
+                    vk::ExternalSemaphoreHandleTypeFlags::empty()
+                });
+            let semaphore = unsafe {
+                device.create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut export),
+                    None,
+                )
+            }
+            .context("creating frame semaphore")?;
+            frames.push(Frame {
+                command_buffer,
+                fence,
+                semaphore,
+            });
         }
-        .context("creating fence")?;
 
         Ok(ShaderRenderer {
             device,
@@ -825,8 +905,9 @@ impl ShaderRenderer {
             render_pass,
             layout,
             pipeline,
-            command_buffer,
-            fence,
+            frames,
+            external_semaphore_fd_fn: gpu.external_semaphore_fd_fn.clone(),
+            sync_file,
         })
     }
 
@@ -906,26 +987,32 @@ impl ShaderRenderer {
         unsafe { self.device.create_framebuffer(&info, None) }.context("creating framebuffer")
     }
 
-    /// Render one frame into `target` via `framebuffer`, then block until
-    /// the GPU is done (so the dmabuf is safe to commit). A CPU fence wait
-    /// is simple and correct for the prototype; explicit GPU→compositor
-    /// sync (`wp_linux_drm_syncobj`) is the later optimization. No readback.
+    /// Render one frame into ring slot `slot`'s `target` via `framebuffer`.
+    ///
+    /// On the fast path (`sync_file`) the GPU work is submitted and its
+    /// completion semaphore is exported as a sync_file and attached to the
+    /// dmabuf as its implicit write fence — so the caller may `commit`
+    /// immediately and the *compositor* waits on the GPU (implicit sync),
+    /// never the calloop thread. If the driver can't export a sync_file we
+    /// fall back to a CPU fence wait before returning. No readback.
     pub fn render(
         &self,
+        slot: usize,
         target: &RenderTarget,
         framebuffer: vk::Framebuffer,
         uniforms: &ShaderUniforms,
     ) -> Result<()> {
         let device = &self.device;
-        let cb = self.command_buffer;
-        // SAFETY: all handles are this renderer's; the previous submission
-        // (if any) is awaited via the fence before reuse below.
+        let frame = &self.frames[slot];
+        let cb = frame.command_buffer;
+        // SAFETY: all handles are this renderer's; this slot's previous
+        // submission is awaited via its fence before reuse below.
         unsafe {
             device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
+                .wait_for_fences(&[frame.fence], true, u64::MAX)
                 .context("waiting on prior frame fence")?;
             device
-                .reset_fences(&[self.fence])
+                .reset_fences(&[frame.fence])
                 .context("resetting fence")?;
             device
                 .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
@@ -1007,25 +1094,107 @@ impl ShaderRenderer {
             device.end_command_buffer(cb).context("end cb")?;
 
             let cbs = [cb];
-            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+            let signal = [frame.semaphore];
+            let mut submit = vk::SubmitInfo::default().command_buffers(&cbs);
+            if self.sync_file {
+                submit = submit.signal_semaphores(&signal);
+            }
             device
-                .queue_submit(self.queue, &[submit], self.fence)
+                .queue_submit(self.queue, &[submit], frame.fence)
                 .context("submitting render")?;
-            device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
+        }
+
+        if !self.sync_file {
+            // No exportable sync_file: block until the GPU is done so the
+            // committed dmabuf holds finished pixels.
+            // SAFETY: the fence was just submitted with this frame's work.
+            unsafe { device.wait_for_fences(&[frame.fence], true, u64::MAX) }
                 .context("waiting on render fence")?;
+            return Ok(());
+        }
+
+        // Export the completion semaphore as a sync_file and attach it to the
+        // dmabuf as its implicit write fence; the compositor's implicit-sync
+        // read then waits on the GPU. A -1 FD means the work already finished
+        // (nothing to wait on). If the attach fails, degrade to a CPU wait so
+        // we never present a half-rendered buffer.
+        if let Some(sync) = self.export_sync_file(frame.semaphore)? {
+            if let Err(e) = import_sync_file_to_dmabuf(target.fd.as_raw_fd(), sync) {
+                tracing::warn!("dmabuf sync_file import failed ({e:#}); blocking instead");
+                // SAFETY: this frame's fence was submitted above.
+                unsafe { device.wait_for_fences(&[frame.fence], true, u64::MAX) }
+                    .context("waiting on render fence (import fallback)")?;
+            }
         }
         Ok(())
     }
+
+    /// Export `semaphore`'s pending payload as a sync_file FD. Returns `None`
+    /// for the special -1 FD (semaphore already signaled — no fence to wait).
+    fn export_sync_file(&self, semaphore: vk::Semaphore) -> Result<Option<OwnedFd>> {
+        let info = vk::SemaphoreGetFdInfoKHR::default()
+            .semaphore(semaphore)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        // SAFETY: semaphore is this renderer's, created exportable; the loader
+        // matches this device.
+        let raw = unsafe { self.external_semaphore_fd_fn.get_semaphore_fd(&info) }
+            .context("exporting render semaphore as sync_file")?;
+        if raw < 0 {
+            Ok(None)
+        } else {
+            // SAFETY: get_semaphore_fd transferred ownership of this FD to us.
+            Ok(Some(unsafe { OwnedFd::from_raw_fd(raw) }))
+        }
+    }
+}
+
+/// Attach `sync_file` to `dmabuf_fd` as an implicit *write* fence, so any
+/// later implicit-sync reader (the compositor) waits for it before sampling.
+/// `sync_file` is closed on return; the kernel holds its own reference.
+fn import_sync_file_to_dmabuf(dmabuf_fd: RawFd, sync_file: OwnedFd) -> Result<()> {
+    // linux/dma-buf.h: DMA_BUF_SYNC_WRITE, and
+    // DMA_BUF_IOCTL_IMPORT_SYNC_FILE = _IOW('b', 3, struct dma_buf_import_sync_file).
+    const DMA_BUF_SYNC_WRITE: u32 = 2;
+    const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: libc::c_ulong = 0x4008_6203;
+    #[repr(C)]
+    struct DmaBufImportSyncFile {
+        flags: u32,
+        fd: i32,
+    }
+    let mut data = DmaBufImportSyncFile {
+        flags: DMA_BUF_SYNC_WRITE,
+        fd: sync_file.as_raw_fd(),
+    };
+    // SAFETY: dmabuf_fd is a live dma-buf; data matches the kernel's struct
+    // and outlives the call; the ioctl only reads from it.
+    let rc = unsafe {
+        libc::ioctl(
+            dmabuf_fd,
+            DMA_BUF_IOCTL_IMPORT_SYNC_FILE,
+            &mut data as *mut DmaBufImportSyncFile,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("DMA_BUF_IOCTL_IMPORT_SYNC_FILE");
+    }
+    Ok(())
 }
 
 impl Drop for ShaderRenderer {
     fn drop(&mut self) {
-        // SAFETY: all handles are this renderer's; nothing is in flight after
-        // the fence wait in render(). The command buffer is freed with the pool.
+        // SAFETY: all handles are this renderer's. On the sync_file path a
+        // submission may still be in flight, so wait every slot's fence
+        // before tearing down. Command buffers are freed with the pool.
         unsafe {
-            let _ = self.device.wait_for_fences(&[self.fence], true, u64::MAX);
-            self.device.destroy_fence(self.fence, None);
+            let fences: Vec<vk::Fence> = self.frames.iter().map(|f| f.fence).collect();
+            if !fences.is_empty() {
+                let _ = self.device.wait_for_fences(&fences, true, u64::MAX);
+            }
+            for frame in &self.frames {
+                self.device.destroy_fence(frame.fence, None);
+                self.device.destroy_semaphore(frame.semaphore, None);
+            }
             self.device.destroy_pipeline(self.pipeline, None);
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device.destroy_render_pass(self.render_pass, None);
@@ -1084,16 +1253,17 @@ mod tests {
         let gpu = pool.any().expect("no usable device");
         let mods = gpu.renderable_modifiers();
         let rt = RenderTarget::new(gpu, 320, 200, &mods).expect("render target");
-        let renderer = ShaderRenderer::new(gpu, DEFAULT_FRAGMENT_GLSL).expect("renderer");
+        let renderer = ShaderRenderer::new(gpu, DEFAULT_FRAGMENT_GLSL, 1).expect("renderer");
         let fb = renderer.create_framebuffer(&rt).expect("framebuffer");
         let uniforms = ShaderUniforms {
             resolution: [rt.width as f32, rt.height as f32],
             time: 1.25,
             _pad: 0.0,
         };
-        renderer.render(&rt, fb, &uniforms).expect("render frame");
-        // SAFETY: fb came from this renderer; the render fence was awaited
-        // inside render(), so nothing references it.
+        // Exercises the sync_file export + dmabuf import attach on this GPU.
+        renderer.render(0, &rt, fb, &uniforms).expect("render frame");
+        // SAFETY: fb came from this renderer; device_wait_idle drains the
+        // submission (the sync_file path does not block in render()).
         unsafe {
             let _ = gpu.device.device_wait_idle();
             gpu.device.destroy_framebuffer(fb, None);

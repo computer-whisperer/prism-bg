@@ -335,7 +335,7 @@ impl ShaderSurface {
             self.state = Some(DeviceState {
                 device_dev,
                 device: gpu.device.clone(),
-                renderer: ShaderRenderer::new(gpu, &self.source)?,
+                renderer: ShaderRenderer::new(gpu, &self.source, RING)?,
                 ring: Vec::new(),
                 size: (0, 0),
             });
@@ -375,7 +375,7 @@ impl ShaderSurface {
         };
         let rt = &st.ring[idx];
         st.renderer
-            .render(&rt.target, rt.framebuffer, &uniforms)
+            .render(idx, &rt.target, rt.framebuffer, &uniforms)
             .context("rendering shader frame")?;
         rt.available.store(false, Ordering::Release);
         surface.attach(Some(&rt.buffer), 0, 0);
