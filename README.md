@@ -109,6 +109,26 @@ Extras beyond swaybg (also per-output-group):
   `0..1` coordinate spanning the desktop. A shader that only reads
   `iResolution`/`iTime` still works and behaves per-output. See
   `examples/shaders/hexgrid.frag` for a worked example.
+
+  A shader can also be **audio-reactive**: reference any of the audio uniforms
+  and prism-bg captures the default sink's output over PipeWire, runs an FFT,
+  and feeds a live spectrum each frame (the capture only starts when a shader
+  uses it, and follows the default device). Audio shaders redraw continuously
+  to track the sound, so they count as animated (cap them with `--fps`).
+
+  ```glsl
+  layout(set = 0, binding = 0, std140) uniform Audio {
+      vec4 iAudioBins[8];   // 32 magnitude bins 0..1, low→high, packed 4/vec4
+      float iAudioLevel;    // overall loudness 0..1
+      float iAudioBass;     // low/mid/high band energy 0..1
+      float iAudioMid;
+      float iAudioTreble;
+  } au;
+  // read bin i (0..31): au.iAudioBins[i >> 2][i & 3]
+  ```
+
+  See `examples/shaders/spectrum.frag` for a worked example. With no PipeWire
+  (or no audio playing) the values are zero and the shader just renders silence.
 - `--fps <n>` — cap an animated shader's render rate (1..=1000); default is
   the compositor's vsync cadence. `iTime` stays real-time, so animation speed
   is unchanged — it's just sampled less often. Requires `--shader`.

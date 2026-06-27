@@ -8,6 +8,7 @@
 //! silent sRGB assumption.
 
 mod app;
+mod audio;
 mod cli;
 mod cms;
 mod color;

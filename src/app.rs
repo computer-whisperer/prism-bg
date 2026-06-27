@@ -49,6 +49,7 @@ use wayland_protocols::wp::viewporter::client::{
 
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 
+use crate::audio::AudioCapture;
 use crate::cli::{Args, Color, Intent, Mode, OutputSpec};
 use crate::colormgmt::{ColorState, DescriptionHandle, Status};
 use crate::decode::DecodedImage;
@@ -205,6 +206,10 @@ pub struct App {
     pub gpus: Option<GpuPool>,
     /// `zwp_linux_dmabuf_v1` (bound v4 for per-surface feedback).
     pub dmabuf: Option<DmabufState>,
+    /// PipeWire spectrum capture, started lazily the first time a shader that
+    /// references the audio uniforms is built. `None` until then (and forever
+    /// if no shader uses audio).
+    audio: Option<AudioCapture>,
 }
 
 /// Crossfade tick period, ~60 Hz.
@@ -295,7 +300,19 @@ impl App {
             wallpapers: Vec::new(),
             gpus,
             dmabuf,
+            audio: None,
         })
+    }
+
+    /// Start the PipeWire spectrum capture if it isn't already running. Called
+    /// the first time a shader referencing the audio uniforms is built, so the
+    /// capture (and its visible audio stream) only exists when something wants
+    /// it. Idempotent.
+    fn ensure_audio_capture(&mut self) {
+        if self.audio.is_none() {
+            tracing::info!("audio-reactive shader detected; starting PipeWire spectrum capture");
+            self.audio = Some(crate::audio::AudioCapture::start());
+        }
     }
 
     /// Create a wallpaper for `output` if a spec matches and none exists.
@@ -365,6 +382,10 @@ impl App {
                 Ok(mut s) => {
                     if let Some(dmabuf) = &self.dmabuf {
                         s.request_feedback(dmabuf, qh, layer.wl_surface(), name.clone());
+                    }
+                    // First audio-reactive shader spins up the capture.
+                    if s.uses_audio() {
+                        self.ensure_audio_capture();
                     }
                     Some(s)
                 }
@@ -835,6 +856,12 @@ impl App {
         // mut borrow below, since it reads `output_state` immutably.
         let output = self.wallpapers[index].output.clone();
         let tiling = self.cluster_placement(&output, (w, h));
+        // Latest spectrum (zeroed silence if no capture is running).
+        let audio = self
+            .audio
+            .as_ref()
+            .map(|a| a.snapshot())
+            .unwrap_or_else(<crate::gpu::AudioUniforms as bytemuck::Zeroable>::zeroed);
 
         let pool = self.gpus.as_mut().context("GPU backend not initialized")?;
         let gpu = pool.get_for_device(device_dev)?;
@@ -854,6 +881,7 @@ impl App {
             device_size,
             (w, h),
             tiling,
+            &audio,
             color,
             intent,
         )?;

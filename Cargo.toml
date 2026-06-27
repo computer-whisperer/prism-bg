@@ -52,6 +52,12 @@ libc = "0.2"
 # JPEG XR (Windows HDR wallpapers/screenshots, scRGB) — vendored jxrlib C.
 jpegxr = "0.3"
 
+# Audio-reactive shaders: capture the default sink's monitor over PipeWire
+# and run a short FFT (rustfft) to feed a per-frame spectrum UBO. Spun up
+# lazily, only when a shader references the audio uniforms.
+pipewire = "0.9.2"
+rustfft = "6.4"
+
 # jpegxr 0.3.1 vendored: its pinned bindgen 0.69 generates opaque structs
 # with current libclang (forward-declared tagPKImageDecode); bumped to
 # bindgen 0.72. Drop the patch when upstream updates.

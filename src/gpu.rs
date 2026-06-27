@@ -652,6 +652,31 @@ pub struct ShaderUniforms {
     pub global_resolution: [f32; 2],
 }
 
+/// Number of spectrum bins handed to audio-reactive shaders (log-spaced,
+/// low→high). Packed four per `vec4` for std140, so keep this a multiple of 4.
+pub const AUDIO_BINS: usize = 32;
+
+/// Audio-reactivity uniforms, uploaded each frame to a fragment-stage UBO
+/// (set 0, binding 0) — separate from the push constants because the bin
+/// array alone would blow the 128-byte push-constant budget. Zeroed when no
+/// audio is captured, so a shader reads silence rather than garbage. std140
+/// layout: `bins` is a `vec4[AUDIO_BINS/4]` (16-byte stride), then four
+/// trailing floats; the `repr(C)` order matches with no implicit padding.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AudioUniforms {
+    /// `AUDIO_BINS` magnitudes in `0..1`, low→high, packed 4 per `vec4`
+    /// (`iAudioBins[i/4][i%4]`).
+    pub bins: [[f32; 4]; AUDIO_BINS / 4],
+    /// Overall loudness `0..1` (`iAudioLevel`).
+    pub level: f32,
+    /// Low/mid/high band energy `0..1` (`iAudioBass`/`iAudioMid`/`iAudioTreble`),
+    /// for cheap reactive effects that don't want the full spectrum.
+    pub bass: f32,
+    pub mid: f32,
+    pub treble: f32,
+}
+
 /// Fullscreen-triangle vertex shader: three vertices covering the viewport,
 /// emitting pixel-space `fragCoord` with a bottom-left origin (Shadertoy
 /// convention; Vulkan's framebuffer y is flipped back in the shader).
@@ -711,6 +736,14 @@ struct Frame {
     /// Signaled by the same submission; exported as a sync_file and attached
     /// to the dmabuf as its implicit write fence. Unused in CPU-wait mode.
     semaphore: vk::Semaphore,
+    /// Per-slot spectrum UBO (set 0, binding 0), host-visible and persistently
+    /// mapped. One per slot so writing the next frame's audio never races the
+    /// in-flight read of the previous one (the fence wait at the top of
+    /// `render` gates the overwrite). `mapped` points into `ubo_memory`.
+    ubo: vk::Buffer,
+    ubo_memory: vk::DeviceMemory,
+    ubo_mapped: *mut u8,
+    descriptor_set: vk::DescriptorSet,
 }
 
 /// The render pass + graphics pipeline for one fragment shader. Renders a
@@ -723,6 +756,11 @@ pub struct ShaderRenderer {
     render_pass: vk::RenderPass,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    /// Spectrum-UBO descriptor layout (set 0, binding 0) and the pool the
+    /// per-slot sets are allocated from. Always present so every shader's
+    /// pipeline layout is uniform; a shader that ignores the UBO is fine.
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
     /// One [`Frame`] per ring slot; indexed by the slot passed to [`Self::render`].
     frames: Vec<Frame>,
     /// Loader to export the render semaphore as a sync_file FD.
@@ -840,16 +878,39 @@ impl ShaderRenderer {
             }
         };
 
+        // Spectrum UBO at set 0, binding 0 (fragment stage). Created even for
+        // shaders that don't sample audio, so the pipeline layout is uniform.
+        let ubo_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+        let ubo_bindings = [ubo_binding];
+        let set_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&ubo_bindings);
+        // SAFETY: set_layout_info outlives the call.
+        let descriptor_set_layout =
+            unsafe { device.create_descriptor_set_layout(&set_layout_info, None) }
+                .context("creating descriptor set layout")?;
+
         let push_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
             .size(std::mem::size_of::<ShaderUniforms>() as u32);
         let push_ranges = [push_range];
-        let layout_info =
-            vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_ranges);
-        // SAFETY: layout_info outlives the call.
-        let layout = unsafe { device.create_pipeline_layout(&layout_info, None) }
-            .context("creating pipeline layout")?;
+        let set_layouts = [descriptor_set_layout];
+        let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&push_ranges);
+        // SAFETY: layout_info outlives the call; descriptor_set_layout is
+        // destroyed on the error paths below and in Drop.
+        let layout = match unsafe { device.create_pipeline_layout(&layout_info, None) } {
+            Ok(l) => l,
+            Err(e) => {
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(e).context("creating pipeline layout");
+            }
+        };
 
         let pipeline_result = Self::create_pipeline(&device, render_pass, layout, vert, frag);
         // Shader modules are consumed by pipeline creation; destroy regardless.
@@ -861,7 +922,10 @@ impl ShaderRenderer {
         let pipeline = match pipeline_result {
             Ok(p) => p,
             Err(e) => {
-                unsafe { device.destroy_pipeline_layout(layout, None) };
+                unsafe {
+                    device.destroy_pipeline_layout(layout, None);
+                    device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+                }
                 return Err(e);
             }
         };
@@ -874,47 +938,24 @@ impl ShaderRenderer {
             );
         }
 
-        // One command buffer + fence + (export) semaphore per ring slot, so
-        // frames pipeline instead of serializing through a single fence.
-        let alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(gpu.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(frame_count as u32);
-        // SAFETY: alloc references gpu.command_pool, valid for this device.
-        let command_buffers = unsafe { device.allocate_command_buffers(&alloc) }
-            .context("allocating command buffers")?;
-
-        let mut frames = Vec::with_capacity(frame_count);
-        for &command_buffer in &command_buffers {
-            // Pre-signaled: render() waits on the fence before reusing the
-            // slot, so the first use must find it already signaled.
-            let fence = unsafe {
-                device.create_fence(
-                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                    None,
-                )
-            }
-            .context("creating frame fence")?;
-            // Exportable as a sync_file when supported.
-            let mut export =
-                vk::ExportSemaphoreCreateInfo::default().handle_types(if sync_file {
-                    vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD
-                } else {
-                    vk::ExternalSemaphoreHandleTypeFlags::empty()
-                });
-            let semaphore = unsafe {
-                device.create_semaphore(
-                    &vk::SemaphoreCreateInfo::default().push_next(&mut export),
-                    None,
-                )
-            }
-            .context("creating frame semaphore")?;
-            frames.push(Frame {
-                command_buffer,
-                fence,
-                semaphore,
-            });
-        }
+        // The descriptor pool and per-slot resources, with self-contained
+        // cleanup: on any failure here `build_frames` frees what it created and
+        // we tear down the pipeline objects, since no `ShaderRenderer` (whose
+        // Drop would do it) gets constructed.
+        let (descriptor_pool, frames) =
+            match Self::build_frames(gpu, &device, descriptor_set_layout, sync_file, frame_count) {
+                Ok(v) => v,
+                Err(e) => {
+                    // SAFETY: created above, not yet owned by anything; render_pass
+                    // is freed by the caller (`new`).
+                    unsafe {
+                        device.destroy_pipeline(pipeline, None);
+                        device.destroy_pipeline_layout(layout, None);
+                        device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+                    }
+                    return Err(e);
+                }
+            };
 
         Ok(ShaderRenderer {
             device,
@@ -923,10 +964,240 @@ impl ShaderRenderer {
             render_pass,
             layout,
             pipeline,
+            descriptor_set_layout,
+            descriptor_pool,
             frames,
             external_semaphore_fd_fn: gpu.external_semaphore_fd_fn.clone(),
             sync_file,
         })
+    }
+
+    /// Create the descriptor pool and one [`Frame`] per ring slot (command
+    /// buffer + fence + export semaphore + spectrum UBO/descriptor). On any
+    /// failure, frees everything it allocated so far so `build` can fail
+    /// cleanly without a half-built renderer to drop.
+    fn build_frames(
+        gpu: &Gpu,
+        device: &ash::Device,
+        set_layout: vk::DescriptorSetLayout,
+        sync_file: bool,
+        frame_count: usize,
+    ) -> Result<(vk::DescriptorPool, Vec<Frame>)> {
+        // Pool sized for one spectrum UBO descriptor per ring slot.
+        let pool_size = vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(frame_count as u32);
+        let pool_sizes = [pool_size];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(frame_count as u32)
+            .pool_sizes(&pool_sizes);
+        // SAFETY: pool_info outlives the call. Nothing else allocated yet, so a
+        // failure here needs no cleanup.
+        let descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None) }
+            .context("creating descriptor pool")?;
+
+        // One command buffer + fence + (export) semaphore per ring slot, so
+        // frames pipeline instead of serializing through a single fence.
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(gpu.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(frame_count as u32);
+        // SAFETY: alloc references gpu.command_pool, valid for this device.
+        let command_buffers = match unsafe { device.allocate_command_buffers(&alloc) } {
+            Ok(c) => c,
+            Err(e) => {
+                // SAFETY: pool created just above, nothing references it.
+                unsafe { device.destroy_descriptor_pool(descriptor_pool, None) };
+                return Err(e).context("allocating command buffers");
+            }
+        };
+
+        let mut frames: Vec<Frame> = Vec::with_capacity(frame_count);
+        for &command_buffer in &command_buffers {
+            match Self::build_one_frame(gpu, device, descriptor_pool, set_layout, sync_file) {
+                Ok((fence, semaphore, ubo, ubo_memory, ubo_mapped, descriptor_set)) => {
+                    frames.push(Frame {
+                        command_buffer,
+                        fence,
+                        semaphore,
+                        ubo,
+                        ubo_memory,
+                        ubo_mapped,
+                        descriptor_set,
+                    });
+                }
+                Err(e) => {
+                    // Free the slots already built, then the pool (which frees
+                    // their descriptor sets and the command buffers).
+                    // SAFETY: every handle below was created by this function.
+                    unsafe {
+                        for f in &frames {
+                            device.destroy_fence(f.fence, None);
+                            device.destroy_semaphore(f.semaphore, None);
+                            device.destroy_buffer(f.ubo, None);
+                            device.free_memory(f.ubo_memory, None);
+                        }
+                        device.destroy_descriptor_pool(descriptor_pool, None);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok((descriptor_pool, frames))
+    }
+
+    /// Create one slot's fence, export semaphore, and spectrum UBO. The caller
+    /// owns the returned handles (and cleans them up on a later slot's failure).
+    #[allow(clippy::type_complexity)]
+    fn build_one_frame(
+        gpu: &Gpu,
+        device: &ash::Device,
+        pool: vk::DescriptorPool,
+        set_layout: vk::DescriptorSetLayout,
+        sync_file: bool,
+    ) -> Result<(
+        vk::Fence,
+        vk::Semaphore,
+        vk::Buffer,
+        vk::DeviceMemory,
+        *mut u8,
+        vk::DescriptorSet,
+    )> {
+        // Pre-signaled: render() waits on the fence before reusing the slot, so
+        // the first use must find it already signaled.
+        let fence = unsafe {
+            device.create_fence(
+                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                None,
+            )
+        }
+        .context("creating frame fence")?;
+        // Exportable as a sync_file when supported.
+        let mut export = vk::ExportSemaphoreCreateInfo::default().handle_types(if sync_file {
+            vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD
+        } else {
+            vk::ExternalSemaphoreHandleTypeFlags::empty()
+        });
+        let semaphore = match unsafe {
+            device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut export), None)
+        } {
+            Ok(s) => s,
+            Err(e) => {
+                // SAFETY: fence created just above.
+                unsafe { device.destroy_fence(fence, None) };
+                return Err(e).context("creating frame semaphore");
+            }
+        };
+        let (ubo, ubo_memory, ubo_mapped, descriptor_set) =
+            match Self::create_ubo(gpu, device, pool, set_layout) {
+                Ok(v) => v,
+                Err(e) => {
+                    // SAFETY: fence + semaphore created just above.
+                    unsafe {
+                        device.destroy_semaphore(semaphore, None);
+                        device.destroy_fence(fence, None);
+                    }
+                    return Err(e);
+                }
+            };
+        Ok((fence, semaphore, ubo, ubo_memory, ubo_mapped, descriptor_set))
+    }
+
+    /// Create one slot's spectrum UBO: a host-visible, persistently-mapped
+    /// buffer sized for [`AudioUniforms`], plus a descriptor set pointing at
+    /// it. The mapping is coherent so [`Self::render`] can write the audio
+    /// snapshot with a plain `copy` and no flush. Zero-initialized so a shader
+    /// reads silence before any audio arrives.
+    fn create_ubo(
+        gpu: &Gpu,
+        device: &ash::Device,
+        pool: vk::DescriptorPool,
+        set_layout: vk::DescriptorSetLayout,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8, vk::DescriptorSet)> {
+        let size = std::mem::size_of::<AudioUniforms>() as u64;
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: buffer_info outlives the call.
+        let buffer = unsafe { device.create_buffer(&buffer_info, None) }
+            .context("creating spectrum UBO buffer")?;
+
+        // From here, free what's been created on any failure: this fn owns the
+        // buffer/memory until it returns Ok. SAFETY: each handle freed is one
+        // this fn created, exactly once.
+        let cleanup_buffer = || unsafe { device.destroy_buffer(buffer, None) };
+        let cleanup_buffer_memory = |memory: vk::DeviceMemory| unsafe {
+            device.free_memory(memory, None);
+            device.destroy_buffer(buffer, None);
+        };
+
+        // SAFETY: buffer is this device's.
+        let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let Some(mem_type) = gpu.find_memory_type(
+            reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) else {
+            cleanup_buffer();
+            anyhow::bail!("no host-visible coherent memory for spectrum UBO");
+        };
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(reqs.size)
+            .memory_type_index(mem_type);
+        // SAFETY: alloc is valid.
+        let memory = match unsafe { device.allocate_memory(&alloc, None) } {
+            Ok(m) => m,
+            Err(e) => {
+                cleanup_buffer();
+                return Err(e).context("allocating spectrum UBO memory");
+            }
+        };
+        // SAFETY: buffer and memory are this device's, bound once.
+        if let Err(e) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+            cleanup_buffer_memory(memory);
+            return Err(e).context("binding spectrum UBO memory");
+        }
+        // SAFETY: memory is host-visible; mapped for the buffer's whole life.
+        let mapped = match unsafe {
+            device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+        } {
+            Ok(p) => p as *mut u8,
+            Err(e) => {
+                cleanup_buffer_memory(memory);
+                return Err(e).context("mapping spectrum UBO");
+            }
+        };
+        // SAFETY: `mapped` is valid for `size` bytes; zero = silence.
+        unsafe { std::ptr::write_bytes(mapped, 0, size as usize) };
+
+        let set_layouts = [set_layout];
+        let set_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(pool)
+            .set_layouts(&set_layouts);
+        // SAFETY: set_alloc outlives the call; pool has room (sized per slot).
+        let descriptor_set = match unsafe { device.allocate_descriptor_sets(&set_alloc) } {
+            Ok(sets) => sets[0],
+            Err(e) => {
+                cleanup_buffer_memory(memory);
+                return Err(e).context("allocating spectrum descriptor set");
+            }
+        };
+
+        let buffer_descriptor = vk::DescriptorBufferInfo::default()
+            .buffer(buffer)
+            .offset(0)
+            .range(size);
+        let buffer_descriptors = [buffer_descriptor];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(&buffer_descriptors);
+        // SAFETY: write references live handles for the call's duration.
+        unsafe { device.update_descriptor_sets(&[write], &[]) };
+
+        Ok((buffer, memory, mapped, descriptor_set))
     }
 
     fn create_pipeline(
@@ -1019,6 +1290,7 @@ impl ShaderRenderer {
         target: &RenderTarget,
         framebuffer: vk::Framebuffer,
         uniforms: &ShaderUniforms,
+        audio: &AudioUniforms,
     ) -> Result<()> {
         let device = &self.device;
         let frame = &self.frames[slot];
@@ -1032,6 +1304,14 @@ impl ShaderRenderer {
             device
                 .reset_fences(&[frame.fence])
                 .context("resetting fence")?;
+
+            // Safe to overwrite now: the fence wait above means this slot's
+            // previous read of the UBO is complete. Coherent mapping → no flush.
+            std::ptr::copy_nonoverlapping(
+                bytemuck::bytes_of(audio).as_ptr(),
+                frame.ubo_mapped,
+                std::mem::size_of::<AudioUniforms>(),
+            );
             device
                 .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
                 .context("resetting command buffer")?;
@@ -1062,6 +1342,14 @@ impl ShaderRenderer {
                 .clear_values(&clears);
             device.cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
             device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.layout,
+                0,
+                &[frame.descriptor_set],
+                &[],
+            );
             let viewport = vk::Viewport {
                 x: 0.0,
                 y: 0.0,
@@ -1212,7 +1500,14 @@ impl Drop for ShaderRenderer {
             for frame in &self.frames {
                 self.device.destroy_fence(frame.fence, None);
                 self.device.destroy_semaphore(frame.semaphore, None);
+                // Unmap is implicit on free; destroy buffer then its memory.
+                self.device.destroy_buffer(frame.ubo, None);
+                self.device.free_memory(frame.ubo_memory, None);
             }
+            // Sets are freed with the pool.
+            self.device.destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             self.device.destroy_pipeline(self.pipeline, None);
             self.device.destroy_pipeline_layout(self.layout, None);
             self.device.destroy_render_pass(self.render_pass, None);
@@ -1281,8 +1576,12 @@ mod tests {
             output_size: [rt.width as f32, rt.height as f32],
             global_resolution: [rt.width as f32, rt.height as f32],
         };
-        // Exercises the sync_file export + dmabuf import attach on this GPU.
-        renderer.render(0, &rt, fb, &uniforms).expect("render frame");
+        // Exercises the sync_file export + dmabuf import attach on this GPU,
+        // plus the spectrum UBO upload + descriptor bind.
+        let audio = <AudioUniforms as bytemuck::Zeroable>::zeroed();
+        renderer
+            .render(0, &rt, fb, &uniforms, &audio)
+            .expect("render frame");
         // SAFETY: fb came from this renderer; device_wait_idle drains the
         // submission (the sync_file path does not block in render()).
         unsafe {

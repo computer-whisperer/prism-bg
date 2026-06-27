@@ -15,7 +15,9 @@
 //! and are rebuilt if the output moves to a different GPU.
 //!
 //! Animation is driven by frame callbacks (vsync-paced, paused when the
-//! surface is occluded); a shader that doesn't use `iTime` renders once.
+//! surface is occluded); a shader that uses neither `iTime` nor the audio
+//! uniforms renders once. Audio-reactive shaders count as animated so they
+//! keep redrawing to track the spectrum.
 
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,7 +40,9 @@ use crate::app::App;
 use crate::cli::Intent;
 use crate::color::{ColorEncoding, PrimaryVolume, Tf};
 use crate::colormgmt::{ColorState, DescriptionHandle, Status};
-use crate::gpu::{Gpu, RenderTarget, ShaderRenderer, ShaderUniforms, RENDER_DRM_FOURCC};
+use crate::gpu::{
+    AudioUniforms, Gpu, RenderTarget, ShaderRenderer, ShaderUniforms, RENDER_DRM_FOURCC,
+};
 
 /// Number of dmabuf targets cycled per surface. Three lets the GPU render
 /// the next frame while the compositor still references the current one
@@ -208,6 +212,9 @@ pub struct ShaderSurface {
     source: String,
     /// Whether the shader samples `iTime` (drives frame-callback animation).
     animated: bool,
+    /// Whether the shader references the audio uniforms (`iAudio*`); if any
+    /// surface does, the app spins up the PipeWire capture.
+    uses_audio: bool,
     /// iTime origin, set on the first rendered frame.
     started: Option<Instant>,
     /// `--fps` cap as a minimum interval between renders; `None` is uncapped
@@ -239,7 +246,10 @@ impl ShaderSurface {
         // Validate the shader compiles up front (device-independent), so a
         // bad shader fails at startup rather than silently on the GPU.
         crate::gpu::validate_fragment(fragment_glsl)?;
-        let animated = fragment_glsl.contains("iTime");
+        let uses_audio = fragment_glsl.contains("iAudio");
+        // Audio-reactive shaders must redraw every frame to track the spectrum,
+        // so they count as animated even without `iTime`.
+        let animated = fragment_glsl.contains("iTime") || uses_audio;
         if fps.is_some() && !animated {
             tracing::warn!("--fps ignored: shader is static (no iTime), renders a single frame");
         }
@@ -262,6 +272,7 @@ impl ShaderSurface {
         Ok(ShaderSurface {
             source: fragment_glsl.to_string(),
             animated,
+            uses_audio,
             started: None,
             min_interval,
             last_render: None,
@@ -277,6 +288,11 @@ impl ShaderSurface {
 
     pub fn animated(&self) -> bool {
         self.animated
+    }
+
+    /// Whether this shader references the audio uniforms (`iAudio*`).
+    pub fn uses_audio(&self) -> bool {
+        self.uses_audio
     }
 
     /// Subscribe to per-surface dmabuf feedback for `surface`. The result
@@ -333,6 +349,7 @@ impl ShaderSurface {
         size: (u32, u32),
         logical: (u32, u32),
         tiling: Tiling,
+        audio: &AudioUniforms,
         color: Option<&ColorState>,
         intent: Intent,
     ) -> Result<bool> {
@@ -425,7 +442,7 @@ impl ShaderSurface {
         };
         let rt = &st.ring[idx];
         st.renderer
-            .render(idx, &rt.target, rt.framebuffer, &uniforms)
+            .render(idx, &rt.target, rt.framebuffer, &uniforms, audio)
             .context("rendering shader frame")?;
         rt.available.store(false, Ordering::Release);
         surface.attach(Some(&rt.buffer), 0, 0);
