@@ -623,15 +623,33 @@ impl Drop for RenderTarget {
 
 /// Shadertoy-ish uniforms handed to the fragment shader as push constants
 /// (no descriptor sets needed for the common case).
+///
+/// The first 16 bytes are the classic Shadertoy subset (`iResolution`,
+/// `iTime`); a shader that declares only those keeps working. The trailing
+/// fields describe this output's place in the multi-monitor *cluster* so a
+/// shader can tile continuously across the whole workspace — see the `Push`
+/// block documented in the module. They are y-up logical pixels with the
+/// origin at the cluster's bottom-left, matching the y-up `fragCoord` the
+/// vertex stage emits. Layout (std430): every field is `vec2`/`float` so the
+/// natural `repr(C)` order matches the GLSL block with no implicit padding.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ShaderUniforms {
-    /// Output size in pixels (`iResolution.xy`).
+    /// This output's size in device pixels (`iResolution.xy`).
     pub resolution: [f32; 2],
     /// Seconds since the wallpaper started (`iTime`).
     pub time: f32,
-    /// Padding to 16 bytes (std430 / push-constant alignment).
+    /// Padding to a vec2 boundary (std430 / push-constant alignment).
     pub _pad: f32,
+    /// This output's bottom-left corner in cluster space, logical px
+    /// (`iOutputOffset`). `(0,0)` for a lone output.
+    pub output_offset: [f32; 2],
+    /// This output's logical size (`iOutputSize`); maps a `0..1` uv into
+    /// cluster space: `g = iOutputOffset + uv * iOutputSize`.
+    pub output_size: [f32; 2],
+    /// The whole cluster's logical size (`iGlobalResolution`); normalize a
+    /// cluster coord to `0..1` across the workspace with `g / iGlobalResolution`.
+    pub global_resolution: [f32; 2],
 }
 
 /// Fullscreen-triangle vertex shader: three vertices covering the viewport,
@@ -1259,6 +1277,9 @@ mod tests {
             resolution: [rt.width as f32, rt.height as f32],
             time: 1.25,
             _pad: 0.0,
+            output_offset: [0.0, 0.0],
+            output_size: [rt.width as f32, rt.height as f32],
+            global_resolution: [rt.width as f32, rt.height as f32],
         };
         // Exercises the sync_file export + dmabuf import attach on this GPU.
         renderer.render(0, &rt, fb, &uniforms).expect("render frame");

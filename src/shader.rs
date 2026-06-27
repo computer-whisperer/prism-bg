@@ -55,6 +55,21 @@ const SHADER_ENCODING: ColorEncoding = ColorEncoding {
     luminances: None,
 };
 
+/// This output's placement in the global multi-monitor cluster, handed to
+/// the shader so patterns tile continuously across the workspace. All fields
+/// are y-up logical pixels with the origin at the cluster's bottom-left
+/// (matching the y-up `fragCoord` the vertex stage emits). A lone output is
+/// `offset (0,0)`, `output_size == global`.
+#[derive(Clone, Copy)]
+pub struct Tiling {
+    /// This output's bottom-left corner in cluster space.
+    pub offset: [f32; 2],
+    /// This output's logical size.
+    pub output_size: [f32; 2],
+    /// The whole cluster's logical size.
+    pub global: [f32; 2],
+}
+
 /// The dmabuf global (bound at v4 for feedback). Per-surface feedback
 /// objects are created on demand from [`ShaderSurface`].
 pub struct DmabufState {
@@ -317,6 +332,7 @@ impl ShaderSurface {
         viewport: &WpViewport,
         size: (u32, u32),
         logical: (u32, u32),
+        tiling: Tiling,
         color: Option<&ColorState>,
         intent: Intent,
     ) -> Result<bool> {
@@ -403,6 +419,9 @@ impl ShaderSurface {
             resolution: [size.0 as f32, size.1 as f32],
             time,
             _pad: 0.0,
+            output_offset: tiling.offset,
+            output_size: tiling.output_size,
+            global_resolution: tiling.global,
         };
         let rt = &st.ring[idx];
         st.renderer

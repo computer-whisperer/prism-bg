@@ -83,6 +83,35 @@ Extras beyond swaybg (also per-output-group):
   degrades to a hard cut with a warning.
 - `--intent perceptual|relative|absolute` (default perceptual).
 - `--no-color-management` (debug escape hatch).
+- `--shader <file>` — render a GLSL fragment shader on the GPU as a live
+  wallpaper (extended-linear output, so it goes through the same HDR-aware
+  pipeline as an image). The shader provides `main()` and reads a
+  push-constant block; a shader that uses `iTime` animates (vsync-paced,
+  paused when occluded), one that doesn't renders once. See
+  `examples/shaders/` for the format. The uniforms:
+
+  ```glsl
+  layout(push_constant) uniform Push {
+      vec2 iResolution;        // this output, device px (fragCoord is y-up, 0..iResolution)
+      float iTime;             // seconds since start (wall-clock)
+      float _pad;
+      vec2 iOutputOffset;      // this output's bottom-left in the multi-monitor
+      vec2 iOutputSize;        //   cluster, and its size — both logical px, y-up
+      vec2 iGlobalResolution;  // the whole cluster, logical px
+  } pc;
+  ```
+
+  The cluster fields let a shader tile *continuously across the whole
+  workspace* instead of restarting per monitor:
+  `vec2 g = iOutputOffset + (fragCoord / iResolution) * iOutputSize;` is this
+  fragment's position in shared cluster space (logical px, same on every
+  monitor regardless of resolution/DPI); divide by `iGlobalResolution` for a
+  `0..1` coordinate spanning the desktop. A shader that only reads
+  `iResolution`/`iTime` still works and behaves per-output. See
+  `examples/shaders/hexgrid.frag` for a worked example.
+- `--fps <n>` — cap an animated shader's render rate (1..=1000); default is
+  the compositor's vsync cadence. `iTime` stays real-time, so animation speed
+  is unchanged — it's just sampled less often. Requires `--shader`.
 
 Formats: PNG, JPEG, WebP, JPEG XL, AVIF (needs libdav1d), JPEG XR
 (Windows HDR wallpapers/screenshots — scRGB), OpenEXR, Radiance HDR.

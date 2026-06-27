@@ -54,7 +54,7 @@ use crate::colormgmt::{ColorState, DescriptionHandle, Status};
 use crate::decode::DecodedImage;
 use crate::gpu::GpuPool;
 use crate::playlist::Playlist;
-use crate::shader::{DmabufState, ShaderSurface};
+use crate::shader::{DmabufState, ShaderSurface, Tiling};
 use crate::surfaces::{place, upload, upload_tiled, WireRgb8};
 
 /// Image identity for deduplication: path + effective luminance treatment
@@ -830,6 +830,12 @@ impl App {
             None => return Ok(()), // feedback pending
         };
 
+        // Where this output sits in the global cluster, so the shader can
+        // tile continuously across the workspace. Computed before the `gpus`
+        // mut borrow below, since it reads `output_state` immutably.
+        let output = self.wallpapers[index].output.clone();
+        let tiling = self.cluster_placement(&output, (w, h));
+
         let pool = self.gpus.as_mut().context("GPU backend not initialized")?;
         let gpu = pool.get_for_device(device_dev)?;
         let dmabuf = self.dmabuf.as_ref().context("dmabuf not available")?;
@@ -847,10 +853,45 @@ impl App {
             &wp.viewport,
             device_size,
             (w, h),
+            tiling,
             color,
             intent,
         )?;
         Ok(())
+    }
+
+    /// This output's placement in the global cluster bounding box, for shader
+    /// tiling — the union of every output's logical rect (from `xdg-output`,
+    /// surfaced by SCTK as `logical_position`/`logical_size`). Returned in
+    /// y-up logical pixels with the origin at the cluster's bottom-left, to
+    /// match the shader's y-up `fragCoord`; the layout's y-down rects are
+    /// flipped here. Falls back to this output alone (offset 0, size ==
+    /// global) when its logical geometry is unavailable — degrading to the
+    /// per-output behavior with no continuity, never breaking.
+    fn cluster_placement(&self, output: &wl_output::WlOutput, logical: (u32, u32)) -> Tiling {
+        let rect = |o: &wl_output::WlOutput| {
+            self.output_state
+                .info(o)
+                .and_then(|i| Some((i.logical_position?, i.logical_size?)))
+        };
+        let all: Vec<_> = self.output_state.outputs().filter_map(|o| rect(&o)).collect();
+        tiling_from_rects(rect(output), &all, logical)
+    }
+
+    /// A layout change (output added/removed/moved/resized) shifts the global
+    /// cluster box, so every shader's tiling uniforms are stale. Animated
+    /// shaders self-heal on their next frame (uniforms are recomputed per
+    /// render); only *static* shaders need an explicit redraw.
+    fn relayout_static_shaders(&mut self, qh: &QueueHandle<App>) {
+        for i in 0..self.wallpapers.len() {
+            let needs = self.wallpapers[i]
+                .shader
+                .as_ref()
+                .is_some_and(|s| !s.animated());
+            if needs {
+                self.draw(qh, i);
+            }
+        }
     }
 
     fn try_draw(&mut self, index: usize) -> Result<()> {
@@ -1062,6 +1103,8 @@ impl OutputHandler for App {
         // Safe at any time: image attachment is deferred to service(),
         // which only runs once main's setup roundtrips are done.
         self.add_output(qh, output);
+        // A new output grows the cluster box; existing static shaders retile.
+        self.relayout_static_shaders(qh);
     }
 
     fn update_output(
@@ -1090,15 +1133,21 @@ impl OutputHandler for App {
                 }
             }
         }
+        // A move/resize of any output shifts the cluster box; retile static
+        // shaders globally (animated ones pick it up on their next frame).
+        self.relayout_static_shaders(qh);
     }
 
     fn output_destroyed(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
         self.remove_output(&output);
+        // Losing an output shrinks the cluster box; existing static shaders
+        // retile around the smaller workspace.
+        self.relayout_static_shaders(qh);
     }
 }
 
@@ -1166,3 +1215,118 @@ delegate_simple!(App, WpViewporter, 1);
 wayland_client::delegate_noop!(App: ignore WpViewport);
 wayland_client::delegate_noop!(App: WpAlphaModifierV1);
 wayland_client::delegate_noop!(App: WpAlphaModifierSurfaceV1);
+
+/// An output's logical rectangle in layout (y-down) pixels: `((x, y), (w, h))`.
+type LogicalRect = ((i32, i32), (i32, i32));
+
+/// Pure cluster-tiling geometry, split from [`App::cluster_placement`] so it
+/// can be tested without a live `OutputState`. `this` is the target output's
+/// logical rect and `all` is every output's rect — both in y-down layout
+/// pixels. Returns the y-up cluster placement (origin at the cluster's
+/// bottom-left). When `this` is `None` (no `xdg-output` geometry), falls back
+/// to `fallback` (the output's own logical size) as a lone output.
+fn tiling_from_rects(
+    this: Option<LogicalRect>,
+    all: &[LogicalRect],
+    fallback: (u32, u32),
+) -> Tiling {
+    let Some(((px, py), (lw, lh))) = this else {
+        let s = [fallback.0 as f32, fallback.1 as f32];
+        return Tiling {
+            offset: [0.0, 0.0],
+            output_size: s,
+            global: s,
+        };
+    };
+    // Union of all reported rects, seeded with this output's own (so a `this`
+    // missing from `all` still bounds the box correctly).
+    let (mut minx, mut miny, mut maxx, mut maxy) = (px, py, px + lw, py + lh);
+    for &((ox, oy), (ow, oh)) in all {
+        minx = minx.min(ox);
+        miny = miny.min(oy);
+        maxx = maxx.max(ox + ow);
+        maxy = maxy.max(oy + oh);
+    }
+    Tiling {
+        // Bottom-left in y-up space: flip the y-down top edge `py`.
+        offset: [(px - minx) as f32, (maxy - (py + lh)) as f32],
+        output_size: [lw as f32, lh as f32],
+        global: [(maxx - minx) as f32, (maxy - miny) as f32],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiling_lone_output_is_origin() {
+        // A single output sits at the origin and spans the whole cluster.
+        let r = ((0, 0), (1920, 1080));
+        let t = tiling_from_rects(Some(r), &[r], (1920, 1080));
+        assert_eq!(t.offset, [0.0, 0.0]);
+        assert_eq!(t.output_size, [1920.0, 1080.0]);
+        assert_eq!(t.global, [1920.0, 1080.0]);
+    }
+
+    #[test]
+    fn tiling_missing_geometry_falls_back_to_lone() {
+        // No xdg-output info: treat as a lone output at its configured size.
+        let t = tiling_from_rects(None, &[], (2560, 1440));
+        assert_eq!(t.offset, [0.0, 0.0]);
+        assert_eq!(t.output_size, [2560.0, 1440.0]);
+        assert_eq!(t.global, [2560.0, 1440.0]);
+    }
+
+    #[test]
+    fn tiling_side_by_side_continuous_x() {
+        // Two 1920x1080 outputs side by side. The right one is offset by the
+        // left's width so x is continuous across the seam; both are full
+        // height, so y-offset is 0 for both.
+        let left = ((0, 0), (1920, 1080));
+        let right = ((1920, 0), (1920, 1080));
+        let all = [left, right];
+        let tl = tiling_from_rects(Some(left), &all, (1920, 1080));
+        let tr = tiling_from_rects(Some(right), &all, (1920, 1080));
+        assert_eq!(tl.offset, [0.0, 0.0]);
+        assert_eq!(tr.offset, [1920.0, 0.0]);
+        assert_eq!(tl.global, [3840.0, 1080.0]);
+        assert_eq!(tr.global, [3840.0, 1080.0]);
+        // The left output's right edge meets the right output's left edge.
+        assert_eq!(tl.offset[0] + tl.output_size[0], tr.offset[0]);
+    }
+
+    #[test]
+    fn tiling_flips_y_to_up_origin() {
+        // A tall output (top, y-down 0) above a short one (below it). In y-up
+        // cluster space the lower output is at y=0 and the upper one above it.
+        let top = ((0, 0), (1000, 600)); // y-down: top edge at 0
+        let bottom = ((0, 600), (1000, 400)); // directly below
+        let all = [top, bottom];
+        let tt = tiling_from_rects(Some(top), &all, (1000, 600));
+        let tb = tiling_from_rects(Some(bottom), &all, (1000, 400));
+        assert_eq!(tt.global, [1000.0, 1000.0]);
+        // Bottom output's bottom-left is the cluster origin.
+        assert_eq!(tb.offset, [0.0, 0.0]);
+        // Top output sits above it: its bottom edge is at the bottom's height.
+        assert_eq!(tt.offset, [0.0, 400.0]);
+        // Their edges meet: bottom's top (offset_y + height) == top's bottom.
+        assert_eq!(tb.offset[1] + tb.output_size[1], tt.offset[1]);
+    }
+
+    #[test]
+    fn tiling_handles_negative_origin() {
+        // Compositor layouts can place outputs at negative coords (left of
+        // the primary). The cluster origin normalizes those away.
+        let primary = ((0, 0), (1920, 1080));
+        let leftof = ((-1280, 0), (1280, 1024));
+        let all = [primary, leftof];
+        let tp = tiling_from_rects(Some(primary), &all, (1920, 1080));
+        let tl = tiling_from_rects(Some(leftof), &all, (1280, 1024));
+        // Leftmost output starts at cluster x=0.
+        assert_eq!(tl.offset[0], 0.0);
+        // Primary is shifted right by the left output's width.
+        assert_eq!(tp.offset[0], 1280.0);
+        assert_eq!(tp.global, [3200.0, 1080.0]);
+    }
+}

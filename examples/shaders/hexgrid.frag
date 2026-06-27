@@ -5,10 +5,26 @@
 //   prism-bg --shader examples/shaders/hexgrid.frag
 //
 // Original implementation of the standard hex-grid distance technique.
+//
+// CLUSTER TILING: instead of working in this output's own pixels, it builds a
+// coordinate in the shared multi-monitor cluster space — so the lattice and
+// the ripple form one continuous field across every monitor, with cells the
+// same size everywhere. The cluster uniforms are y-up logical pixels with the
+// origin at the cluster's bottom-left (same convention as fragCoord):
+//   vec2 g = iOutputOffset + (fragCoord / iResolution) * iOutputSize;
+// gives this fragment's position in cluster space; divide by iGlobalResolution
+// for a 0..1 coordinate spanning the whole workspace.
 #version 450
 layout(location = 0) in vec2 fragCoord;
 layout(location = 0) out vec4 outColor;
-layout(push_constant) uniform Push { vec2 iResolution; float iTime; float _pad; } pc;
+layout(push_constant) uniform Push {
+    vec2 iResolution;        // this output, device px
+    float iTime;
+    float _pad;
+    vec2 iOutputOffset;      // this output's bottom-left in cluster space, logical px
+    vec2 iOutputSize;        // this output, logical px
+    vec2 iGlobalResolution;  // whole cluster, logical px
+} pc;
 
 vec3 palette(float t) {
     vec3 a = vec3(0.5), b = vec3(0.5), c = vec3(1.0);
@@ -35,10 +51,17 @@ float hexDist(vec2 p) {
 }
 
 void main() {
-    vec2 uv = (fragCoord - 0.5 * pc.iResolution) / pc.iResolution.y;
     float t = pc.iTime;
 
-    vec4 hc = hexCoords(uv * 6.0);
+    // Position in the shared cluster, centered on the whole workspace so the
+    // ripple emanates from the middle of the desktop, not each monitor.
+    vec2 g = pc.iOutputOffset + (fragCoord / pc.iResolution) * pc.iOutputSize;
+    vec2 c = g - 0.5 * pc.iGlobalResolution;
+
+    // Fixed cell size in logical px → identical hexagons on every monitor,
+    // regardless of resolution or DPI. (Tune CELL to taste.)
+    const float CELL = 200.0;
+    vec4 hc = hexCoords(c / CELL);
     vec2 gv = hc.xy;
     vec2 id = hc.zw;
 
