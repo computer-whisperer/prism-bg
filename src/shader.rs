@@ -523,23 +523,36 @@ fn make_description(
     }
 }
 
-impl ShaderSurface {
-    /// Prepare a shader surface from `fragment_glsl`. Compilation and target
-    /// allocation are deferred until feedback resolves the output's GPU.
-    pub fn new(
-        qh: &QueueHandle<App>,
+/// A fully-prepared wallpaper source — image or shader — ready to display in a
+/// [`ShaderSurface`]. Carries the render graph, its static textures, the dmabuf
+/// color tag, and the per-source behavior (animation, audio/mouse use, frame
+/// cap). Built by the app from a static spec or a playlist entry, then handed to
+/// [`ShaderSurface::from_source`] (first load) or [`ShaderSurface::set_source`]
+/// (rotation). The two source kinds differ only in these fields, so the surface
+/// and its transition machinery treat them uniformly.
+pub struct PreparedSource {
+    pub graph: crate::shadergraph::GraphSpec,
+    pub textures: Vec<TextureData>,
+    pub encoding: ColorEncoding,
+    pub animated: bool,
+    pub uses_audio: bool,
+    pub uses_mouse: bool,
+    pub min_interval: Option<Duration>,
+}
+
+impl PreparedSource {
+    /// Prepare a shader source from `fragment_glsl`: parse + validate the graph
+    /// (any `/*!prism …*/` metadata), load its static texture channels (paths
+    /// relative to `base_dir`), and detect its behavior — so a bad shader fails
+    /// here rather than silently on the GPU. Tagged extended-linear
+    /// ([`SHADER_ENCODING`]).
+    pub fn shader(
         fragment_glsl: &str,
         base_dir: &std::path::Path,
-        color: Option<&ColorState>,
         fps: Option<u32>,
-    ) -> Result<ShaderSurface> {
-        // Resolve the render graph (parses any `/*!prism …*/` metadata) and
-        // compile every pass up front (device-independent), so a bad shader
-        // fails at startup rather than silently on the GPU.
+    ) -> Result<PreparedSource> {
         let spec = crate::shadergraph::parse(fragment_glsl)?;
         crate::gpu::validate_graph(&spec)?;
-        // Decode any static image channels now (paths are relative to the .frag),
-        // so a missing/bad texture fails at startup, not on the GPU.
         let textures = spec
             .textures
             .iter()
@@ -553,17 +566,14 @@ impl ShaderSurface {
         // accesses like `pc.iTime`. See [`usage_scan_source`].
         let scan = usage_scan_source(fragment_glsl);
         let uses_audio = scan.contains("iAudio");
-        // A shader that reads iMouse becomes pointer-interactive: the app binds
-        // a seat pointer and routes events to it. It does *not* make the shader
-        // animated — a static mouse shader renders once and then only on
-        // pointer events (repaint-on-motion), staying off the frame-callback
-        // treadmill when idle.
+        // A shader that reads iMouse wants pointer input (only wired for static
+        // --shader specs; a playlist shader using iMouse reads zero). It does
+        // *not* make the shader animated — a static mouse shader renders once
+        // and then only on pointer events.
         let uses_mouse = scan.contains("iMouse");
         // Anything that advances on its own — iTime/iTimeDelta (the latter
         // contains "iTime"), the per-frame counter iFrame, the wall clock iDate,
         // audio, or evolving buffers — needs continuous redraw to progress.
-        // (iMouse is deliberately *not* here: it is event-driven, so a static
-        // mouse shader repaints only on pointer input.)
         let animated = scan.contains("iTime")
             || scan.contains("iFrame")
             || scan.contains("iDate")
@@ -576,18 +586,85 @@ impl ShaderSurface {
         let min_interval = fps
             .filter(|_| animated)
             .map(|n| Duration::from_secs_f64(1.0 / n as f64));
-        let description = make_description(qh, color, &SHADER_ENCODING);
-        Ok(ShaderSurface {
-            spec,
+        Ok(PreparedSource {
+            graph: spec,
             textures,
+            encoding: SHADER_ENCODING,
             animated,
             uses_audio,
             uses_mouse,
+            min_interval,
+        })
+    }
+
+    /// Prepare an image source: a degenerate single-pass graph (from
+    /// [`crate::gpu::image_graph`]) over the image already converted to
+    /// working-space fp16, tagged with that working space. Static — no
+    /// animation, audio, or mouse.
+    pub fn image(
+        graph: crate::shadergraph::GraphSpec,
+        texture: TextureData,
+        encoding: ColorEncoding,
+    ) -> PreparedSource {
+        PreparedSource {
+            graph,
+            textures: vec![texture],
+            encoding,
+            animated: false,
+            uses_audio: false,
+            uses_mouse: false,
+            min_interval: None,
+        }
+    }
+}
+
+/// Parse + validate a shader file without loading its textures — the cheap
+/// "is this entry usable?" check used when seeking/rotating a playlist past
+/// broken entries. Texture-load failures surface later, at display time.
+pub fn validate_shader_file(path: &std::path::Path) -> Result<()> {
+    let glsl = std::fs::read_to_string(path)
+        .with_context(|| format!("reading shader {}", path.display()))?;
+    let spec = crate::shadergraph::parse(&glsl)?;
+    crate::gpu::validate_graph(&spec)?;
+    Ok(())
+}
+
+impl ShaderSurface {
+    /// Prepare a shader surface from `fragment_glsl`. Compilation and target
+    /// allocation are deferred until feedback resolves the output's GPU.
+    pub fn new(
+        qh: &QueueHandle<App>,
+        fragment_glsl: &str,
+        base_dir: &std::path::Path,
+        color: Option<&ColorState>,
+        fps: Option<u32>,
+    ) -> Result<ShaderSurface> {
+        Ok(Self::from_source(
+            qh,
+            PreparedSource::shader(fragment_glsl, base_dir, fps)?,
+            color,
+        ))
+    }
+
+    /// Build a surface displaying `src` (image or shader). The GPU build is
+    /// deferred until feedback resolves the output's device.
+    pub fn from_source(
+        qh: &QueueHandle<App>,
+        src: PreparedSource,
+        color: Option<&ColorState>,
+    ) -> ShaderSurface {
+        let description = make_description(qh, color, &src.encoding);
+        ShaderSurface {
+            spec: src.graph,
+            textures: src.textures,
+            animated: src.animated,
+            uses_audio: src.uses_audio,
+            uses_mouse: src.uses_mouse,
             ptr: PointerState::default(),
             last_time: None,
             frame_count: 0,
             started: None,
-            min_interval,
+            min_interval: src.min_interval,
             last_render: None,
             description,
             cm: None,
@@ -599,61 +676,21 @@ impl ShaderSurface {
             source_dirty: false,
             pending_fade: None,
             outgoing_timing: None,
-        })
-    }
-
-    /// Prepare a surface that displays a still image as a GPU wallpaper. The
-    /// caller hands over a graph from [`crate::gpu::image_graph`], the image
-    /// already converted to working-space fp16 (one [`TextureData`]), and the
-    /// [`ColorEncoding`] to tag the dmabuf with (the image's working space).
-    /// The surface is static — it renders one frame — with no audio or mouse
-    /// inputs. Like [`Self::new`], the GPU build is deferred until feedback
-    /// resolves the output's device.
-    pub fn from_image(
-        qh: &QueueHandle<App>,
-        graph: crate::shadergraph::GraphSpec,
-        textures: Vec<TextureData>,
-        encoding: &ColorEncoding,
-        color: Option<&ColorState>,
-    ) -> ShaderSurface {
-        ShaderSurface {
-            spec: graph,
-            textures,
-            animated: false,
-            uses_audio: false,
-            uses_mouse: false,
-            ptr: PointerState::default(),
-            last_time: None,
-            frame_count: 0,
-            started: None,
-            min_interval: None,
-            last_render: None,
-            description: make_description(qh, color, encoding),
-            cm: None,
-            tagged: false,
-            feedback: None,
-            accum: FeedbackAccum::default(),
-            resolved: None,
-            state: None,
-            source_dirty: false,
-            pending_fade: None,
-            outgoing_timing: None,
         }
     }
 
-    /// Swap the displayed source in place (playlist rotation): replace the
-    /// graph, textures, and color tag, keeping the surface, dmabuf ring, and
-    /// feedback resolution. With `fade: None` the new source renders on the next
-    /// draw and the old frame stays presented until then (a flash-free hard
+    /// Swap the displayed source in place (playlist rotation): replace the graph,
+    /// textures, behavior flags, and color tag, keeping the surface, dmabuf ring,
+    /// and feedback resolution. With `fade: None` the new source renders on the
+    /// next draw and the old frame stays presented until then (a flash-free hard
     /// cut). With `fade: Some(d)` the swap instead blur-dissolves from the old
     /// source to the new one over `d` (see [`ActiveTransition`]); the surface
-    /// keeps requesting frame callbacks until the dissolve completes.
+    /// keeps requesting frame callbacks until the dissolve completes. Works for
+    /// any source pair — image↔image, image↔shader, shader↔shader.
     pub fn set_source(
         &mut self,
         qh: &QueueHandle<App>,
-        graph: crate::shadergraph::GraphSpec,
-        textures: Vec<TextureData>,
-        encoding: &ColorEncoding,
+        src: PreparedSource,
         color: Option<&ColorState>,
         fade: Option<Duration>,
     ) {
@@ -663,19 +700,25 @@ impl ShaderSurface {
             self.outgoing_timing = Some((self.started, self.last_time, self.frame_count));
             self.pending_fade = fade;
         }
-        self.spec = graph;
-        self.textures = textures;
+        self.spec = src.graph;
+        self.textures = src.textures;
+        self.animated = src.animated;
+        self.uses_audio = src.uses_audio;
+        self.uses_mouse = src.uses_mouse;
+        self.min_interval = src.min_interval;
         self.source_dirty = true;
-        // Re-tag with the new image's working space.
+        // Re-tag with the new source's working space.
         if let Some(cm) = self.cm.take() {
             cm.destroy();
         }
-        self.description = make_description(qh, color, encoding);
+        self.description = make_description(qh, color, &src.encoding);
         self.tagged = false;
-        // The incoming source renders one frame from t = 0.
+        // The incoming source renders one frame from t = 0, unthrottled (so the
+        // dissolve's first frame isn't gated by the outgoing source's --fps).
         self.started = None;
         self.last_time = None;
         self.frame_count = 0;
+        self.last_render = None;
     }
 
     /// Whether the surface should keep requesting frame callbacks: an animated

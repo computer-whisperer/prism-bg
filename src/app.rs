@@ -458,31 +458,42 @@ impl App {
     /// main loop after every dispatch — cheap when nothing changed.
     pub fn service(&mut self, qh: &QueueHandle<App>) {
         for i in 0..self.wallpapers.len() {
-            let wp = &self.wallpapers[i];
-            if wp.broken || wp.spec.shader.is_some() {
+            if self.wallpapers[i].broken || self.wallpapers[i].spec.shader.is_some() {
                 continue; // --shader wallpapers render via feedback/frame, not here
             }
-            let name = wp.name.clone();
-            // Desired image path: the playlist's current entry, or static -i.
-            let path = match wp.spec.playlist {
-                Some(p) => {
-                    let src = self.playlists[p].current();
-                    if src.is_shader() {
-                        continue; // GPU-rendered playlist shaders arrive in a later step
+            let name = self.wallpapers[i].name.clone();
+            // A playlist whose current entry is a shader: prepare + display it as
+            // a GPU shader source (dissolving like any other rotation). Keyed by
+            // path alone (no tone treatment), so it dedups against `loaded`.
+            if let Some(p) = self.wallpapers[i].spec.playlist {
+                let src = self.playlists[p].current();
+                if src.is_shader() {
+                    let path = src.path().to_path_buf();
+                    let key: ImageKey = (path.clone(), None);
+                    if self.wallpapers[i].loaded.as_ref() == Some(&key) {
+                        continue; // already showing it
                     }
-                    src.path().to_path_buf()
+                    if let Err(e) = self.show_shader(qh, i, &path) {
+                        tracing::error!(output = name, "preparing shader failed: {e:#}");
+                        self.wallpapers[i].broken = true;
+                    }
+                    continue;
                 }
-                None => match wp.spec.image.clone() {
+            }
+            // Desired image path: the playlist's current entry, or static -i.
+            let path = match self.wallpapers[i].spec.playlist {
+                Some(p) => self.playlists[p].current().path().to_path_buf(),
+                None => match self.wallpapers[i].spec.image.clone() {
                     Some(path) => path,
                     None => continue, // solid color: drawn at configure
                 },
             };
-            if wp.spec.effective_mode() == Mode::SolidColor {
+            if self.wallpapers[i].spec.effective_mode() == Mode::SolidColor {
                 continue;
             }
 
             // Resolve the tone target (auto waits for the output's luminance).
-            let tone = match wp.spec.tone_map {
+            let tone = match self.wallpapers[i].spec.tone_map {
                 Some(crate::cli::ToneMap::Nits(n)) => Some(n),
                 Some(crate::cli::ToneMap::Auto) => {
                     if self.color.is_none() {
@@ -556,6 +567,7 @@ impl App {
             Tf::Srgb.eotf(c.b as f32),
         ];
         let graph = crate::gpu::image_graph(w, h, mode, bg);
+        let src = crate::shader::PreparedSource::image(graph, texture, encoding);
 
         let color = self.color.as_ref();
         let dmabuf = self.dmabuf.as_ref();
@@ -563,9 +575,9 @@ impl App {
         let fade = self.wallpapers[i].spec.fade;
         let wp = &mut self.wallpapers[i];
         match wp.shader.as_mut() {
-            Some(s) => s.set_source(qh, graph, vec![texture], &encoding, color, fade),
+            Some(s) => s.set_source(qh, src, color, fade),
             None => {
-                let mut s = ShaderSurface::from_image(qh, graph, vec![texture], &encoding, color);
+                let mut s = ShaderSurface::from_source(qh, src, color);
                 if let Some(dmabuf) = dmabuf {
                     s.request_feedback(dmabuf, qh, wp.layer.wl_surface(), wp.name.clone());
                 }
@@ -573,6 +585,54 @@ impl App {
             }
         }
         wp.loaded = Some(key.clone());
+        self.draw(qh, i);
+        Ok(())
+    }
+
+    /// Build (or swap in place) the GPU surface that renders wallpaper `i`'s
+    /// current playlist *shader* entry: parse + prepare the shader, spin up
+    /// audio capture if it's reactive, then create the surface (first load) or
+    /// [`ShaderSurface::set_source`] it (rotation, blur-dissolving with `--fade`).
+    fn show_shader(
+        &mut self,
+        qh: &QueueHandle<App>,
+        i: usize,
+        path: &std::path::Path,
+    ) -> Result<()> {
+        let glsl = std::fs::read_to_string(path)
+            .with_context(|| format!("reading shader {}", path.display()))?;
+        let base_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let fps = self.wallpapers[i].spec.fps;
+        let src = crate::shader::PreparedSource::shader(&glsl, base_dir, fps)?;
+        // A reactive playlist shader spins up the capture on arrival.
+        if src.uses_audio {
+            self.ensure_audio_capture();
+        }
+        // Pointer input is decided once at startup from --shader specs only, so
+        // a playlist shader that reads iMouse gets zero unless a static --shader
+        // also wanted the pointer.
+        if src.uses_mouse && !self.wants_mouse {
+            tracing::warn!(
+                path = %path.display(),
+                "playlist shader uses iMouse, but pointer input is wired only for --shader \
+                 wallpapers; it will read zero"
+            );
+        }
+        let fade = self.wallpapers[i].spec.fade;
+        let color = self.color.as_ref();
+        let dmabuf = self.dmabuf.as_ref();
+        let wp = &mut self.wallpapers[i];
+        match wp.shader.as_mut() {
+            Some(s) => s.set_source(qh, src, color, fade),
+            None => {
+                let mut s = ShaderSurface::from_source(qh, src, color);
+                if let Some(dmabuf) = dmabuf {
+                    s.request_feedback(dmabuf, qh, wp.layer.wl_surface(), wp.name.clone());
+                }
+                wp.shader = Some(s);
+            }
+        }
+        wp.loaded = Some((path.to_path_buf(), None));
         self.draw(qh, i);
         Ok(())
     }
@@ -747,16 +807,28 @@ impl App {
     pub fn rotate(&mut self, qh: &QueueHandle<App>, idx: usize) {
         let previous = self.playlists[idx].current().path().to_path_buf();
 
-        // Find the next decodable entry, skipping (with a warning) files
-        // that fail — a deleted or corrupt entry must not kill the daemon.
+        // Find the next usable entry, skipping (with a warning) files that fail
+        // — a deleted or corrupt entry must not kill the daemon. Images are
+        // pre-decoded into the cache; shaders are validated (parse only — the
+        // full prep, including textures, happens at display time).
         let mut next = None;
         for _ in 0..self.playlists[idx].len() {
             self.playlists[idx].advance();
             let src = self.playlists[idx].current();
-            if src.is_shader() {
-                continue; // not yet renderable from a playlist; skip during rotation
-            }
+            let is_shader = src.is_shader();
             let path = src.path().to_path_buf();
+            if is_shader {
+                match crate::shader::validate_shader_file(&path) {
+                    Ok(()) => {
+                        next = Some(path);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), "skipping playlist entry: {e:#}")
+                    }
+                }
+                continue;
+            }
             if self.raw_images.contains_key(&path) {
                 next = Some(path);
                 break;

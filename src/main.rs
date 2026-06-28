@@ -107,20 +107,20 @@ fn main() -> Result<()> {
     // decodable entry, failing only if none decodes.
     for (i, pl) in playlists.iter_mut().enumerate() {
         let loaded = (0..pl.len()).any(|_| {
-            // Shader entries render via the GPU path (wired up in a later
-            // step); for now skip them when seeking the first decodable
-            // image so an image-only list keeps its existing fail-fast.
-            if pl.current().is_shader() {
-                pl.advance();
-                return false;
-            }
-            match load_raw(&mut raw_images, pl.current().path()) {
+            let is_shader = pl.current().is_shader();
+            let path = pl.current().path().to_path_buf();
+            // Shaders are validated (parse only — textures load at display
+            // time); images are pre-decoded into the cache. A broken entry is
+            // skipped so the list seeks to its first usable source.
+            let result = if is_shader {
+                crate::shader::validate_shader_file(&path)
+            } else {
+                load_raw(&mut raw_images, &path)
+            };
+            match result {
                 Ok(()) => true,
                 Err(e) => {
-                    tracing::warn!(
-                        path = %pl.current().path().display(),
-                        "skipping playlist entry: {e:#}"
-                    );
+                    tracing::warn!(path = %path.display(), "skipping playlist entry: {e:#}");
                     pl.advance();
                     false
                 }
