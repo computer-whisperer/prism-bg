@@ -922,6 +922,17 @@ pub struct ShaderUniforms {
     /// The whole cluster's logical size (`iGlobalResolution`); normalize a
     /// cluster coord to `0..1` across the workspace with `g / iGlobalResolution`.
     pub global_resolution: [f32; 2],
+    /// This output's diffuse/reference white in cd/m² (`iRefWhite`). The output
+    /// is tagged extended-linear with the perceptual (anchored) intent, so the
+    /// compositor maps shader value `1.0` to this luminance — i.e. `1.0` *is*
+    /// diffuse white. Authored content should treat `1.0` as white.
+    pub ref_white: f32,
+    /// This output's peak luminance to master against, cd/m² (`iMaxLum`) — the
+    /// compositor-advertised mastering-display peak. Highlight headroom above
+    /// white is `iMaxLum / iRefWhite`; a shader must clamp its output so it
+    /// never exceeds that, or the compositor's display LUT rolls off the
+    /// overage and brightness blows past the advertised target.
+    pub max_lum: f32,
 }
 
 /// Number of spectrum bins handed to audio-reactive shaders (log-spaced,
@@ -2500,6 +2511,8 @@ mod tests {
             output_offset: [0.0, 0.0],
             output_size: [rt.width as f32, rt.height as f32],
             global_resolution: [rt.width as f32, rt.height as f32],
+            ref_white: 203.0,
+            max_lum: 203.0,
         };
         // Exercises the sync_file export + dmabuf import attach on this GPU,
         // plus the spectrum UBO upload + descriptor bind.
@@ -2551,6 +2564,8 @@ void main() {
             output_offset: [0.0, 0.0],
             output_size: [rt.width as f32, rt.height as f32],
             global_resolution: [rt.width as f32, rt.height as f32],
+            ref_white: 203.0,
+            max_lum: 203.0,
         };
         let audio = <AudioUniforms as bytemuck::Zeroable>::zeroed();
         // Two frames: the second samples the first via iPrevFrame (parity flip).
@@ -2640,6 +2655,8 @@ void main() {
             output_offset: [0.0, 0.0],
             output_size: [rt.width as f32, rt.height as f32],
             global_resolution: [rt.width as f32, rt.height as f32],
+            ref_white: 203.0,
+            max_lum: 203.0,
         };
         let audio = <AudioUniforms as bytemuck::Zeroable>::zeroed();
         for slot in 0..2 {

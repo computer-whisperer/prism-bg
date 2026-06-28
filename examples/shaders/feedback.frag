@@ -21,7 +21,13 @@ layout(push_constant) uniform Push {
     vec2 iOutputOffset;
     vec2 iOutputSize;
     vec2 iGlobalResolution;
+    float iRefWhite;  // cd/m²: output value 1.0 = diffuse white
+    float iMaxLum;    // cd/m²: peak to master against
 } pc;
+
+// Highlight headroom above white (≥ 1.0): how far past diffuse white we may
+// push before the compositor's display LUT rolls off the overage. 1.0 on SDR.
+float headroom() { return max(pc.iMaxLum / max(pc.iRefWhite, 1.0), 1.0); }
 
 // Previous frame's output (this buffer, last frame). Sampled y-flipped.
 layout(set = 1, binding = 0) uniform sampler2D iPrevFrame;
@@ -45,10 +51,14 @@ void main() {
     vec3 col = acc / 8.0 * 0.985;
 
     // A wandering emitter (a couple of incommensurate sinusoids → a Lissajous
-    // path that doesn't obviously repeat).
+    // path that doesn't obviously repeat). The emitter core is driven toward the
+    // display peak so the trails glow in HDR; on SDR (headroom 1.0) it tops out
+    // at white.
     vec2 p = vec2(0.5 + 0.36 * cos(pc.iTime * 0.7), 0.5 + 0.30 * sin(pc.iTime * 1.1));
     float d = distance(uv, p);
-    col += palette(pc.iTime * 0.05) * smoothstep(0.025, 0.0, d) * 1.5;
+    col += palette(pc.iTime * 0.05) * smoothstep(0.025, 0.0, d) * headroom();
 
-    outColor = vec4(col, 1.0);
+    // Clamp the accumulator to the peak so additive trails can't creep past the
+    // master target over many frames.
+    outColor = vec4(min(col, vec3(headroom())), 1.0);
 }

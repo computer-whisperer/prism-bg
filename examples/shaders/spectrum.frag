@@ -21,7 +21,12 @@ layout(push_constant) uniform Push {
     vec2 iOutputOffset;
     vec2 iOutputSize;
     vec2 iGlobalResolution;
+    float iRefWhite;
+    float iMaxLum;
 } pc;
+
+// Highlight headroom above diffuse white (>= 1.0; 1.0 on SDR).
+float headroom() { return max(pc.iMaxLum / max(pc.iRefWhite, 1.0), 1.0); }
 
 layout(set = 0, binding = 0, std140) uniform Audio {
     vec4 iAudioBins[8];   // 32 bins packed four-per-vec4
@@ -67,7 +72,7 @@ void main() {
 
     // A glowing crest line riding the top of each bar.
     float crest = bar * exp(-220.0 * (uv.y - height) * (uv.y - height));
-    col += barCol * crest * (0.5 + mag);
+    col += barCol * crest * (0.5 + mag) * headroom();
 
-    outColor = vec4(col, 1.0);
+    outColor = vec4(min(col, vec3(headroom())), 1.0);
 }

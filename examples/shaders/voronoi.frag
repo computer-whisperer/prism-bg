@@ -10,7 +10,19 @@
 #version 450
 layout(location = 0) in vec2 fragCoord;
 layout(location = 0) out vec4 outColor;
-layout(push_constant) uniform Push { vec2 iResolution; float iTime; float _pad; } pc;
+layout(push_constant) uniform Push {
+    vec2 iResolution;
+    float iTime;
+    float _pad;
+    vec2 iOutputOffset;
+    vec2 iOutputSize;
+    vec2 iGlobalResolution;
+    float iRefWhite;  // cd/m²: output value 1.0 = diffuse white
+    float iMaxLum;    // cd/m²: peak to master against
+} pc;
+
+// Highlight headroom above diffuse white (>= 1.0; 1.0 on SDR).
+float headroom() { return max(pc.iMaxLum / max(pc.iRefWhite, 1.0), 1.0); }
 
 vec2 hash22(vec2 p) {
     p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
@@ -66,7 +78,7 @@ void main() {
 
     // Glowing borders.
     float edge = smoothstep(0.04, 0.0, me);
-    col += palette(0.6 + 0.05 * sin(t)) * edge * 0.5;
+    col += palette(0.6 + 0.05 * sin(t)) * edge * 0.5 * headroom();
 
-    outColor = vec4(col, 1.0);
+    outColor = vec4(min(col, vec3(headroom())), 1.0);
 }

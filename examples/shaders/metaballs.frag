@@ -8,7 +8,19 @@
 #version 450
 layout(location = 0) in vec2 fragCoord;
 layout(location = 0) out vec4 outColor;
-layout(push_constant) uniform Push { vec2 iResolution; float iTime; float _pad; } pc;
+layout(push_constant) uniform Push {
+    vec2 iResolution;
+    float iTime;
+    float _pad;
+    vec2 iOutputOffset;
+    vec2 iOutputSize;
+    vec2 iGlobalResolution;
+    float iRefWhite;  // cd/m²: output value 1.0 = diffuse white
+    float iMaxLum;    // cd/m²: peak to master against
+} pc;
+
+// Highlight headroom above diffuse white (>= 1.0; 1.0 on SDR).
+float headroom() { return max(pc.iMaxLum / max(pc.iRefWhite, 1.0), 1.0); }
 
 vec3 palette(float t) {
     vec3 a = vec3(0.5, 0.45, 0.5);
@@ -45,9 +57,9 @@ void main() {
     vec3 body = palette(0.15 + field * 0.12 + t * 0.05) * 0.5;
 
     vec3 col = mix(bg, body, inside);
-    col += palette(0.5) * rim * 0.35; // brighter rim/contour
+    col += palette(0.5) * rim * 0.35 * headroom(); // brighter rim/contour
     // Soft outer glow where the field is rising but not yet inside.
-    col += body * smoothstep(0.3, 0.8, field) * 0.12;
+    col += body * smoothstep(0.3, 0.8, field) * 0.12 * headroom();
 
-    outColor = vec4(col, 1.0);
+    outColor = vec4(min(col, vec3(headroom())), 1.0);
 }

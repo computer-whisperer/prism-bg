@@ -9,7 +9,19 @@
 #version 450
 layout(location = 0) in vec2 fragCoord;
 layout(location = 0) out vec4 outColor;
-layout(push_constant) uniform Push { vec2 iResolution; float iTime; float _pad; } pc;
+layout(push_constant) uniform Push {
+    vec2 iResolution;
+    float iTime;
+    float _pad;
+    vec2 iOutputOffset;
+    vec2 iOutputSize;
+    vec2 iGlobalResolution;
+    float iRefWhite;  // cd/m²: output value 1.0 = diffuse white
+    float iMaxLum;    // cd/m²: peak to master against
+} pc;
+
+// Highlight headroom above diffuse white (>= 1.0; 1.0 on SDR).
+float headroom() { return max(pc.iMaxLum / max(pc.iRefWhite, 1.0), 1.0); }
 
 float hash21(vec2 p) {
     p = fract(p * vec2(123.34, 345.45));
@@ -48,7 +60,7 @@ void main() {
     vec2 sp = fragCoord / pc.iResolution.y;
     float star = pow(hash21(floor(sp * 320.0)), 220.0);
     star *= smoothstep(0.35, 0.95, uv.y);
-    col += vec3(0.8, 0.85, 1.0) * star;
+    col += vec3(0.8, 0.85, 1.0) * star * headroom();
 
     // Two drifting curtains. Each is a horizontal noise band whose height is
     // modulated by fbm; brightness falls off above and below the band.
@@ -65,12 +77,12 @@ void main() {
         curtain *= 0.55 + 0.65 * fil;
 
         vec3 tint = mix(vec3(0.05, 0.7, 0.35), vec3(0.1, 0.45, 0.8), fk);
-        col += tint * curtain * 0.7;
+        col += tint * curtain * 0.7 * headroom();
     }
 
     // Magenta fringe skimming the top of the higher curtain.
     float fringe = smoothstep(0.6, 0.78, uv.y) * (1.0 - smoothstep(0.78, 0.95, uv.y));
-    col += vec3(0.5, 0.1, 0.45) * fringe * 0.15;
+    col += vec3(0.5, 0.1, 0.45) * fringe * 0.15 * headroom();
 
-    outColor = vec4(col, 1.0);
+    outColor = vec4(min(col, vec3(headroom())), 1.0);
 }

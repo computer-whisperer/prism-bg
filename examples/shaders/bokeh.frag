@@ -6,7 +6,19 @@
 #version 450
 layout(location = 0) in vec2 fragCoord;
 layout(location = 0) out vec4 outColor;
-layout(push_constant) uniform Push { vec2 iResolution; float iTime; float _pad; } pc;
+layout(push_constant) uniform Push {
+    vec2 iResolution;
+    float iTime;
+    float _pad;
+    vec2 iOutputOffset;
+    vec2 iOutputSize;
+    vec2 iGlobalResolution;
+    float iRefWhite;  // cd/m²: output value 1.0 = diffuse white
+    float iMaxLum;    // cd/m²: peak to master against
+} pc;
+
+// Highlight headroom above diffuse white (>= 1.0; 1.0 on SDR).
+float headroom() { return max(pc.iMaxLum / max(pc.iRefWhite, 1.0), 1.0); }
 
 float hash11(float n) {
     return fract(sin(n * 91.3458) * 47453.5453);
@@ -44,8 +56,8 @@ void main() {
         float a = disc * 0.12 + rim * 0.10;
 
         vec3 tint = mix(vec3(0.5, 0.7, 1.0), vec3(1.0, 0.7, 0.5), hash11(fi + 5.0));
-        col += tint * a;
+        col += tint * a * headroom();
     }
 
-    outColor = vec4(col, 1.0);
+    outColor = vec4(min(col, vec3(headroom())), 1.0);
 }

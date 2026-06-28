@@ -38,7 +38,15 @@ layout(push_constant) uniform Push {
     vec2 iOutputOffset;
     vec2 iOutputSize;
     vec2 iGlobalResolution;
+    float iRefWhite;  // cd/m²: output value 1.0 = diffuse white
+    float iMaxLum;    // cd/m²: peak to master against
 } pc;
+
+// Highlight headroom above diffuse white, in multiples of white (≥ 1.0). The
+// surface is extended-linear/anchored, so 1.0 already = the output's reference
+// white; this is how far above white we may push before the compositor's
+// display LUT rolls off the overage. Master HDR content into [0, headroom()].
+float headroom() { return max(pc.iMaxLum / max(pc.iRefWhite, 1.0), 1.0); }
 
 // 9-tap Gaussian weights (sigma ≈ 2), normalized.
 const float W[5] = float[](0.227027, 0.194595, 0.121622, 0.054054, 0.016216);
@@ -75,9 +83,10 @@ void main() {
             0.5 + 0.30 * sin(pc.iTime * (0.6 + 0.15 * fi) + fi * 1.7)
         );
         float d = distance(p, c);
-        // Sharp core (overdriven past 1.0 so the bloom has HDR energy to spread)
-        // plus a faint near-field glow.
-        col += palette(0.1 * fi + pc.iTime * 0.05) * (4.0 * smoothstep(0.05, 0.0, d));
+        // Sharp core driven up to the display's peak (headroom × white) so the
+        // bloom has real HDR energy to spread — on an SDR output headroom is
+        // 1.0 and the cores sit at white instead of blowing past it.
+        col += palette(0.1 * fi + pc.iTime * 0.05) * (headroom() * smoothstep(0.05, 0.0, d));
     }
     outColor = vec4(col, 1.0);
 }
@@ -109,5 +118,7 @@ void main() {
     vec2 uv = fragCoord / pc.iResolution;
     vec3 scene = tap(iChannel0, uv);
     vec3 glow = blur(iChannel1, uv, vec2(0.0, 1.0), 2.0);
-    outColor = vec4(scene + glow * 1.3, 1.0);
+    // Clamp the composite to the advertised peak so a stack of overlapping
+    // cores + glow can't drive luminance past the master target.
+    outColor = vec4(min(scene + glow * 1.3, vec3(headroom())), 1.0);
 }

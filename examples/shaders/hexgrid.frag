@@ -24,7 +24,12 @@ layout(push_constant) uniform Push {
     vec2 iOutputOffset;      // this output's bottom-left in cluster space, logical px
     vec2 iOutputSize;        // this output, logical px
     vec2 iGlobalResolution;  // whole cluster, logical px
+    float iRefWhite;         // cd/m²: output value 1.0 = diffuse white
+    float iMaxLum;           // cd/m²: peak luminance to master against
 } pc;
+
+// Highlight headroom above diffuse white (>= 1.0; 1.0 on SDR).
+float headroom() { return max(pc.iMaxLum / max(pc.iRefWhite, 1.0), 1.0); }
 
 vec3 palette(float t) {
     vec3 a = vec3(0.5), b = vec3(0.5), c = vec3(1.0);
@@ -78,9 +83,9 @@ void main() {
     vec3 tint = palette(dist + t * 0.03);
 
     // Faint always-on cell fill, plus a stronger lit fill where the pulse is.
-    col += tint * (0.05 + 0.4 * pulse) * edge;
+    col += tint * (0.05 + 0.4 * pulse) * edge * headroom();
     // Glowing borders, brightest on lit cells.
-    col += tint * border * (0.15 + 0.5 * pulse);
+    col += tint * border * (0.15 + 0.5 * pulse) * headroom();
 
-    outColor = vec4(col, 1.0);
+    outColor = vec4(min(col, vec3(headroom())), 1.0);
 }

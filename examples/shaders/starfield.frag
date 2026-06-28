@@ -6,7 +6,19 @@
 #version 450
 layout(location = 0) in vec2 fragCoord;
 layout(location = 0) out vec4 outColor;
-layout(push_constant) uniform Push { vec2 iResolution; float iTime; float _pad; } pc;
+layout(push_constant) uniform Push {
+    vec2 iResolution;
+    float iTime;
+    float _pad;
+    vec2 iOutputOffset;
+    vec2 iOutputSize;
+    vec2 iGlobalResolution;
+    float iRefWhite;  // cd/m²: output value 1.0 = diffuse white
+    float iMaxLum;    // cd/m²: peak to master against
+} pc;
+
+// Highlight headroom above diffuse white (>= 1.0; 1.0 on SDR).
+float headroom() { return max(pc.iMaxLum / max(pc.iRefWhite, 1.0), 1.0); }
 
 float hash21(vec2 p) {
     p = fract(p * vec2(123.34, 345.45));
@@ -42,9 +54,9 @@ void main() {
     vec2 sc = fragCoord / pc.iResolution;
     vec3 col = mix(vec3(0.02, 0.02, 0.05), vec3(0.0, 0.0, 0.015), sc.y);
 
-    col += layer(uv, 8.0, 0.010, 0.0, t) * 0.6;  // far, static
-    col += layer(uv, 14.0, 0.025, 2.5, t) * 0.8; // mid
-    col += layer(uv, 22.0, 0.050, 4.0, t) * 1.1; // near, fast twinkle
+    col += layer(uv, 8.0, 0.010, 0.0, t) * 0.6 * headroom();  // far, static
+    col += layer(uv, 14.0, 0.025, 2.5, t) * 0.8 * headroom(); // mid
+    col += layer(uv, 22.0, 0.050, 4.0, t) * 1.1 * headroom(); // near, fast twinkle
 
-    outColor = vec4(col, 1.0);
+    outColor = vec4(min(col, vec3(headroom())), 1.0);
 }

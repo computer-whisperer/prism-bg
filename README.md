@@ -98,8 +98,13 @@ Extras beyond swaybg (also per-output-group):
       vec2 iOutputOffset;      // this output's bottom-left in the multi-monitor
       vec2 iOutputSize;        //   cluster, and its size — both logical px, y-up
       vec2 iGlobalResolution;  // the whole cluster, logical px
+      float iRefWhite;         // cd/m²: output value 1.0 = diffuse white
+      float iMaxLum;           // cd/m²: peak luminance to master against
   } pc;
   ```
+
+  A shader may declare only the prefix it uses — the block is read positionally,
+  so older shaders that stop at `iGlobalResolution` keep working.
 
   The cluster fields let a shader tile *continuously across the whole
   workspace* instead of restarting per monitor:
@@ -109,6 +114,22 @@ Extras beyond swaybg (also per-output-group):
   `0..1` coordinate spanning the desktop. A shader that only reads
   `iResolution`/`iTime` still works and behaves per-output. See
   `examples/shaders/hexgrid.frag` for a worked example.
+
+  **Luminance (`iRefWhite` / `iMaxLum`).** The shader output is tagged
+  extended-linear with the perceptual (anchored) intent, so the compositor maps
+  value `1.0` to the output's diffuse white — i.e. **`1.0` is white**, and the
+  buffer is HDR-capable above that. `iRefWhite` is that white in cd/m² and
+  `iMaxLum` is the peak the compositor advertises to master against (its
+  configured mastering peak, *not* the panel's marketing/HDR-metadata number).
+  Highlight headroom above white is `iMaxLum / iRefWhite` (≥ 1.0; exactly 1.0 on
+  an SDR output). **A shader is responsible for keeping its own output within
+  `[0, iMaxLum/iRefWhite]`** — prism does not tone-map the buffer for you; a
+  shader that drives past the peak gets rolled off by the output's display LUT
+  and reads as blown-out. Master HDR highlights into the headroom and clamp.
+  Before an output's capabilities resolve (and with no color management) the
+  values default to an SDR-safe `203 / 203` (headroom 1.0), so a shader never
+  overblows at startup. See `examples/shaders/bloom.frag` (HDR bloom into the
+  headroom) and `examples/shaders/feedback.frag`.
 
   A shader can also be **audio-reactive**: reference any of the audio uniforms
   and prism-bg captures the default sink's output over PipeWire, runs an FFT,

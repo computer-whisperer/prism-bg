@@ -337,7 +337,7 @@ impl Dispatch<WpImageDescriptionInfoV1, FeedbackData> for App {
         event: wp_image_description_info_v1::Event,
         data: &FeedbackData,
         _: &Connection,
-        _: &QueueHandle<App>,
+        qh: &QueueHandle<App>,
     ) {
         use wp_image_description_info_v1::Event;
         let output = &data.0;
@@ -348,19 +348,41 @@ impl Dispatch<WpImageDescriptionInfoV1, FeedbackData> for App {
             Event::TargetLuminance { max_lum, .. } => {
                 state.pending_targets.entry(output.clone()).or_default().1 = Some(max_lum as f64);
             }
+            Event::Luminances { reference_lum, .. } => {
+                // The preferred encoding's reference white: the luminance shader
+                // value 1.0 maps to under the anchored intent.
+                state.pending_targets.entry(output.clone()).or_default().2 =
+                    Some(reference_lum as f64);
+            }
             Event::Done => {
-                let (cll, lum_max) = state.pending_targets.remove(output).unwrap_or_default();
+                let (cll, lum_max, reference) =
+                    state.pending_targets.remove(output).unwrap_or_default();
                 // Master against target_luminance.max — the mastering-display
                 // peak the compositor advertises as the value to tone-map to
                 // (prism's `advertised-peak-nits`, deliberately decoupled from
                 // the HDR_OUTPUT_METADATA signaling). target_max_cll is that
                 // signaling/panel value (often the marketing peak) and is a
                 // fallback only, used when target_luminance is somehow absent.
-                if let Some(target) = lum_max.or(cll) {
-                    tracing::info!(output, target_nits = target, "output tone-map target");
-                    state.tone_targets.insert(output.clone(), target);
-                } else {
+                let Some(max) = lum_max.or(cll) else {
                     tracing::warn!(output, "preferred description had no target luminance");
+                    return;
+                };
+                let reference = reference.unwrap_or(crate::app::DEFAULT_OUTPUT_LUM.reference);
+                let lum = crate::app::OutputLum { reference, max };
+                let changed = state.output_lums.get(output).map(|l| (l.reference, l.max))
+                    != Some((reference, max));
+                tracing::info!(
+                    output,
+                    ref_nits = reference,
+                    target_nits = max,
+                    "output advertised luminance"
+                );
+                state.output_lums.insert(output.clone(), lum);
+                // Static shaders baked stale luminance into their one frame
+                // (caps may arrive after the first render); redraw them.
+                // Animated shaders pick the new values up on their next frame.
+                if changed {
+                    state.redraw_static_shaders(qh);
                 }
             }
             _ => {}

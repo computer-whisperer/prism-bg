@@ -135,6 +135,26 @@ struct Fade {
     _old_buffer: Option<Buffer>,
 }
 
+/// The luminance an output advertises (cd/m²), resolved from its preferred
+/// image description. `reference` is the diffuse-white level shader value `1.0`
+/// maps to under the anchored intent; `max` is the mastering-display peak to
+/// master highlights against (the compositor's advertised peak, deliberately
+/// distinct from the panel's marketing/HDR-metadata `max_cll`).
+#[derive(Clone, Copy, Debug)]
+pub struct OutputLum {
+    pub reference: f64,
+    pub max: f64,
+}
+
+/// SDR-safe luminance used before an output's preferred description resolves
+/// (and when there's no color management): `1.0` = 203 nits, no highlight
+/// headroom, so a shader renders plain SDR and can't overblow until real caps
+/// arrive.
+pub(crate) const DEFAULT_OUTPUT_LUM: OutputLum = OutputLum {
+    reference: 203.0,
+    max: 203.0,
+};
+
 struct Wallpaper {
     output: wl_output::WlOutput,
     name: String,
@@ -185,12 +205,14 @@ pub struct App {
     pub raw_images: HashMap<PathBuf, Arc<DecodedImage>>,
     /// Treated + capability-adapted images by (path, treatment).
     pub images: HashMap<ImageKey, LoadedImage>,
-    /// Resolved per-output tone-map targets (nits), from the preferred
-    /// image description's target_max_cll / target_luminance.
-    pub tone_targets: HashMap<String, f64>,
+    /// Resolved per-output advertised luminance, from the preferred image
+    /// description: the reference white (shader `1.0` maps here) and the peak
+    /// to master against. Drives both `--tone-map auto` (the `max`) and the
+    /// shader `iRefWhite`/`iMaxLum` uniforms.
+    pub output_lums: HashMap<String, OutputLum>,
     /// In-flight info collection per output: (target_max_cll,
-    /// target_luminance.max).
-    pub pending_targets: HashMap<String, (Option<f64>, Option<f64>)>,
+    /// target_luminance.max, luminances.reference).
+    pub pending_targets: HashMap<String, (Option<f64>, Option<f64>, Option<f64>)>,
     /// Rotation state per `--image-list` spec group, indexed by
     /// `OutputSpec::playlist`. Advanced by per-playlist timers in `main`.
     pub playlists: Vec<Playlist>,
@@ -292,7 +314,7 @@ impl App {
             specs: args.specs.clone(),
             raw_images,
             images: HashMap::new(),
-            tone_targets: HashMap::new(),
+            output_lums: HashMap::new(),
             pending_targets: HashMap::new(),
             playlists,
             loop_handle,
@@ -355,15 +377,19 @@ impl App {
                 .set_opaque_region(Some(region.wl_region()));
         }
 
-        // `--tone-map auto` needs the output's preferred description;
-        // subscribe before the first service pass.
+        // Subscribe to the output's preferred description (which carries its
+        // advertised luminance) before the first service pass. Needed by
+        // `--tone-map auto` images and by every shader (which masters its
+        // content to the output's reference white + peak via iRefWhite/iMaxLum).
         let wants_image = (spec.image.is_some() || spec.playlist.is_some())
             && spec.effective_mode() != Mode::SolidColor;
-        let feedback = match (&self.color, spec.tone_map, wants_image) {
-            (Some(color), Some(crate::cli::ToneMap::Auto), true) => {
+        let wants_auto = matches!(spec.tone_map, Some(crate::cli::ToneMap::Auto)) && wants_image;
+        let is_shader = spec.shader.is_some();
+        let feedback = match &self.color {
+            Some(color) if wants_auto || is_shader => {
                 Some(color.watch_preferred(qh, layer.wl_surface(), name.clone()))
             }
-            (None, Some(crate::cli::ToneMap::Auto), true) => {
+            None if wants_auto => {
                 tracing::warn!(
                     output = name,
                     "--tone-map auto needs wp_color_management_v1; tone mapping disabled"
@@ -496,8 +522,8 @@ impl App {
                     if self.color.is_none() {
                         None // warned at add_output
                     } else {
-                        match self.tone_targets.get(&name) {
-                            Some(&t) => Some(t),
+                        match self.output_lums.get(&name) {
+                            Some(lum) => Some(lum.max),
                             None => continue, // feedback still in flight
                         }
                     }
@@ -856,6 +882,13 @@ impl App {
         // mut borrow below, since it reads `output_state` immutably.
         let output = self.wallpapers[index].output.clone();
         let tiling = self.cluster_placement(&output, (w, h));
+        // The output's advertised luminance to master against (SDR-safe default
+        // until its preferred description resolves). Read before the mut borrow.
+        let lum = self
+            .output_lums
+            .get(&self.wallpapers[index].name)
+            .copied()
+            .unwrap_or(DEFAULT_OUTPUT_LUM);
         // Latest spectrum (zeroed silence if no capture is running).
         let audio = self
             .audio
@@ -882,6 +915,7 @@ impl App {
             (w, h),
             tiling,
             &audio,
+            (lum.reference as f32, lum.max as f32),
             color,
             intent,
         )?;
@@ -906,11 +940,12 @@ impl App {
         tiling_from_rects(rect(output), &all, logical)
     }
 
-    /// A layout change (output added/removed/moved/resized) shifts the global
-    /// cluster box, so every shader's tiling uniforms are stale. Animated
-    /// shaders self-heal on their next frame (uniforms are recomputed per
-    /// render); only *static* shaders need an explicit redraw.
-    fn relayout_static_shaders(&mut self, qh: &QueueHandle<App>) {
+    /// Redraw every *static* shader. Animated shaders self-heal on their next
+    /// frame (uniforms are recomputed per render), but a static shader rendered
+    /// its single frame already, so a change to any per-frame uniform input —
+    /// the cluster layout (output added/removed/moved/resized) or an output's
+    /// advertised luminance — needs an explicit redraw to take effect.
+    pub(crate) fn redraw_static_shaders(&mut self, qh: &QueueHandle<App>) {
         for i in 0..self.wallpapers.len() {
             let needs = self.wallpapers[i]
                 .shader
@@ -1132,7 +1167,7 @@ impl OutputHandler for App {
         // which only runs once main's setup roundtrips are done.
         self.add_output(qh, output);
         // A new output grows the cluster box; existing static shaders retile.
-        self.relayout_static_shaders(qh);
+        self.redraw_static_shaders(qh);
     }
 
     fn update_output(
@@ -1163,7 +1198,7 @@ impl OutputHandler for App {
         }
         // A move/resize of any output shifts the cluster box; retile static
         // shaders globally (animated ones pick it up on their next frame).
-        self.relayout_static_shaders(qh);
+        self.redraw_static_shaders(qh);
     }
 
     fn output_destroyed(
@@ -1175,7 +1210,7 @@ impl OutputHandler for App {
         self.remove_output(&output);
         // Losing an output shrinks the cluster box; existing static shaders
         // retile around the smaller workspace.
-        self.relayout_static_shaders(qh);
+        self.redraw_static_shaders(qh);
     }
 }
 

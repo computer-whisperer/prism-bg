@@ -6,7 +6,19 @@
 #version 450
 layout(location = 0) in vec2 fragCoord;
 layout(location = 0) out vec4 outColor;
-layout(push_constant) uniform Push { vec2 iResolution; float iTime; float _pad; } pc;
+layout(push_constant) uniform Push {
+    vec2 iResolution;
+    float iTime;
+    float _pad;
+    vec2 iOutputOffset;
+    vec2 iOutputSize;
+    vec2 iGlobalResolution;
+    float iRefWhite;  // cd/m²: output value 1.0 = diffuse white
+    float iMaxLum;    // cd/m²: peak to master against
+} pc;
+
+// Highlight headroom above diffuse white (>= 1.0; 1.0 on SDR).
+float headroom() { return max(pc.iMaxLum / max(pc.iRefWhite, 1.0), 1.0); }
 
 float hash21(vec2 p) {
     p = fract(p * vec2(123.34, 345.45));
@@ -54,7 +66,7 @@ void main() {
     col = mix(col, c, smoothstep(0.55, 0.95, f) * length(r));
 
     // Lift the brightest folds a touch into HDR for a soft glow.
-    col += vec3(0.15) * smoothstep(0.8, 1.1, f + length(q));
+    col += vec3(0.15) * smoothstep(0.8, 1.1, f + length(q)) * headroom();
 
-    outColor = vec4(col, 1.0);
+    outColor = vec4(min(col, vec3(headroom())), 1.0);
 }

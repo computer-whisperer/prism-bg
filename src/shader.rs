@@ -355,6 +355,10 @@ impl ShaderSurface {
         logical: (u32, u32),
         tiling: Tiling,
         audio: &AudioUniforms,
+        // This output's `(reference_white, peak)` luminance in cd/m² — the
+        // shader's `iRefWhite`/`iMaxLum`. `1.0` maps to `reference_white`;
+        // highlight headroom is `peak / reference_white`.
+        lum: (f32, f32),
         color: Option<&ColorState>,
         intent: Intent,
     ) -> Result<bool> {
@@ -444,6 +448,8 @@ impl ShaderSurface {
             output_offset: tiling.offset,
             output_size: tiling.output_size,
             global_resolution: tiling.global,
+            ref_white: lum.0,
+            max_lum: lum.1,
         };
         let rt = &st.ring[idx];
         st.renderer
