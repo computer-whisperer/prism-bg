@@ -559,9 +559,11 @@ impl App {
 
         let color = self.color.as_ref();
         let dmabuf = self.dmabuf.as_ref();
+        // Blur-dissolve on rotation when --fade is set; a hard cut otherwise.
+        let fade = self.wallpapers[i].spec.fade;
         let wp = &mut self.wallpapers[i];
         match wp.shader.as_mut() {
-            Some(s) => s.set_source(qh, graph, vec![texture], &encoding, color),
+            Some(s) => s.set_source(qh, graph, vec![texture], &encoding, color, fade),
             None => {
                 let mut s = ShaderSurface::from_image(qh, graph, vec![texture], &encoding, color);
                 if let Some(dmabuf) = dmabuf {
@@ -848,7 +850,7 @@ impl CompositorHandler for App {
                 && self.wallpapers[i]
                     .shader
                     .as_ref()
-                    .is_some_and(|s| s.animated());
+                    .is_some_and(|s| s.needs_redraw());
             if animate {
                 self.draw(qh, i);
             }

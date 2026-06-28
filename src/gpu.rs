@@ -625,6 +625,47 @@ impl Drop for RenderTarget {
     }
 }
 
+/// The present render pass writing the exported dmabuf, shared by
+/// [`ShaderRenderer`] and [`Transition`]. initialLayout UNDEFINED every frame
+/// (we redraw the whole surface, so prior contents are discarded — no
+/// acquire-from-FOREIGN needed); finalLayout GENERAL, with an explicit
+/// queue-family release barrier afterward (→ FOREIGN) handing the buffer to the
+/// compositor.
+fn create_present_render_pass(device: &ash::Device) -> Result<vk::RenderPass> {
+    let attachment = vk::AttachmentDescription::default()
+        .format(RENDER_FORMAT)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::GENERAL);
+    let attachments = [attachment];
+    let color_ref = vk::AttachmentReference::default()
+        .attachment(0)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    let color_refs = [color_ref];
+    let subpass = vk::SubpassDescription::default()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(&color_refs);
+    let subpasses = [subpass];
+    let dependency = vk::SubpassDependency::default()
+        .src_subpass(vk::SUBPASS_EXTERNAL)
+        .dst_subpass(0)
+        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+    let dependencies = [dependency];
+    let info = vk::RenderPassCreateInfo::default()
+        .attachments(&attachments)
+        .subpasses(&subpasses)
+        .dependencies(&dependencies);
+    // SAFETY: info outlives the call.
+    unsafe { device.create_render_pass(&info, None) }.context("creating render pass")
+}
+
 /// Create one internal F16 buffer texture (optimal tiling, color-attachment +
 /// sampled, device-local) and its view. Unlike [`RenderTarget`] it isn't a
 /// dmabuf — it's sampled and rendered entirely within our queue. The caller
@@ -1599,6 +1640,28 @@ struct Graph {
     size: (u32, u32),
 }
 
+/// Where a render writes its final image pass: the exported dmabuf (presented
+/// to the compositor) or an offscreen `SHADER_READ_ONLY` texture (sampled by a
+/// transition's blend pass). Copy — holds only a reference plus Vulkan handles.
+#[derive(Clone, Copy)]
+pub enum RenderDest<'a> {
+    /// Present into the exported dmabuf: queue-family release to the compositor
+    /// + sync_file write fence (or a CPU wait if the driver can't export one).
+    Present {
+        target: &'a RenderTarget,
+        framebuffer: vk::Framebuffer,
+    },
+    /// Render into an offscreen color texture left in `SHADER_READ_ONLY` for a
+    /// downstream sampler. `render_pass`/`framebuffer` are the caller's (the
+    /// transition's), sized `extent`. Signals this slot's frame semaphore; no
+    /// dmabuf release, no sync_file, no CPU wait.
+    Offscreen {
+        render_pass: vk::RenderPass,
+        framebuffer: vk::Framebuffer,
+        extent: vk::Extent2D,
+    },
+}
+
 /// The render graph + per-slot command resources for one shader. The image
 /// pass renders a fullscreen triangle into an fp16 [`RenderTarget`] (dmabuf);
 /// any buffer passes render into offscreen ping-pong textures first.
@@ -1669,42 +1732,7 @@ impl ShaderRenderer {
     }
 
     fn create_render_pass(device: &ash::Device) -> Result<vk::RenderPass> {
-        // initialLayout UNDEFINED every frame: we redraw the whole surface,
-        // so prior contents are discarded — no acquire-from-FOREIGN needed.
-        // finalLayout GENERAL: the explicit queue-family release barrier
-        // afterward (→ FOREIGN) hands the buffer to the compositor.
-        let attachment = vk::AttachmentDescription::default()
-            .format(RENDER_FORMAT)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::GENERAL);
-        let attachments = [attachment];
-        let color_ref = vk::AttachmentReference::default()
-            .attachment(0)
-            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-        let color_refs = [color_ref];
-        let subpass = vk::SubpassDescription::default()
-            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-            .color_attachments(&color_refs);
-        let subpasses = [subpass];
-        let dependency = vk::SubpassDependency::default()
-            .src_subpass(vk::SUBPASS_EXTERNAL)
-            .dst_subpass(0)
-            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
-        let dependencies = [dependency];
-        let info = vk::RenderPassCreateInfo::default()
-            .attachments(&attachments)
-            .subpasses(&subpasses)
-            .dependencies(&dependencies);
-        // SAFETY: info outlives the call.
-        unsafe { device.create_render_pass(&info, None) }.context("creating render pass")
+        create_present_render_pass(device)
     }
 
     fn build(
@@ -2555,7 +2583,7 @@ impl ShaderRenderer {
         unsafe { self.device.create_framebuffer(&info, None) }.context("creating framebuffer")
     }
 
-    /// Render one frame into ring slot `slot`'s `target` via `framebuffer`.
+    /// Render one frame of the graph into the present dmabuf `target`.
     ///
     /// On the fast path (`sync_file`) the GPU work is submitted and its
     /// completion semaphore is exported as a sync_file and attached to the
@@ -2571,6 +2599,81 @@ impl ShaderRenderer {
         uniforms: &ShaderUniforms,
         audio: &AudioUniforms,
     ) -> Result<()> {
+        self.render_to(
+            slot,
+            RenderDest::Present {
+                target,
+                framebuffer,
+            },
+            uniforms,
+            audio,
+        )
+    }
+
+    /// Render one frame of the graph into an offscreen `SHADER_READ_ONLY` color
+    /// texture (`render_pass`/`framebuffer`, sized `extent`) instead of the
+    /// dmabuf — used during a transition, where the blend pass samples the
+    /// result. Signals this slot's frame semaphore (see [`Self::frame_semaphore`])
+    /// for the downstream sampler to wait on; no queue-family release, no
+    /// sync_file, no CPU wait (returns as soon as the work is submitted).
+    pub fn render_offscreen(
+        &self,
+        slot: usize,
+        render_pass: vk::RenderPass,
+        framebuffer: vk::Framebuffer,
+        extent: vk::Extent2D,
+        uniforms: &ShaderUniforms,
+        audio: &AudioUniforms,
+    ) -> Result<()> {
+        self.render_to(
+            slot,
+            RenderDest::Offscreen {
+                render_pass,
+                framebuffer,
+                extent,
+            },
+            uniforms,
+            audio,
+        )
+    }
+
+    /// This slot's render-completion binary semaphore. In offscreen mode
+    /// [`Self::render_offscreen`] signals it for the blend pass to wait on; in
+    /// present mode it's exported as the dmabuf sync_file instead.
+    pub fn frame_semaphore(&self, slot: usize) -> vk::Semaphore {
+        self.frames[slot].semaphore
+    }
+
+    /// Shared core of [`Self::render`]/[`Self::render_offscreen`]: record the
+    /// buffer passes into their ping-pong targets, then the image pass into
+    /// `dest`, and submit. The present path releases the dmabuf to the
+    /// compositor (queue-family transfer + sync_file fence); the offscreen path
+    /// leaves the result in `SHADER_READ_ONLY` and signals a semaphore.
+    fn render_to(
+        &self,
+        slot: usize,
+        dest: RenderDest,
+        uniforms: &ShaderUniforms,
+        audio: &AudioUniforms,
+    ) -> Result<()> {
+        let (extent, image_rp, image_fb) = match dest {
+            RenderDest::Present {
+                target,
+                framebuffer,
+            } => (
+                vk::Extent2D {
+                    width: target.width,
+                    height: target.height,
+                },
+                self.render_pass,
+                framebuffer,
+            ),
+            RenderDest::Offscreen {
+                render_pass,
+                framebuffer,
+                extent,
+            } => (extent, render_pass, framebuffer),
+        };
         let device = &self.device;
         let frame = &self.frames[slot];
         let cb = frame.command_buffer;
@@ -2609,16 +2712,13 @@ impl ShaderRenderer {
             let clears = [clear];
             let area = vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D {
-                    width: target.width,
-                    height: target.height,
-                },
+                extent,
             };
             let viewport = vk::Viewport {
                 x: 0.0,
                 y: 0.0,
-                width: target.width as f32,
-                height: target.height as f32,
+                width: extent.width as f32,
+                height: extent.height as f32,
                 min_depth: 0.0,
                 max_depth: 1.0,
             };
@@ -2661,11 +2761,11 @@ impl ShaderRenderer {
             // Offscreen framebuffers are sized to graph.size; the caller resizes
             // the ring and the buffers together, so this must match the target.
             debug_assert!(
-                self.graph.buffers.is_empty() || self.graph.size == (target.width, target.height),
+                self.graph.buffers.is_empty() || self.graph.size == (extent.width, extent.height),
                 "buffer size {:?} != target {}x{}",
                 self.graph.size,
-                target.width,
-                target.height
+                extent.width,
+                extent.height
             );
             for (i, pass) in self.graph.buffers.iter().enumerate() {
                 let pp = pass.target.as_ref().expect("buffer pass has a target");
@@ -2695,8 +2795,8 @@ impl ShaderRenderer {
                 self.graph.buffers.len(),
             )?;
             let rp = vk::RenderPassBeginInfo::default()
-                .render_pass(self.render_pass)
-                .framebuffer(framebuffer)
+                .render_pass(image_rp)
+                .framebuffer(image_fb)
                 .render_area(area)
                 .clear_values(&clears);
             device.cmd_begin_render_pass(cb, &rp, vk::SubpassContents::INLINE);
@@ -2711,45 +2811,59 @@ impl ShaderRenderer {
                 }
             }
 
-            // Release ownership to the compositor's (foreign) queue. For the
-            // DCC modifier this also lets the driver flush compression
-            // metadata so the compositor reads correct pixels.
-            let barrier = vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                .dst_access_mask(vk::AccessFlags::empty())
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_queue_family_index(self.queue_family)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-                .image(target.image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                });
-            device.cmd_pipeline_barrier(
-                cb,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
+            // Present only: release ownership to the compositor's (foreign)
+            // queue. For the DCC modifier this also lets the driver flush
+            // compression metadata so the compositor reads correct pixels. The
+            // offscreen path keeps the texture on our queue (the render pass
+            // leaves it in SHADER_READ_ONLY for the blend sampler).
+            if let RenderDest::Present { target, .. } = dest {
+                let barrier = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .dst_access_mask(vk::AccessFlags::empty())
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(self.queue_family)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                    .image(target.image)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+            }
             device.end_command_buffer(cb).context("end cb")?;
 
             let cbs = [cb];
             let signal = [frame.semaphore];
+            // Offscreen always signals (the blend pass waits on it); present
+            // signals only to export as the dmabuf sync_file.
+            let signal_sem = matches!(dest, RenderDest::Offscreen { .. }) || self.sync_file;
             let mut submit = vk::SubmitInfo::default().command_buffers(&cbs);
-            if self.sync_file {
+            if signal_sem {
                 submit = submit.signal_semaphores(&signal);
             }
             device
                 .queue_submit(self.queue, &[submit], frame.fence)
                 .context("submitting render")?;
         }
+
+        let target = match dest {
+            // Offscreen: the blend pass waits on frame.semaphore; this slot's
+            // fence gates its next reuse. Nothing to attach, no CPU wait.
+            RenderDest::Offscreen { .. } => return Ok(()),
+            RenderDest::Present { target, .. } => target,
+        };
 
         if !self.sync_file {
             // No exportable sync_file: block until the GPU is done so the
@@ -2851,6 +2965,753 @@ impl Drop for ShaderRenderer {
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             self.graph.destroy(&self.device);
             self.device.destroy_render_pass(self.render_pass, None);
+        }
+    }
+}
+
+/// Cross-blur-dissolve fragment shader: defocus-blur each source by a
+/// progress-driven radius (the outgoing sharpens→blurs as it leaves, the
+/// incoming blurs→sharpens as it arrives) and cross-dissolve. Both inputs are
+/// opaque, full-surface, working-space (extended-linear, sRGB-primaries) — so
+/// the blur and mix happen in linear light, which is physically correct. The
+/// 9×9 Gaussian collapses to identity as the radius → 0 (every tap lands on the
+/// center), so the ends of the transition are pixel-exact.
+const BLEND_FRAGMENT_GLSL: &str = r#"#version 450
+layout(location = 0) in vec2 uv;
+layout(location = 0) out vec4 outColor;
+layout(set = 0, binding = 0) uniform sampler2D texOut;
+layout(set = 0, binding = 1) uniform sampler2D texIn;
+layout(push_constant) uniform Push {
+    vec2 iResolution;
+    float progress;
+    float maxRadius;
+} pc;
+
+vec3 blur(sampler2D tex, vec2 p, float radiusPx) {
+    vec2 texel = 1.0 / pc.iResolution;
+    const int K = 4;
+    const float s = float(K) * 0.5;
+    vec3 acc = vec3(0.0);
+    float wsum = 0.0;
+    for (int y = -K; y <= K; ++y) {
+        for (int x = -K; x <= K; ++x) {
+            float w = exp(-float(x * x + y * y) / (2.0 * s * s));
+            vec2 o = vec2(float(x), float(y)) * (radiusPx / float(K)) * texel;
+            acc += w * texture(tex, p + o).rgb;
+            wsum += w;
+        }
+    }
+    return acc / wsum;
+}
+
+void main() {
+    float pr = clamp(pc.progress, 0.0, 1.0);
+    vec3 a = blur(texOut, uv, pc.maxRadius * pr);
+    vec3 b = blur(texIn, uv, pc.maxRadius * (1.0 - pr));
+    float t = smoothstep(0.0, 1.0, pr);
+    outColor = vec4(mix(a, b, t), 1.0);
+}
+"#;
+
+/// Blend-pass push constants: surface size (for texel size), dissolve progress
+/// `0..1`, and the peak blur radius in pixels. 16 bytes, std430-aligned.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct BlendPush {
+    resolution: [f32; 2],
+    progress: f32,
+    max_radius: f32,
+}
+
+/// Per-ring-slot command resources for the blend pass: a command buffer, its
+/// completion fence, and the semaphore exported as the dmabuf sync_file.
+struct BlendFrame {
+    command_buffer: vk::CommandBuffer,
+    fence: vk::Fence,
+    semaphore: vk::Semaphore,
+}
+
+/// GPU resources for a cross-blur-dissolve transition between two sources. The
+/// outgoing and incoming source each render (via
+/// [`ShaderRenderer::render_offscreen`]) into one of two surface-sized
+/// offscreen targets; [`Transition::blend`] then samples both, defocus-blurs
+/// each by a progress-driven radius, cross-dissolves, and writes the dmabuf.
+///
+/// The two targets are single (not ring-deep): a transition source render only
+/// has to outlive the same frame's blend, and the source render pass's WAR
+/// dependency orders the next frame's overwrite after this frame's blend read.
+pub struct Transition {
+    device: ash::Device,
+    queue: vk::Queue,
+    queue_family: u32,
+    /// Present render pass writing the dmabuf (shared shape with [`ShaderRenderer`]).
+    present_pass: vk::RenderPass,
+    /// CLEAR → SHADER_READ render pass for the two source targets.
+    source_pass: vk::RenderPass,
+    /// Clamp/linear sampler for the two source reads.
+    sampler: vk::Sampler,
+    /// `[outgoing, incoming]` source targets; rebuilt on resize.
+    targets: Option<[BufferImage; 2]>,
+    /// Framebuffers binding each target to `source_pass`; `null` until built.
+    framebuffers: [vk::Framebuffer; 2],
+    size: (u32, u32),
+    set_layout: vk::DescriptorSetLayout,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    descriptor_pool: vk::DescriptorPool,
+    /// One set pointing at `[outgoing, incoming]`, shared by every slot's blend
+    /// command buffer (read-only; re-pointed only on resize).
+    descriptor_set: vk::DescriptorSet,
+    frames: Vec<BlendFrame>,
+    external_semaphore_fd_fn: ash::khr::external_semaphore_fd::Device,
+    sync_file: bool,
+}
+
+impl Transition {
+    /// Build the size-independent blend resources (render passes, sampler,
+    /// pipeline, descriptor set, per-slot command resources). The two source
+    /// targets are allocated on the first [`Self::resize`]. `frames` is the ring
+    /// depth (one blend command buffer per slot).
+    pub fn new(gpu: &Gpu, frames: usize) -> Result<Transition> {
+        let device = gpu.device.clone();
+        let present_pass = create_present_render_pass(&device)?;
+        match Self::build(gpu, device.clone(), present_pass, frames) {
+            Ok(t) => Ok(t),
+            Err(e) => {
+                // SAFETY: present_pass created just above, nothing else owns it.
+                unsafe { device.destroy_render_pass(present_pass, None) };
+                Err(e)
+            }
+        }
+    }
+
+    fn build(
+        gpu: &Gpu,
+        device: ash::Device,
+        present_pass: vk::RenderPass,
+        frames: usize,
+    ) -> Result<Transition> {
+        // Source render pass: fully cleared each frame, left in SHADER_READ for
+        // the blend; WAR orders the overwrite after the prior frame's blend
+        // read, RAW makes this write visible to the blend sample.
+        let source_pass = {
+            let attachment = vk::AttachmentDescription::default()
+                .format(RENDER_FORMAT)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            let attachments = [attachment];
+            let color_ref = vk::AttachmentReference::default()
+                .attachment(0)
+                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+            let color_refs = [color_ref];
+            let subpass = vk::SubpassDescription::default()
+                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                .color_attachments(&color_refs);
+            let subpasses = [subpass];
+            let deps = [
+                vk::SubpassDependency::default()
+                    .src_subpass(vk::SUBPASS_EXTERNAL)
+                    .dst_subpass(0)
+                    .src_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+                    .src_access_mask(vk::AccessFlags::SHADER_READ)
+                    .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+                vk::SubpassDependency::default()
+                    .src_subpass(0)
+                    .dst_subpass(vk::SUBPASS_EXTERNAL)
+                    .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ),
+            ];
+            let info = vk::RenderPassCreateInfo::default()
+                .attachments(&attachments)
+                .subpasses(&subpasses)
+                .dependencies(&deps);
+            // SAFETY: info outlives the call.
+            unsafe { device.create_render_pass(&info, None) }.context("creating source pass")?
+        };
+
+        // From here every fallible step tears down what precedes it.
+        let cleanup_passes = |device: &ash::Device| unsafe {
+            device.destroy_render_pass(source_pass, None);
+        };
+
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        // SAFETY: sampler_info outlives the call.
+        let sampler = match unsafe { device.create_sampler(&sampler_info, None) } {
+            Ok(s) => s,
+            Err(e) => {
+                cleanup_passes(&device);
+                return Err(e).context("creating blend sampler");
+            }
+        };
+
+        // Descriptor set layout: two combined image samplers (set 0).
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let set_layout = match unsafe {
+            device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )
+        } {
+            Ok(l) => l,
+            Err(e) => {
+                unsafe { device.destroy_sampler(sampler, None) };
+                cleanup_passes(&device);
+                return Err(e).context("creating blend set layout");
+            }
+        };
+        let cleanup_layout = |device: &ash::Device| unsafe {
+            device.destroy_descriptor_set_layout(set_layout, None);
+            device.destroy_sampler(sampler, None);
+            device.destroy_render_pass(source_pass, None);
+        };
+
+        // Pipeline layout: one sampler set + a fragment-only push range.
+        let push_range = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(std::mem::size_of::<BlendPush>() as u32);
+        let push_ranges = [push_range];
+        let set_layouts = [set_layout];
+        let pipeline_layout = match unsafe {
+            device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&set_layouts)
+                    .push_constant_ranges(&push_ranges),
+                None,
+            )
+        } {
+            Ok(l) => l,
+            Err(e) => {
+                cleanup_layout(&device);
+                return Err(e).context("creating blend pipeline layout");
+            }
+        };
+        let cleanup_pipeline_layout = |device: &ash::Device| unsafe {
+            device.destroy_pipeline_layout(pipeline_layout, None);
+            cleanup_layout(device);
+        };
+
+        // Pipeline: fullscreen blit VS (1:1 uv) + the cross-blur dissolve FS.
+        let pipeline = {
+            let vert = compile_glsl(BLIT_VERTEX_GLSL, shaderc::ShaderKind::Vertex, "blend.vert");
+            let frag = compile_glsl(
+                BLEND_FRAGMENT_GLSL,
+                shaderc::ShaderKind::Fragment,
+                "blend.frag",
+            );
+            let (vert, frag) = match (vert, frag) {
+                (Ok(v), Ok(f)) => (v, f),
+                (Err(e), _) | (_, Err(e)) => {
+                    cleanup_pipeline_layout(&device);
+                    return Err(e);
+                }
+            };
+            // SAFETY: SPIR-V slices live across module creation.
+            let vmod = unsafe {
+                device
+                    .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert), None)
+            };
+            let fmod = unsafe {
+                device
+                    .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&frag), None)
+            };
+            let (vmod, fmod) = match (vmod, fmod) {
+                (Ok(v), Ok(f)) => (v, f),
+                (v, f) => {
+                    // SAFETY: destroy whichever module was created.
+                    unsafe {
+                        if let Ok(m) = v {
+                            device.destroy_shader_module(m, None);
+                        }
+                        if let Ok(m) = f {
+                            device.destroy_shader_module(m, None);
+                        }
+                    }
+                    cleanup_pipeline_layout(&device);
+                    return Err(anyhow::anyhow!("creating blend shader module"));
+                }
+            };
+            let result =
+                ShaderRenderer::create_pipeline(&device, present_pass, pipeline_layout, vmod, fmod);
+            // SAFETY: modules consumed by pipeline creation.
+            unsafe {
+                device.destroy_shader_module(vmod, None);
+                device.destroy_shader_module(fmod, None);
+            }
+            match result {
+                Ok(p) => p,
+                Err(e) => {
+                    cleanup_pipeline_layout(&device);
+                    return Err(e);
+                }
+            }
+        };
+        let cleanup_pipeline = |device: &ash::Device| unsafe {
+            device.destroy_pipeline(pipeline, None);
+            cleanup_pipeline_layout(device);
+        };
+
+        // Descriptor pool + the single shared set (re-pointed on resize).
+        let pool_size = vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(2);
+        let pool_sizes = [pool_size];
+        let descriptor_pool = match unsafe {
+            device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1)
+                    .pool_sizes(&pool_sizes),
+                None,
+            )
+        } {
+            Ok(p) => p,
+            Err(e) => {
+                cleanup_pipeline(&device);
+                return Err(e).context("creating blend descriptor pool");
+            }
+        };
+        let set_layouts = [set_layout];
+        let descriptor_set = match unsafe {
+            device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&set_layouts),
+            )
+        } {
+            Ok(s) => s[0],
+            Err(e) => {
+                unsafe { device.destroy_descriptor_pool(descriptor_pool, None) };
+                cleanup_pipeline(&device);
+                return Err(e).context("allocating blend descriptor set");
+            }
+        };
+        let cleanup_pool = |device: &ash::Device| unsafe {
+            device.destroy_descriptor_pool(descriptor_pool, None);
+            cleanup_pipeline(device);
+        };
+
+        // Per-slot command buffers, fences, and export semaphores.
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(gpu.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(frames as u32);
+        // SAFETY: alloc references gpu.command_pool, valid for this device.
+        let command_buffers = match unsafe { device.allocate_command_buffers(&alloc) } {
+            Ok(c) => c,
+            Err(e) => {
+                cleanup_pool(&device);
+                return Err(e).context("allocating blend command buffers");
+            }
+        };
+        let mut blend_frames: Vec<BlendFrame> = Vec::with_capacity(frames);
+        for &command_buffer in &command_buffers {
+            // Pre-signaled fence: blend() waits before reusing the slot.
+            let fence = unsafe {
+                device.create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )
+            };
+            let mut export = vk::ExportSemaphoreCreateInfo::default().handle_types(
+                if ShaderRenderer::sync_file_exportable(gpu) {
+                    vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD
+                } else {
+                    vk::ExternalSemaphoreHandleTypeFlags::empty()
+                },
+            );
+            let semaphore = unsafe {
+                device.create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut export),
+                    None,
+                )
+            };
+            match (fence, semaphore) {
+                (Ok(fence), Ok(semaphore)) => blend_frames.push(BlendFrame {
+                    command_buffer,
+                    fence,
+                    semaphore,
+                }),
+                (f, s) => {
+                    // SAFETY: free whichever of this pair succeeded, plus the
+                    // already-built frames and the pool/pipeline chain.
+                    unsafe {
+                        if let Ok(fence) = f {
+                            device.destroy_fence(fence, None);
+                        }
+                        if let Ok(semaphore) = s {
+                            device.destroy_semaphore(semaphore, None);
+                        }
+                        for bf in &blend_frames {
+                            device.destroy_fence(bf.fence, None);
+                            device.destroy_semaphore(bf.semaphore, None);
+                        }
+                    }
+                    cleanup_pool(&device);
+                    return Err(anyhow::anyhow!("creating blend frame sync objects"));
+                }
+            }
+        }
+
+        Ok(Transition {
+            device,
+            queue: gpu.queue,
+            queue_family: gpu.queue_family,
+            present_pass,
+            source_pass,
+            sampler,
+            targets: None,
+            framebuffers: [vk::Framebuffer::null(); 2],
+            size: (0, 0),
+            set_layout,
+            pipeline_layout,
+            pipeline,
+            descriptor_pool,
+            descriptor_set,
+            frames: blend_frames,
+            external_semaphore_fd_fn: gpu.external_semaphore_fd_fn.clone(),
+            sync_file: ShaderRenderer::sync_file_exportable(gpu),
+        })
+    }
+
+    /// (Re)allocate the two source targets at `w`×`h` and re-point the blend
+    /// descriptor set at them. No-op if already built at this size.
+    pub fn resize(&mut self, gpu: &Gpu, w: u32, h: u32) -> Result<()> {
+        if self.targets.is_some() && self.size == (w, h) {
+            return Ok(());
+        }
+        let device = self.device.clone();
+        // SAFETY: drain in-flight blends before freeing the old targets.
+        unsafe {
+            let _ = device.device_wait_idle();
+            for fb in self.framebuffers {
+                if fb != vk::Framebuffer::null() {
+                    device.destroy_framebuffer(fb, None);
+                }
+            }
+            self.framebuffers = [vk::Framebuffer::null(); 2];
+            if let Some(targets) = self.targets.take() {
+                for t in &targets {
+                    t.destroy(&device);
+                }
+            }
+        }
+
+        let make = |i: usize| -> Result<(BufferImage, vk::Framebuffer)> {
+            let img = create_buffer_image(gpu, &device, w, h)
+                .with_context(|| format!("creating transition target {i}"))?;
+            let attachments = [img.view];
+            let fb = unsafe {
+                device.create_framebuffer(
+                    &vk::FramebufferCreateInfo::default()
+                        .render_pass(self.source_pass)
+                        .attachments(&attachments)
+                        .width(w)
+                        .height(h)
+                        .layers(1),
+                    None,
+                )
+            };
+            match fb {
+                Ok(fb) => Ok((img, fb)),
+                Err(e) => {
+                    // SAFETY: img just created; nothing else references it.
+                    unsafe { img.destroy(&device) };
+                    Err(e).with_context(|| format!("creating transition framebuffer {i}"))
+                }
+            }
+        };
+        let (img0, fb0) = make(0)?;
+        let (img1, fb1) = match make(1) {
+            Ok(v) => v,
+            Err(e) => {
+                // SAFETY: target 0 succeeded; unwind it.
+                unsafe {
+                    device.destroy_framebuffer(fb0, None);
+                    img0.destroy(&device);
+                }
+                return Err(e);
+            }
+        };
+
+        // Point the shared set at [outgoing, incoming].
+        let infos = [
+            vk::DescriptorImageInfo::default()
+                .sampler(self.sampler)
+                .image_view(img0.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            vk::DescriptorImageInfo::default()
+                .sampler(self.sampler)
+                .image_view(img1.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+        ];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&infos[0..1]),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&infos[1..2]),
+        ];
+        // SAFETY: writes/infos outlive the call; the set isn't in use (drained).
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
+
+        self.targets = Some([img0, img1]);
+        self.framebuffers = [fb0, fb1];
+        self.size = (w, h);
+        Ok(())
+    }
+
+    /// Render source `idx` (`0` = outgoing, `1` = incoming) into its target via
+    /// `renderer`. The caller must have [`Self::resize`]d this transition and
+    /// `renderer.resize`d the source to the same size first.
+    pub fn render_source(
+        &self,
+        idx: usize,
+        renderer: &ShaderRenderer,
+        slot: usize,
+        uniforms: &ShaderUniforms,
+        audio: &AudioUniforms,
+    ) -> Result<()> {
+        let extent = vk::Extent2D {
+            width: self.size.0,
+            height: self.size.1,
+        };
+        renderer.render_offscreen(
+            slot,
+            self.source_pass,
+            self.framebuffers[idx],
+            extent,
+            uniforms,
+            audio,
+        )
+    }
+
+    /// Composite the two rendered source targets into the dmabuf `target` for
+    /// dissolve `progress` (`0` = fully outgoing, `1` = fully incoming). Waits on
+    /// the two source renders' semaphores (`out_sem`/`in_sem` from
+    /// [`ShaderRenderer::frame_semaphore`]), then presents like
+    /// [`ShaderRenderer::render`] (queue-family release + sync_file fence).
+    pub fn blend(
+        &self,
+        slot: usize,
+        target: &RenderTarget,
+        framebuffer: vk::Framebuffer,
+        progress: f32,
+        out_sem: vk::Semaphore,
+        in_sem: vk::Semaphore,
+    ) -> Result<()> {
+        let device = &self.device;
+        let frame = &self.frames[slot];
+        let cb = frame.command_buffer;
+        let extent = vk::Extent2D {
+            width: target.width,
+            height: target.height,
+        };
+        let push = BlendPush {
+            resolution: [target.width as f32, target.height as f32],
+            progress,
+            // Peak defocus radius: 4% of the surface height.
+            max_radius: 0.04 * target.height as f32,
+        };
+        // SAFETY: all handles are this transition's; the slot's prior blend is
+        // awaited via its fence before reuse.
+        unsafe {
+            device
+                .wait_for_fences(&[frame.fence], true, u64::MAX)
+                .context("waiting on prior blend fence")?;
+            device
+                .reset_fences(&[frame.fence])
+                .context("resetting blend fence")?;
+            device
+                .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
+                .context("resetting blend cb")?;
+            device
+                .begin_command_buffer(
+                    cb,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .context("begin blend cb")?;
+
+            let clears = [vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 1.0],
+                },
+            }];
+            let area = vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent,
+            };
+            let viewport = vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: extent.width as f32,
+                height: extent.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            let rp = vk::RenderPassBeginInfo::default()
+                .render_pass(self.present_pass)
+                .framebuffer(framebuffer)
+                .render_area(area)
+                .clear_values(&clears);
+            device.cmd_begin_render_pass(cb, &rp, vk::SubpassContents::INLINE);
+            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout,
+                0,
+                &[self.descriptor_set],
+                &[],
+            );
+            device.cmd_set_viewport(cb, 0, &[viewport]);
+            device.cmd_set_scissor(cb, 0, &[area]);
+            device.cmd_push_constants(
+                cb,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                bytemuck::bytes_of(&push),
+            );
+            device.cmd_draw(cb, 3, 1, 0, 0);
+            device.cmd_end_render_pass(cb);
+
+            // Release the dmabuf to the compositor's (foreign) queue.
+            let barrier = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::empty())
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(self.queue_family)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .image(target.image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+            device.end_command_buffer(cb).context("end blend cb")?;
+
+            // Wait on both source renders (their offscreen writes → our sample).
+            let wait_sems = [out_sem, in_sem];
+            let wait_stages = [
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+            ];
+            let cbs = [cb];
+            let signal = [frame.semaphore];
+            let mut submit = vk::SubmitInfo::default()
+                .wait_semaphores(&wait_sems)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&cbs);
+            if self.sync_file {
+                submit = submit.signal_semaphores(&signal);
+            }
+            device
+                .queue_submit(self.queue, &[submit], frame.fence)
+                .context("submitting blend")?;
+        }
+
+        if !self.sync_file {
+            // SAFETY: the fence was just submitted with this blend's work.
+            unsafe { device.wait_for_fences(&[frame.fence], true, u64::MAX) }
+                .context("waiting on blend fence")?;
+            return Ok(());
+        }
+        // Attach the completion semaphore to the dmabuf as its write fence.
+        let info = vk::SemaphoreGetFdInfoKHR::default()
+            .semaphore(frame.semaphore)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        // SAFETY: semaphore is this transition's, created exportable.
+        let raw = unsafe { self.external_semaphore_fd_fn.get_semaphore_fd(&info) }
+            .context("exporting blend semaphore as sync_file")?;
+        if raw >= 0 {
+            // SAFETY: get_semaphore_fd transferred ownership of this FD to us.
+            let sync = unsafe { OwnedFd::from_raw_fd(raw) };
+            if let Err(e) = import_sync_file_to_dmabuf(target.fd.as_raw_fd(), sync) {
+                tracing::warn!("dmabuf sync_file import failed ({e:#}); blocking instead");
+                // SAFETY: this blend's fence was submitted above.
+                unsafe { device.wait_for_fences(&[frame.fence], true, u64::MAX) }
+                    .context("waiting on blend fence (import fallback)")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Transition {
+    fn drop(&mut self) {
+        // SAFETY: all handles are this transition's; drain in-flight blends
+        // before teardown. Command buffers are freed with the pool.
+        unsafe {
+            let fences: Vec<vk::Fence> = self.frames.iter().map(|f| f.fence).collect();
+            if !fences.is_empty() {
+                let _ = self.device.wait_for_fences(&fences, true, u64::MAX);
+            }
+            for f in &self.frames {
+                self.device.destroy_fence(f.fence, None);
+                self.device.destroy_semaphore(f.semaphore, None);
+            }
+            for fb in self.framebuffers {
+                if fb != vk::Framebuffer::null() {
+                    self.device.destroy_framebuffer(fb, None);
+                }
+            }
+            if let Some(targets) = &self.targets {
+                for t in targets {
+                    t.destroy(&self.device);
+                }
+            }
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.set_layout, None);
+            self.device.destroy_sampler(self.sampler, None);
+            self.device.destroy_render_pass(self.source_pass, None);
+            self.device.destroy_render_pass(self.present_pass, None);
         }
     }
 }
@@ -2996,6 +3857,20 @@ fn update_pass_channels(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The transition blend shaders compile (pure shaderc, no GPU) — guards the
+    /// hand-written GLSL against syntax/binding regressions in CI.
+    #[test]
+    fn blend_shaders_compile() {
+        compile_glsl(BLIT_VERTEX_GLSL, shaderc::ShaderKind::Vertex, "blend.vert")
+            .expect("blend vertex compiles");
+        compile_glsl(
+            BLEND_FRAGMENT_GLSL,
+            shaderc::ShaderKind::Fragment,
+            "blend.frag",
+        )
+        .expect("blend fragment compiles");
+    }
 
     /// Brings up Vulkan on the local machine. Ignored by default so CI
     /// (no GPU) is unaffected; run with `cargo test --ignored gpu_init`.

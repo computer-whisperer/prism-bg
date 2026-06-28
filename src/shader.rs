@@ -45,7 +45,7 @@ use crate::cli::Intent;
 use crate::color::{ColorEncoding, PrimaryVolume, Tf};
 use crate::colormgmt::{ColorState, DescriptionHandle, Status};
 use crate::gpu::{
-    AudioUniforms, Gpu, RenderTarget, ShaderRenderer, ShaderUniforms, TextureData,
+    AudioUniforms, Gpu, RenderTarget, ShaderRenderer, ShaderUniforms, TextureData, Transition,
     RENDER_DRM_FOURCC,
 };
 
@@ -182,6 +182,25 @@ struct RingTarget {
     available: Arc<AtomicBool>,
 }
 
+/// An in-progress cross-blur-dissolve between the previous source (`outgoing`)
+/// and the current one (`DeviceState::renderer`, the incoming). Each frame both
+/// render offscreen via `blend`, which composites them into the dmabuf by
+/// `progress`. Dropped once `progress` reaches 1 (the incoming becomes the sole
+/// source). The outgoing keeps its own animation clock so a departing animated
+/// shader continues from where it was rather than restarting.
+struct ActiveTransition {
+    outgoing: ShaderRenderer,
+    blend: Transition,
+    /// Wall-clock start of the dissolve, and its total duration.
+    started: Instant,
+    duration: Duration,
+    /// The outgoing source's independent `iTime`/`iTimeDelta`/`iFrame` state,
+    /// carried over from before the swap.
+    out_started: Option<Instant>,
+    out_last_time: Option<f32>,
+    out_frame_count: i32,
+}
+
 /// The device-specific half of a shader surface: the pipeline and target
 /// ring on one GPU. Rebuilt if the output moves to a different GPU.
 struct DeviceState {
@@ -194,6 +213,8 @@ struct DeviceState {
     ring: Vec<RingTarget>,
     /// Device-pixel size of the targets.
     size: (u32, u32),
+    /// Active blur-dissolve transition, if one is running.
+    transition: Option<ActiveTransition>,
 }
 
 impl Drop for DeviceState {
@@ -473,6 +494,14 @@ pub struct ShaderSurface {
     /// The graph/textures were swapped (playlist rotation): rebuild the
     /// renderer in place on the next render, keeping the dmabuf ring.
     source_dirty: bool,
+    /// When `Some`, the next source swap blur-dissolves over this duration
+    /// instead of cutting; consumed when the transition is built. Set by
+    /// [`Self::set_source`] with a fade.
+    pending_fade: Option<Duration>,
+    /// The outgoing source's animation clock `(started, last_time, frame_count)`,
+    /// snapshotted at the swap so a departing animated shader keeps advancing
+    /// through the dissolve. Paired with `pending_fade`.
+    outgoing_timing: Option<(Option<Instant>, Option<f32>, i32)>,
 }
 
 /// Build the compositor-side color description for `encoding`, or `None`
@@ -568,6 +597,8 @@ impl ShaderSurface {
             resolved: None,
             state: None,
             source_dirty: false,
+            pending_fade: None,
+            outgoing_timing: None,
         })
     }
 
@@ -605,13 +636,18 @@ impl ShaderSurface {
             resolved: None,
             state: None,
             source_dirty: false,
+            pending_fade: None,
+            outgoing_timing: None,
         }
     }
 
     /// Swap the displayed source in place (playlist rotation): replace the
     /// graph, textures, and color tag, keeping the surface, dmabuf ring, and
-    /// feedback resolution. The new source renders on the next draw; the old
-    /// frame stays presented until then, so the swap is flash-free.
+    /// feedback resolution. With `fade: None` the new source renders on the next
+    /// draw and the old frame stays presented until then (a flash-free hard
+    /// cut). With `fade: Some(d)` the swap instead blur-dissolves from the old
+    /// source to the new one over `d` (see [`ActiveTransition`]); the surface
+    /// keeps requesting frame callbacks until the dissolve completes.
     pub fn set_source(
         &mut self,
         qh: &QueueHandle<App>,
@@ -619,7 +655,14 @@ impl ShaderSurface {
         textures: Vec<TextureData>,
         encoding: &ColorEncoding,
         color: Option<&ColorState>,
+        fade: Option<Duration>,
     ) {
+        // Snapshot the outgoing source's clock before it's reset for the
+        // incoming, so a departing animated shader keeps advancing mid-dissolve.
+        if fade.is_some() {
+            self.outgoing_timing = Some((self.started, self.last_time, self.frame_count));
+            self.pending_fade = fade;
+        }
         self.spec = graph;
         self.textures = textures;
         self.source_dirty = true;
@@ -629,10 +672,18 @@ impl ShaderSurface {
         }
         self.description = make_description(qh, color, encoding);
         self.tagged = false;
-        // A fresh static image renders one frame from t = 0.
+        // The incoming source renders one frame from t = 0.
         self.started = None;
         self.last_time = None;
         self.frame_count = 0;
+    }
+
+    /// Whether the surface should keep requesting frame callbacks: an animated
+    /// shader, or an in-progress / about-to-start blur-dissolve transition.
+    pub fn needs_redraw(&self) -> bool {
+        self.animated
+            || self.pending_fade.is_some()
+            || self.state.as_ref().is_some_and(|s| s.transition.is_some())
     }
 
     pub fn animated(&self) -> bool {
@@ -767,17 +818,19 @@ impl ShaderSurface {
                 renderer: ShaderRenderer::new(gpu, &self.spec, &self.textures, RING)?,
                 ring: Vec::new(),
                 size: (0, 0),
+                transition: None,
             });
         }
-        // Source swapped (rotation): rebuild the renderer in place, keeping
-        // the dmabuf ring — only the framebuffers (tied to the new render
-        // pass) are recreated. The presented frame is untouched until the
-        // new source renders below. Skipped when there's no ring yet (the
-        // GPU-change branch above already built the new spec).
+        // Source swapped (rotation): build the incoming renderer and recreate
+        // the ring framebuffers against its render pass (the dmabuf ring itself
+        // is kept). With a pending fade the *old* renderer is retained as the
+        // outgoing half of a blur-dissolve (see [`ActiveTransition`]); otherwise
+        // it's dropped for a flash-free hard cut. Skipped when there's no ring
+        // yet (the GPU-change branch above already built the new spec).
         if self.source_dirty {
             if let Some(st) = self.state.as_mut() {
                 if !st.ring.is_empty() {
-                    let mut renderer = ShaderRenderer::new(gpu, &self.spec, &self.textures, RING)?;
+                    let mut incoming = ShaderRenderer::new(gpu, &self.spec, &self.textures, RING)?;
                     // SAFETY: drain in-flight work before swapping framebuffers.
                     unsafe {
                         let _ = st.device.device_wait_idle();
@@ -787,16 +840,46 @@ impl ShaderSurface {
                     }
                     let mut fbs = Vec::with_capacity(st.ring.len());
                     for t in &st.ring {
-                        fbs.push(renderer.create_framebuffer(&t.target)?);
+                        fbs.push(incoming.create_framebuffer(&t.target)?);
                     }
                     for (t, fb) in st.ring.iter_mut().zip(fbs) {
                         t.framebuffer = fb;
                     }
-                    renderer.resize(gpu, st.size.0, st.size.1)?; // no-op (image has no buffers)
-                    st.renderer = renderer; // old renderer dropped here
+                    incoming.resize(gpu, st.size.0, st.size.1)?;
+                    // Supersede any still-running transition: its incoming (the
+                    // current `st.renderer`) becomes this dissolve's outgoing.
+                    st.transition = None;
+                    match self.pending_fade.take() {
+                        Some(duration) => {
+                            let mut blend = Transition::new(gpu, RING)?;
+                            blend.resize(gpu, st.size.0, st.size.1)?;
+                            let (out_started, out_last_time, out_frame_count) =
+                                self.outgoing_timing.take().unwrap_or((None, None, 0));
+                            let outgoing = std::mem::replace(&mut st.renderer, incoming);
+                            st.transition = Some(ActiveTransition {
+                                outgoing,
+                                blend,
+                                started: Instant::now(),
+                                duration,
+                                out_started,
+                                out_last_time,
+                                out_frame_count,
+                            });
+                        }
+                        None => {
+                            self.outgoing_timing = None;
+                            st.renderer = incoming; // old renderer dropped here
+                        }
+                    }
                 }
             }
             self.source_dirty = false;
+            // If a fade was requested but no transition could start (no ring
+            // yet — the source changed before the first render), drop it so the
+            // fresh source just renders normally rather than leaving the surface
+            // perpetually "needs redraw".
+            self.pending_fade = None;
+            self.outgoing_timing = None;
         }
 
         // (Re)build the ring if the size changed.
@@ -805,6 +888,11 @@ impl ShaderSurface {
             st.ring.is_empty() || st.size != size
         };
         if need_ring {
+            // A resize mid-dissolve abandons it (the outgoing/blend targets are
+            // the old size): snap to the incoming, which build_ring resizes.
+            if let Some(st) = self.state.as_mut() {
+                st.transition = None;
+            }
             self.build_ring(gpu, dmabuf, qh, size, &candidates)?;
         }
 
@@ -847,11 +935,63 @@ impl ShaderSurface {
             time_delta,
             frame: self.frame_count,
         };
-        let rt = &st.ring[idx];
-        st.renderer
-            .render(idx, &rt.target, rt.framebuffer, &uniforms, audio)
-            .context("rendering shader frame")?;
-        // Advance the per-frame counters now the render is committed to.
+        // Disjoint borrows of the renderer, ring, and transition so a blend can
+        // sample the incoming renderer (`renderer`) while mutating the
+        // transition state.
+        let DeviceState {
+            renderer,
+            ring,
+            transition,
+            ..
+        } = st;
+        let rt = &ring[idx];
+        let mut transition_done = false;
+        let keep;
+        match transition.as_mut() {
+            Some(tr) => {
+                // Dissolve progress, clamped; the final frame lands exactly at 1.
+                let dur = tr.duration.as_secs_f32().max(1e-3);
+                let progress = (tr.started.elapsed().as_secs_f32() / dur).clamp(0.0, 1.0);
+                // The outgoing source advances on its own carried-over clock.
+                let out_time = tr.out_started.map_or(0.0, |t| t.elapsed().as_secs_f32());
+                let out_delta = tr.out_last_time.map_or(0.0, |p| (out_time - p).max(0.0));
+                let out_uniforms = ShaderUniforms {
+                    time: out_time,
+                    time_delta: out_delta,
+                    frame: tr.out_frame_count,
+                    ..uniforms
+                };
+                tr.blend
+                    .render_source(0, &tr.outgoing, idx, &out_uniforms, audio)
+                    .context("rendering outgoing source")?;
+                tr.blend
+                    .render_source(1, renderer, idx, &uniforms, audio)
+                    .context("rendering incoming source")?;
+                tr.blend
+                    .blend(
+                        idx,
+                        &rt.target,
+                        rt.framebuffer,
+                        progress,
+                        tr.outgoing.frame_semaphore(idx),
+                        renderer.frame_semaphore(idx),
+                    )
+                    .context("blending transition frame")?;
+                tr.out_last_time = Some(out_time);
+                tr.out_frame_count = tr.out_frame_count.wrapping_add(1);
+                transition_done = progress >= 1.0;
+                // Keep ticking until the dissolve ends; after that, only if the
+                // incoming is itself animated.
+                keep = !transition_done || self.animated;
+            }
+            None => {
+                renderer
+                    .render(idx, &rt.target, rt.framebuffer, &uniforms, audio)
+                    .context("rendering shader frame")?;
+                keep = self.animated;
+            }
+        }
+        // Advance the incoming per-frame counters now the render is committed to.
         self.last_time = Some(time);
         self.frame_count = self.frame_count.wrapping_add(1);
         rt.available.store(false, Ordering::Release);
@@ -860,12 +1000,16 @@ impl ShaderSurface {
         viewport.set_source(-1.0, -1.0, -1.0, -1.0);
         viewport.set_destination(logical.0 as i32, logical.1 as i32);
         surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-        if self.animated {
+        if keep {
             // Request the next callback before committing; delivered when
             // ready (and not while occluded).
             surface.frame(qh, surface.clone());
         }
         surface.commit();
+        // A finished dissolve drops here, leaving the incoming as the sole source.
+        if transition_done {
+            *transition = None;
+        }
         Ok(self.animated)
     }
 
