@@ -233,25 +233,32 @@ Extras beyond swaybg (also per-output-group):
   **Static image channels (`textures`).** A `/*!prism …*/` block can also declare
   a `textures` map (name → path, resolved relative to the `.frag` file); a channel
   routes to a texture by naming it, exactly like a buffer. The image is decoded
-  and uploaded once per GPU as an sRGB-sampled texture — so `texture()` returns
-  linear light, matching the working space — with repeat wrap + linear filter. A
-  shader that only wants a texture needs no `//!pass` sections (a plain body plus
-  the metadata block is enough):
+  and uploaded once per GPU (repeat wrap + linear filter). A shader that only
+  wants a texture needs no `//!pass` sections (a plain body plus the metadata
+  block is enough):
 
   ```glsl
   /*!prism
-  { "textures": { "noise": "../textures/rgba-noise.png" },
-    "channels": { "image": { "0": "noise" } } }
+  { "textures": {
+      "noise": "../textures/rgba-noise.png",          // raw (default)
+      "photo": { "path": "wall.jpg", "srgb": true }   // color: linearize on read
+    },
+    "channels": { "image": { "0": "noise", "1": "photo" } } }
   */
   #version 450
   layout(set = 1, binding = 0) uniform sampler2D iChannel0; // = noise
-  /* … sample texture(iChannel0, uv) … */
+  layout(set = 1, binding = 1) uniform sampler2D iChannel1; // = photo
+  /* … sample texture(iChannelN, uv) … */
   ```
 
-  Texture, buffer, and `"self"` channels mix freely in one shader. Texture color
-  management is sRGB-only for now (HDR/wide-gamut sources are flattened to sRGB),
-  and `iChannelResolution` is not yet provided. See `examples/shaders/clouds.frag`
-  (fbm clouds from a noise texture).
+  By default a texture is sampled **raw** (Shadertoy-style, no linearization) —
+  correct for noise/data textures, where the stored value *is* the data. Set
+  `"srgb": true` (the object form) for a **color** image, so the sampler
+  linearizes it on read into the linear working space. Texture, buffer, and
+  `"self"` channels mix freely in one shader. Sources are decoded to 8-bit sRGB
+  (HDR/wide-gamut textures are flattened — author HDR in-shader for now), and
+  `iChannelResolution` is not yet provided. See `examples/shaders/clouds.frag`
+  (fbm clouds from a raw noise texture).
 - `--fps <n>` — cap an animated shader's render rate (1..=1000); default is
   the compositor's vsync cadence. `iTime` stays real-time, so animation speed
   is unchanged — it's just sampled less often. Requires `--shader`.

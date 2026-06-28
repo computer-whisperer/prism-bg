@@ -323,22 +323,26 @@ fn local_date() -> [f32; 4] {
     ]
 }
 
-/// Decode a static image channel into 8-bit sRGB RGBA for upload. Path is
-/// resolved relative to the `.frag` file's directory. The image is re-encoded to
-/// sRGB so the GPU's `R8G8B8A8_SRGB` sampler linearizes it on read (HDR/wide-gamut
-/// sources are flattened to sRGB — texture color management is a later refinement).
+/// Decode a static image channel to 8-bit RGBA for upload. Path is resolved
+/// relative to the `.frag` file's directory. Pixels are kept sRGB-encoded as
+/// stored; the GPU format chosen at upload decides interpretation — raw `UNORM`
+/// (Shadertoy default, `tex.srgb == false`) passes the stored value straight to
+/// the shader, while `SRGB` linearizes on read for color images. HDR/wide-gamut
+/// sources are flattened to 8-bit sRGB (texture color management is a later
+/// refinement; authors handle HDR in-shader for now).
 fn load_texture(base_dir: &std::path::Path, tex: &crate::shadergraph::TextureSpec) -> Result<TextureData> {
     let path = base_dir.join(&tex.path);
     let decoded = crate::decode::load(&path)
         .with_context(|| format!("loading texture {:?} ({})", tex.name, path.display()))?;
-    let srgb = decoded.quantized_to_8bit(crate::color::Tf::Srgb);
-    let crate::decode::Pixels::Rgba8(rgba_srgb) = srgb.pixels else {
-        bail!("texture {:?}: expected 8-bit pixels after sRGB quantization", tex.name);
+    let img8 = decoded.quantized_to_8bit(crate::color::Tf::Srgb);
+    let crate::decode::Pixels::Rgba8(rgba) = img8.pixels else {
+        bail!("texture {:?}: expected 8-bit pixels after quantization", tex.name);
     };
     Ok(TextureData {
-        width: srgb.width,
-        height: srgb.height,
-        rgba_srgb,
+        width: img8.width,
+        height: img8.height,
+        rgba,
+        srgb: tex.srgb,
     })
 }
 
@@ -1009,10 +1013,12 @@ mod tests {
         let tex = crate::shadergraph::TextureSpec {
             name: "noise".into(),
             path: "../textures/rgba-noise.png".into(),
+            srgb: false,
         };
         let data = super::load_texture(&base, &tex).expect("load example noise texture");
         assert_eq!((data.width, data.height), (256, 256));
-        assert_eq!(data.rgba_srgb.len(), 256 * 256 * 4);
+        assert_eq!(data.rgba.len(), 256 * 256 * 4);
+        assert!(!data.srgb, "textures default to raw (UNORM) sampling");
     }
 
     #[test]

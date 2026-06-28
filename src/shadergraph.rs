@@ -44,6 +44,11 @@ pub enum ChannelSource {
 pub struct TextureSpec {
     pub name: String,
     pub path: String,
+    /// When `true`, the texture is uploaded as sRGB and the sampler linearizes
+    /// on read (for color images); when `false` (the default) it's sampled raw,
+    /// like Shadertoy — correct for noise/data textures, where linearizing would
+    /// distort the values. Authors opt in for color content.
+    pub srgb: bool,
 }
 
 /// One input channel binding: which `iChannelN` and what it samples.
@@ -101,10 +106,24 @@ struct RawMeta {
     /// `pass name → (channel index string → source string)`.
     #[serde(default)]
     channels: HashMap<String, HashMap<String, String>>,
-    /// `texture name → path` (path resolved relative to the `.frag` by the
-    /// loader). A channel routes to a texture by naming it, same as a buffer.
+    /// `texture name → path | {path, srgb}` (path resolved relative to the
+    /// `.frag` by the loader). A channel routes to a texture by naming it, same
+    /// as a buffer.
     #[serde(default)]
-    textures: HashMap<String, String>,
+    textures: HashMap<String, RawTexture>,
+}
+
+/// A `textures` map value: either a bare path string (raw sampling, the default)
+/// or an object with an explicit `srgb` flag for color images.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawTexture {
+    Path(String),
+    Spec {
+        path: String,
+        #[serde(default)]
+        srgb: bool,
+    },
 }
 
 /// Parse `source` into a [`GraphSpec`]. Authoring-level detection (plain /
@@ -192,9 +211,14 @@ fn parse_multipass(source: &str, meta_json: &str) -> Result<GraphSpec> {
             bail!("name {name:?} is declared as both a buffer and a texture");
         }
         texture_of.insert(name, i);
+        let (path, srgb) = match &meta.textures[*name] {
+            RawTexture::Path(p) => (p.clone(), false),
+            RawTexture::Spec { path, srgb } => (path.clone(), *srgb),
+        };
         textures.push(TextureSpec {
             name: (*name).to_string(),
-            path: meta.textures[*name].clone(),
+            path,
+            srgb,
         });
     }
 
@@ -443,6 +467,7 @@ void main(){}
         assert_eq!(g.textures.len(), 1);
         assert_eq!(g.textures[0].name, "noise");
         assert_eq!(g.textures[0].path, "noise.png");
+        assert!(!g.textures[0].srgb, "a bare path string defaults to raw");
         match &g.image {
             ImageSpec::Explicit(p) => {
                 assert_eq!(p.channels.len(), 1);
@@ -450,6 +475,24 @@ void main(){}
             }
             _ => panic!("expected explicit image pass"),
         }
+    }
+
+    #[test]
+    fn texture_srgb_flag_via_object_form() {
+        // The object form `{ "path": …, "srgb": true }` opts a texture into sRGB
+        // linearization; a bare string stays raw.
+        let src = r#"/*!prism
+{ "textures": { "photo": { "path": "p.png", "srgb": true }, "noise": "n.png" },
+  "channels": { "image": {"0": "photo", "1": "noise"} } }
+*/
+#version 450
+void main(){}
+"#;
+        let g = parse(src).unwrap();
+        let photo = g.textures.iter().find(|t| t.name == "photo").unwrap();
+        let noise = g.textures.iter().find(|t| t.name == "noise").unwrap();
+        assert!(photo.srgb, "object form with srgb:true must be sRGB");
+        assert!(!noise.srgb, "bare path stays raw");
     }
 
     #[test]

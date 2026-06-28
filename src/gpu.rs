@@ -708,22 +708,31 @@ fn create_buffer_image(gpu: &Gpu, device: &ash::Device, w: u32, h: u32) -> Resul
     })
 }
 
-/// CPU-side pixels for a static image channel: tightly-packed 8-bit sRGB RGBA
-/// (`width*height*4` bytes). Decoded once by the shader surface, then uploaded
-/// to a sampled image on each GPU that renders the shader.
+/// CPU-side pixels for a static image channel: tightly-packed 8-bit RGBA
+/// (`width*height*4` bytes), sRGB-encoded as stored. Decoded once by the shader
+/// surface, then uploaded to a sampled image on each GPU that renders the shader.
 pub struct TextureData {
     pub width: u32,
     pub height: u32,
-    pub rgba_srgb: Vec<u8>,
+    pub rgba: Vec<u8>,
+    /// Upload as sRGB (sampler linearizes on read) for color images; raw
+    /// `UNORM` (Shadertoy-style, no linearization) otherwise — the default.
+    pub srgb: bool,
 }
 
-/// Upload `data` to a sampled `R8G8B8A8_SRGB` image on `gpu` — the sampler
-/// hardware-linearizes sRGB on read, so shaders sample linear light (matching
-/// the ext-linear working space and output). A staging buffer + one-shot copy,
+/// Upload `data` to a sampled image on `gpu` — `R8G8B8A8_SRGB` (sampler
+/// linearizes on read) for color images or `R8G8B8A8_UNORM` (raw, Shadertoy
+/// default) otherwise, per `data.srgb`. A staging buffer + one-shot copy,
 /// awaited before returning; the image ends in `SHADER_READ_ONLY_OPTIMAL`. The
 /// returned [`BufferImage`] is freed via its `destroy` like a buffer texture.
 fn upload_texture(gpu: &Gpu, device: &ash::Device, data: &TextureData) -> Result<BufferImage> {
-    const FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
+    // sRGB format → the sampler linearizes on read (color images); UNORM → raw
+    // values straight through (Shadertoy-style, correct for noise/data).
+    let format = if data.srgb {
+        vk::Format::R8G8B8A8_SRGB
+    } else {
+        vk::Format::R8G8B8A8_UNORM
+    };
     let range = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
         base_mip_level: 0,
@@ -733,17 +742,17 @@ fn upload_texture(gpu: &Gpu, device: &ash::Device, data: &TextureData) -> Result
     };
     let (w, h) = (data.width.max(1), data.height.max(1));
     let byte_len = w as usize * h as usize * 4;
-    if data.rgba_srgb.len() < byte_len {
+    if data.rgba.len() < byte_len {
         bail!(
             "texture {w}x{h} needs {byte_len} bytes, got {}",
-            data.rgba_srgb.len()
+            data.rgba.len()
         );
     }
 
     // Device-local sampled image + memory + view.
     let image_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
-        .format(FORMAT)
+        .format(format)
         .extent(vk::Extent3D {
             width: w,
             height: h,
@@ -788,7 +797,7 @@ fn upload_texture(gpu: &Gpu, device: &ash::Device, data: &TextureData) -> Result
     let view_info = vk::ImageViewCreateInfo::default()
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
-        .format(FORMAT)
+        .format(format)
         .subresource_range(range);
     // SAFETY: view_info outlives the call.
     let view = match unsafe { device.create_image_view(&view_info, None) } {
@@ -809,7 +818,7 @@ fn upload_texture(gpu: &Gpu, device: &ash::Device, data: &TextureData) -> Result
 
     // Staging buffer holding the pixels, then a one-shot copy + transitions.
     // On any failure past here, free `tex` (the finished image) too.
-    let upload = upload_into(gpu, device, &tex, &data.rgba_srgb[..byte_len], w, h, range);
+    let upload = upload_into(gpu, device, &tex, &data.rgba[..byte_len], w, h, range);
     if let Err(e) = upload {
         // SAFETY: tex was fully built above; free it exactly once.
         unsafe { tex.destroy(device) };
@@ -3096,10 +3105,11 @@ void main() {
         let tex = TextureData {
             width: 2,
             height: 2,
-            rgba_srgb: vec![
+            rgba: vec![
                 255, 0, 0, 255, 0, 255, 0, 255, // red, green
                 0, 0, 255, 255, 255, 255, 0, 255, // blue, yellow
             ],
+            srgb: false,
         };
         let renderer = ShaderRenderer::new(gpu, &spec, std::slice::from_ref(&tex), 1)
             .expect("renderer");
