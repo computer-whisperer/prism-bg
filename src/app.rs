@@ -15,12 +15,19 @@ use smithay_client_toolkit::reexports::calloop::{
     LoopHandle,
 };
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState, Region},
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
-    delegate_simple, delegate_subcompositor,
+    compositor::{CompositorHandler, CompositorState, Region, SurfaceData},
+    delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
+    delegate_seat, delegate_shm, delegate_simple, delegate_subcompositor,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{
+        pointer::{
+            CursorIcon, PointerData, PointerEvent, PointerEventKind, PointerHandler, ThemeSpec,
+            ThemedPointer,
+        },
+        Capability, SeatHandler, SeatState,
+    },
     shell::{
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
@@ -36,8 +43,11 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     globals::GlobalList,
-    protocol::{wl_output, wl_shm, wl_subsurface::WlSubsurface, wl_surface::WlSurface},
-    Connection, QueueHandle,
+    protocol::{
+        wl_output, wl_pointer::WlPointer, wl_seat::WlSeat, wl_shm, wl_subsurface::WlSubsurface,
+        wl_surface::WlSurface,
+    },
+    Connection, Proxy, QueueHandle,
 };
 use wayland_protocols::wp::alpha_modifier::v1::client::{
     wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1, wp_alpha_modifier_v1::WpAlphaModifierV1,
@@ -194,6 +204,16 @@ pub struct App {
     pub subcompositor: SubcompositorState,
     pub layer_shell: LayerShell,
     pub viewporter: SimpleViewporter,
+    /// Seats are always tracked, but a pointer is only created (and surfaces
+    /// made input-receiving) when a shader uses `iMouse` — see `wants_mouse`.
+    pub seat_state: SeatState,
+    /// One themed pointer per seat that has the capability; empty unless
+    /// `wants_mouse`. Kept alive here; events arrive via [`PointerHandler`].
+    pointers: Vec<ThemedPointer>,
+    /// A shader somewhere references `iMouse`, so we bind pointers and make the
+    /// interactive surfaces input-receiving (non-interactive ones get an empty
+    /// input region so they stay click-through, as a wallpaper should).
+    wants_mouse: bool,
     /// `wp_alpha_modifier_v1` if the compositor has it; `--fade` degrades
     /// to a hard cut without it.
     pub alpha_modifier: Option<WpAlphaModifierV1>,
@@ -282,6 +302,18 @@ impl App {
         // Shader wallpapers need the GPU backend and dmabuf import. Only pay
         // for them when a --shader spec is present.
         let wants_shader = args.specs.iter().any(|s| s.shader.is_some());
+        // Does any shader want pointer input? Peek the source files now (a cheap
+        // startup-only read) so the seat's pointer is created — and surfaces get
+        // the right input region — before the first output is added. A read
+        // failure here just defers to the real error when the shader is built.
+        let wants_mouse = args
+            .specs
+            .iter()
+            .filter_map(|s| s.shader.as_ref())
+            .any(|p| std::fs::read_to_string(p).is_ok_and(|src| src.contains("iMouse")));
+        if wants_mouse {
+            tracing::info!("a shader uses iMouse; binding seat pointer for interactivity");
+        }
         let gpus = if wants_shader {
             Some(GpuPool::new().context("initializing GPU backend for --shader")?)
         } else {
@@ -308,6 +340,9 @@ impl App {
             subcompositor,
             layer_shell,
             viewporter,
+            seat_state: SeatState::new(globals, qh),
+            pointers: Vec::new(),
+            wants_mouse,
             alpha_modifier,
             color,
             intent: args.intent,
@@ -423,6 +458,20 @@ impl App {
             None => None,
         };
         let shader_broken = spec.shader.is_some() && shader.is_none();
+
+        // Pointer focus: a wallpaper should be click-through unless it's an
+        // interactive (iMouse) shader. Surfaces default to an infinite input
+        // region, so once we've bound a pointer (`wants_mouse`) we must give
+        // every non-interactive surface an empty input region or it would
+        // swallow desktop clicks. Interactive surfaces keep the default region.
+        if self.wants_mouse {
+            let interactive = shader.as_ref().is_some_and(|s| s.uses_mouse());
+            if !interactive {
+                if let Ok(empty) = Region::new(&self.compositor) {
+                    layer.wl_surface().set_input_region(Some(empty.wl_region()));
+                }
+            }
+        }
 
         // Bare commit maps the layer surface; the configure callback draws
         // the color, service() attaches the image once it's prepared.
@@ -1255,11 +1304,119 @@ impl ShmHandler for App {
     }
 }
 
+impl SeatHandler for App {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
+
+    /// Create a themed pointer for this seat the moment it gains the pointer
+    /// capability — but only if a shader wants `iMouse`. The theme makes the
+    /// surface show a normal cursor (set on each Enter); without `wants_mouse`
+    /// we bind nothing, so plain wallpapers never touch input.
+    fn new_capability(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: WlSeat,
+        capability: Capability,
+    ) {
+        if capability != Capability::Pointer || !self.wants_mouse {
+            return;
+        }
+        let surface = self.compositor.create_surface(qh);
+        match self.seat_state.get_pointer_with_theme::<App, SurfaceData>(
+            qh,
+            &seat,
+            self.shm.wl_shm(),
+            surface,
+            ThemeSpec::default(),
+        ) {
+            Ok(pointer) => self.pointers.push(pointer),
+            Err(e) => tracing::warn!("pointer init failed; iMouse shaders inert: {e}"),
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        seat: WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer {
+            self.pointers
+                .retain(|p| p.pointer().data::<PointerData>().map(|d| d.seat()) != Some(&seat));
+        }
+    }
+
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, seat: WlSeat) {
+        self.pointers
+            .retain(|p| p.pointer().data::<PointerData>().map(|d| d.seat()) != Some(&seat));
+    }
+}
+
+impl PointerHandler for App {
+    /// Route pointer events to the interactive shader under the cursor. Only
+    /// `iMouse` shaders have a non-empty input region, so every event we get
+    /// belongs to one. A change to the resolved `iMouse` repaints a *static*
+    /// shader (repaint-on-motion); animated ones absorb it on their next frame.
+    fn pointer_frame(
+        &mut self,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+        pointer: &WlPointer,
+        events: &[PointerEvent],
+    ) {
+        // Apply every event in the frame first, then redraw each affected
+        // static shader at most once: a frame can batch several motions (and a
+        // press + motion), and a single render of the final state is both
+        // cheaper and more correct (it can't overwrite the press frame's
+        // `sign(iMouse.w)` with the motion that followed it in the same batch).
+        let mut redraw: HashSet<usize> = HashSet::new();
+        for event in events {
+            let Some(i) = self
+                .wallpapers
+                .iter()
+                .position(|w| w.layer.wl_surface() == &event.surface)
+            else {
+                continue;
+            };
+            // The wallpaper owns pointer focus while the cursor is over it; give
+            // it the normal arrow (the compositor leaves the cursor to us).
+            if matches!(event.kind, PointerEventKind::Enter { .. }) {
+                if let Some(p) = self.pointers.iter().find(|p| p.pointer() == pointer) {
+                    let _ = p.set_cursor(conn, CursorIcon::Default);
+                }
+            }
+            let pos = (event.position.0 as f32, event.position.1 as f32);
+            let changed = match self.wallpapers[i].shader.as_mut() {
+                Some(s) => s.pointer_event(&event.kind, pos),
+                None => continue,
+            };
+            // A static shader must be redrawn to pick the change up; an animated
+            // one will on its next frame callback, and a broken one not at all.
+            let static_live = !self.wallpapers[i].broken
+                && self.wallpapers[i]
+                    .shader
+                    .as_ref()
+                    .is_some_and(|s| !s.animated());
+            if changed && static_live {
+                redraw.insert(i);
+            }
+        }
+        for i in redraw {
+            self.draw(qh, i);
+        }
+    }
+}
+
 impl ProvidesRegistryState for App {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 impl AsMut<SimpleViewporter> for App {
@@ -1273,6 +1430,8 @@ delegate_subcompositor!(App);
 delegate_output!(App);
 delegate_shm!(App);
 delegate_layer!(App);
+delegate_seat!(App);
+delegate_pointer!(App);
 delegate_registry!(App);
 delegate_simple!(App, WpViewporter, 1);
 wayland_client::delegate_noop!(App: ignore WpViewport);

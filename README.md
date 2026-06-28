@@ -100,6 +100,7 @@ Extras beyond swaybg (also per-output-group):
       vec2 iGlobalResolution;  // the whole cluster, logical px
       float iRefWhite;         // cd/m²: output value 1.0 = diffuse white
       float iMaxLum;           // cd/m²: peak luminance to master against
+      vec4 iMouse;             // xy: cursor (while held); zw: click pos (sign = state)
   } pc;
   ```
 
@@ -130,6 +131,19 @@ Extras beyond swaybg (also per-output-group):
   values default to an SDR-safe `203 / 203` (headroom 1.0), so a shader never
   overblows at startup. See `examples/shaders/bloom.frag` (HDR bloom into the
   headroom) and `examples/shaders/feedback.frag`.
+
+  **Mouse (`iMouse`).** Reference `iMouse` and prism-bg makes the surface
+  pointer-interactive: it binds a seat pointer, gives the wallpaper a normal
+  cursor, and **redraws it on each pointer event** ("repaint on motion"), so a
+  mouse-reactive shader needs no `iTime` — it renders once and then only while
+  the cursor moves or clicks, costing no GPU when idle. The convention matches
+  Shadertoy, in device pixels with a y-up origin (like `fragCoord`): `iMouse.xy`
+  is the cursor position while a button is held (holding the last drag position
+  once released), `iMouse.zw` is the position of the press with `sign(iMouse.z)`
+  encoding whether the button is currently down and `sign(iMouse.w)` whether the
+  press happened this frame. All four are zero until the first click. Only
+  shaders that reference `iMouse` receive input; every other wallpaper stays
+  click-through. See `examples/shaders/pointer.frag`.
 
   A shader can also be **audio-reactive**: reference any of the audio uniforms
   and prism-bg captures the default sink's output over PipeWire, runs an FFT,

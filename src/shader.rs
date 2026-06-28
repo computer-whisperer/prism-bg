@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use ash::vk;
+use smithay_client_toolkit::seat::pointer::PointerEventKind;
 use wayland_client::protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface};
 use wayland_client::{Dispatch, QueueHandle};
 use wayland_protocols::wp::color_management::v1::client::wp_color_management_surface_v1::WpColorManagementSurfaceV1;
@@ -207,6 +208,91 @@ impl Drop for DeviceState {
     }
 }
 
+/// Linux button code for the left mouse button (`BTN_LEFT`), the button
+/// Shadertoy's `iMouse` tracks.
+const BTN_LEFT: u32 = 0x110;
+
+/// Accumulated pointer state for a shader surface, in surface-local logical
+/// pixels (y-down, as `wl_pointer` delivers). Resolved into the device-pixel,
+/// y-up `iMouse` vec4 at render time, where the surface size is known.
+#[derive(Clone, Copy, Default)]
+struct PointerState {
+    /// Cursor position while the left button is (or was last) held.
+    pos: (f32, f32),
+    /// Position of the most recent left-button press.
+    click: (f32, f32),
+    /// Whether the left button is currently down.
+    down: bool,
+    /// True from a press until the next render consumes it (drives the
+    /// `sign(iMouse.w)` "clicked this frame" bit).
+    clicked_frame: bool,
+    /// Whether a press has ever happened (until then `iMouse` is all-zero).
+    ever: bool,
+}
+
+impl PointerState {
+    /// Apply one pointer event. `pos` is the event's surface-local position.
+    /// Returns whether the resolved `iMouse` value changed (so the caller can
+    /// redraw a static shader). Hover motion with no button held is ignored, to
+    /// match Shadertoy (`iMouse.xy` only tracks while pressed) and to avoid
+    /// waking a static shader on every mouse move.
+    fn apply(&mut self, kind: &PointerEventKind, pos: (f32, f32)) -> bool {
+        match kind {
+            PointerEventKind::Press {
+                button: BTN_LEFT, ..
+            } => {
+                self.pos = pos;
+                self.click = pos;
+                self.down = true;
+                self.clicked_frame = true;
+                self.ever = true;
+                true
+            }
+            PointerEventKind::Release {
+                button: BTN_LEFT, ..
+            } => {
+                let was = self.down;
+                self.down = false;
+                was
+            }
+            // Leaving the surface ends any drag (no further motion arrives).
+            PointerEventKind::Leave { .. } => {
+                let was = self.down;
+                self.down = false;
+                was
+            }
+            PointerEventKind::Motion { .. } if self.down => {
+                self.pos = pos;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Resolve the `iMouse` vec4 in device pixels, y-up. `size` is the device
+    /// resolution, `logical` the surface's logical size (the space pointer
+    /// events arrive in); the ratio handles output scale and fractional scaling.
+    fn uniform(&self, size: (u32, u32), logical: (u32, u32)) -> [f32; 4] {
+        if !self.ever {
+            return [0.0; 4];
+        }
+        let to_device = |p: (f32, f32)| {
+            let nx = p.0 / logical.0.max(1) as f32;
+            let ny = p.1 / logical.1.max(1) as f32;
+            // y-down logical → y-up device.
+            (nx * size.0 as f32, (1.0 - ny) * size.1 as f32)
+        };
+        let (px, py) = to_device(self.pos);
+        let (cx, cy) = to_device(self.click);
+        [
+            px,
+            py,
+            if self.down { cx } else { -cx },
+            if self.clicked_frame { cy } else { -cy },
+        ]
+    }
+}
+
 pub struct ShaderSurface {
     /// The shader resolved into its render graph; compiled per GPU into a
     /// `DeviceState`.
@@ -216,6 +302,13 @@ pub struct ShaderSurface {
     /// Whether the shader references the audio uniforms (`iAudio*`); if any
     /// surface does, the app spins up the PipeWire capture.
     uses_audio: bool,
+    /// Whether the shader references `iMouse`; if any surface does, the app
+    /// binds a seat pointer and makes the interactive surfaces input-receiving.
+    uses_mouse: bool,
+    /// Pointer state, in surface-local logical pixels with a y-down origin (as
+    /// delivered by `wl_pointer`); converted to the device-pixel, y-up `iMouse`
+    /// convention at render time. See [`Self::mouse_uniform`].
+    ptr: PointerState,
     /// iTime origin, set on the first rendered frame.
     started: Option<Instant>,
     /// `--fps` cap as a minimum interval between renders; `None` is uncapped
@@ -250,6 +343,12 @@ impl ShaderSurface {
         let spec = crate::shadergraph::parse(fragment_glsl)?;
         crate::gpu::validate_graph(&spec)?;
         let uses_audio = fragment_glsl.contains("iAudio");
+        // A shader that reads iMouse becomes pointer-interactive: the app binds
+        // a seat pointer and routes events to it. It does *not* make the shader
+        // animated — a static mouse shader renders once and then only on
+        // pointer events (repaint-on-motion), staying off the frame-callback
+        // treadmill when idle.
+        let uses_mouse = fragment_glsl.contains("iMouse");
         // Multi-pass / feedback shaders evolve their buffers, so they must
         // redraw every frame and count as animated even without `iTime`; so do
         // audio-reactive shaders (to track the spectrum).
@@ -278,6 +377,8 @@ impl ShaderSurface {
             spec,
             animated,
             uses_audio,
+            uses_mouse,
+            ptr: PointerState::default(),
             started: None,
             min_interval,
             last_render: None,
@@ -298,6 +399,18 @@ impl ShaderSurface {
     /// Whether this shader references the audio uniforms (`iAudio*`).
     pub fn uses_audio(&self) -> bool {
         self.uses_audio
+    }
+
+    /// Whether this shader references `iMouse` (and so wants pointer input).
+    pub fn uses_mouse(&self) -> bool {
+        self.uses_mouse
+    }
+
+    /// Apply a pointer event (surface-local position `pos`). Returns whether the
+    /// resolved `iMouse` changed — the caller redraws a static shader when so
+    /// (an animated one picks the new value up on its next frame anyway).
+    pub fn pointer_event(&mut self, kind: &PointerEventKind, pos: (f32, f32)) -> bool {
+        self.ptr.apply(kind, pos)
     }
 
     /// Subscribe to per-surface dmabuf feedback for `surface`. The result
@@ -441,6 +554,10 @@ impl ShaderSurface {
                 0.0
             }
         };
+        let mouse = self.ptr.uniform(size, logical);
+        // The "clicked this frame" bit is one-shot: clear it now that this
+        // render has captured it, so the next frame sees sign(iMouse.w) < 0.
+        self.ptr.clicked_frame = false;
         let uniforms = ShaderUniforms {
             resolution: [size.0 as f32, size.1 as f32],
             time,
@@ -450,6 +567,7 @@ impl ShaderSurface {
             global_resolution: tiling.global,
             ref_white: lum.0,
             max_lum: lum.1,
+            mouse,
         };
         let rt = &st.ring[idx];
         st.renderer

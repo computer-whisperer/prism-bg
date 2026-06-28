@@ -902,8 +902,9 @@ fn rebuild_pingpong(
 /// shader can tile continuously across the whole workspace — see the `Push`
 /// block documented in the module. They are y-up logical pixels with the
 /// origin at the cluster's bottom-left, matching the y-up `fragCoord` the
-/// vertex stage emits. Layout (std430): every field is `vec2`/`float` so the
-/// natural `repr(C)` order matches the GLSL block with no implicit padding.
+/// vertex stage emits. Layout (std430): every field is `vec2`/`float`/`vec4`,
+/// each landing on its natural alignment (the trailing `vec4` at offset 48 is
+/// 16-aligned), so the `repr(C)` order matches the GLSL block with no padding.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ShaderUniforms {
@@ -933,6 +934,14 @@ pub struct ShaderUniforms {
     /// never exceeds that, or the compositor's display LUT rolls off the
     /// overage and brightness blows past the advertised target.
     pub max_lum: f32,
+    /// Pointer state in the Shadertoy `iMouse` convention, in device pixels with
+    /// a y-up origin (matching `fragCoord`). `.xy` is the cursor position while a
+    /// button is held (retaining the last drag position once released); `.zw` is
+    /// the position of the press, with `sign(.z)` encoding whether the button is
+    /// currently down and `sign(.w)` whether the press happened this frame. All
+    /// zero until the first click. Only meaningful for surfaces whose shader
+    /// references `iMouse` (which are made pointer-interactive); zero otherwise.
+    pub mouse: [f32; 4],
 }
 
 /// Number of spectrum bins handed to audio-reactive shaders (log-spaced,
@@ -2513,6 +2522,7 @@ mod tests {
             global_resolution: [rt.width as f32, rt.height as f32],
             ref_white: 203.0,
             max_lum: 203.0,
+            mouse: [0.0; 4],
         };
         // Exercises the sync_file export + dmabuf import attach on this GPU,
         // plus the spectrum UBO upload + descriptor bind.
@@ -2566,6 +2576,7 @@ void main() {
             global_resolution: [rt.width as f32, rt.height as f32],
             ref_white: 203.0,
             max_lum: 203.0,
+            mouse: [0.0; 4],
         };
         let audio = <AudioUniforms as bytemuck::Zeroable>::zeroed();
         // Two frames: the second samples the first via iPrevFrame (parity flip).
@@ -2657,6 +2668,7 @@ void main() {
             global_resolution: [rt.width as f32, rt.height as f32],
             ref_white: 203.0,
             max_lum: 203.0,
+            mouse: [0.0; 4],
         };
         let audio = <AudioUniforms as bytemuck::Zeroable>::zeroed();
         for slot in 0..2 {
