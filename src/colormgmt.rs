@@ -350,10 +350,13 @@ impl Dispatch<WpImageDescriptionInfoV1, FeedbackData> for App {
             }
             Event::Done => {
                 let (cll, lum_max) = state.pending_targets.remove(output).unwrap_or_default();
-                // max_cll is the tighter "content light level the display
-                // handles" bound when present; target_luminance.max is
-                // always sent.
-                if let Some(target) = cll.or(lum_max) {
+                // Master against target_luminance.max — the mastering-display
+                // peak the compositor advertises as the value to tone-map to
+                // (prism's `advertised-peak-nits`, deliberately decoupled from
+                // the HDR_OUTPUT_METADATA signaling). target_max_cll is that
+                // signaling/panel value (often the marketing peak) and is a
+                // fallback only, used when target_luminance is somehow absent.
+                if let Some(target) = lum_max.or(cll) {
                     tracing::info!(output, target_nits = target, "output tone-map target");
                     state.tone_targets.insert(output.clone(), target);
                 } else {
