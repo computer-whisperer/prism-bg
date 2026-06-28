@@ -86,8 +86,9 @@ pub enum ToneMap {
 pub struct OutputSpec {
     pub output: String,
     pub image: Option<PathBuf>,
-    /// Playlist file (`--image-list`): one image path per line, rotated
-    /// on a timer. Mutually exclusive with `image`.
+    /// Playlist file (`--image-list`): one entry path per line, rotated
+    /// on a timer. Entries may be images or `.frag`/`.glsl` shaders; a
+    /// single list interleaves both. Mutually exclusive with `image`.
     pub image_list: Option<PathBuf>,
     /// Index into `App::playlists`, assigned by `main` after the list
     /// file is loaded. `None` until then (and always for `-i` specs).
@@ -172,9 +173,10 @@ Usage: prism-bg <options...>
   -o, --output <name>    Set the output to operate on or * for all,
                          starting a new per-output group.
       --image-list <file>
-                         Rotate through the images listed in <file>, one
+                         Rotate through the entries listed in <file>, one
                          path per line (relative to the file's directory;
-                         blank lines and # comments ignored). Outputs
+                         blank lines and # comments ignored). Entries may be
+                         images or .frag/.glsl shaders, interleaved. Outputs
                          sharing the group rotate in lockstep.
       --rotate-every <duration>
                          Rotation period for --image-list, e.g. 90s, 15m,

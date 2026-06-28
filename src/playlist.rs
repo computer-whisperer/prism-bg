@@ -1,5 +1,7 @@
-//! Wallpaper playlists (`--image-list`): a text file with one image path
-//! per line, stepped through on a timer.
+//! Wallpaper playlists (`--image-list`): a text file with one entry per
+//! line, stepped through on a timer. Each entry is either a still image or
+//! a live GLSL shader (`.frag`/`.glsl`), classified by extension — a single
+//! list may interleave both.
 //!
 //! One `Playlist` per CLI output group that asked for one — every output
 //! the group matches shows the same entry and advances in lockstep, so
@@ -12,8 +14,45 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
+/// A playlist entry: a still image or a live GLSL shader. The kind is
+/// decided from the file extension when the list is parsed, so the
+/// presentation code can route each entry to the right pipeline without
+/// re-sniffing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    Image(PathBuf),
+    Shader(PathBuf),
+}
+
+impl Source {
+    /// Classify a path by extension: `.frag`/`.glsl` (case-insensitive) are
+    /// shaders, anything else is an image (the decoder sniffs the actual
+    /// format from the file's bytes).
+    pub fn from_path(path: PathBuf) -> Source {
+        let is_shader = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("frag") || e.eq_ignore_ascii_case("glsl"));
+        if is_shader {
+            Source::Shader(path)
+        } else {
+            Source::Image(path)
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        match self {
+            Source::Image(p) | Source::Shader(p) => p,
+        }
+    }
+
+    pub fn is_shader(&self) -> bool {
+        matches!(self, Source::Shader(_))
+    }
+}
+
 pub struct Playlist {
-    entries: Vec<PathBuf>,
+    entries: Vec<Source>,
     /// Presentation order, indices into `entries`; identity unless
     /// `randomize`.
     order: Vec<usize>,
@@ -37,11 +76,12 @@ impl Playlist {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            entries.push(match (line.strip_prefix("~/"), &home) {
+            let path = match (line.strip_prefix("~/"), &home) {
                 (Some(rest), Some(home)) => home.join(rest),
                 // join() ignores `dir` when `line` is absolute.
                 _ => dir.join(line),
-            });
+            };
+            entries.push(Source::from_path(path));
         }
         if entries.is_empty() {
             bail!("image list {} contains no entries", list.display());
@@ -59,7 +99,7 @@ impl Playlist {
         })
     }
 
-    pub fn current(&self) -> &Path {
+    pub fn current(&self) -> &Source {
         &self.entries[self.order[self.pos]]
     }
 
@@ -111,7 +151,21 @@ mod tests {
         );
         let pl = Playlist::load(&list, Duration::from_secs(60), false).unwrap();
         assert_eq!(pl.len(), 2);
-        assert_eq!(pl.current(), list.parent().unwrap().join("a.png"));
+        assert_eq!(pl.current().path(), list.parent().unwrap().join("a.png"));
+        let _ = std::fs::remove_file(&list);
+    }
+
+    #[test]
+    fn entries_are_classified_by_extension() {
+        let list = write_list("kinds.txt", "a.png\nb.frag\nc.JPG\nd.GLSL\n");
+        let mut pl = Playlist::load(&list, Duration::from_secs(60), false).unwrap();
+        assert!(matches!(pl.current(), Source::Image(_))); // a.png
+        pl.advance();
+        assert!(matches!(pl.current(), Source::Shader(_))); // b.frag
+        pl.advance();
+        assert!(matches!(pl.current(), Source::Image(_))); // c.JPG
+        pl.advance();
+        assert!(matches!(pl.current(), Source::Shader(_))); // d.GLSL (case-insensitive)
         let _ = std::fs::remove_file(&list);
     }
 
@@ -126,11 +180,11 @@ mod tests {
     fn sequential_advance_wraps() {
         let list = write_list("seq.txt", "a.png\nb.png\nc.png\n");
         let mut pl = Playlist::load(&list, Duration::from_secs(60), false).unwrap();
-        let first = pl.current().to_path_buf();
+        let first = pl.current().clone();
         pl.advance();
         pl.advance();
         pl.advance();
-        assert_eq!(pl.current(), first);
+        assert_eq!(pl.current(), &first);
         let _ = std::fs::remove_file(&list);
     }
 
@@ -141,10 +195,10 @@ mod tests {
         for _ in 0..10 {
             let mut seen = HashSet::new();
             for _ in 0..pl.len() {
-                let prev = pl.current().to_path_buf();
+                let prev = pl.current().path().to_path_buf();
                 seen.insert(prev.clone());
                 pl.advance();
-                assert_ne!(pl.current(), prev, "immediate repeat across shuffle");
+                assert_ne!(pl.current().path(), prev, "immediate repeat across shuffle");
             }
             assert_eq!(seen.len(), pl.len(), "a pass must cover every entry");
         }
@@ -155,9 +209,9 @@ mod tests {
     fn single_entry_list_advances_to_itself() {
         let list = write_list("single.txt", "only.png\n");
         let mut pl = Playlist::load(&list, Duration::from_secs(60), true).unwrap();
-        let only = pl.current().to_path_buf();
+        let only = pl.current().path().to_path_buf();
         pl.advance();
-        assert_eq!(pl.current(), only);
+        assert_eq!(pl.current().path(), only);
         let _ = std::fs::remove_file(&list);
     }
 }

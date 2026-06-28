@@ -566,7 +566,13 @@ impl App {
             let name = wp.name.clone();
             // Playlist specs show the playlist's current entry.
             let path = match spec.playlist {
-                Some(p) => self.playlists[p].current().to_path_buf(),
+                Some(p) => {
+                    let src = self.playlists[p].current();
+                    if src.is_shader() {
+                        continue; // GPU-rendered playlist shaders arrive in a later step
+                    }
+                    src.path().to_path_buf()
+                }
                 None => match spec.image.clone() {
                     Some(path) => path,
                     None => continue,
@@ -1098,14 +1104,18 @@ impl App {
     /// synchronous — a slow decode stalls the event loop briefly, which
     /// is fine at rotation cadence.
     pub fn rotate(&mut self, qh: &QueueHandle<App>, idx: usize) {
-        let previous = self.playlists[idx].current().to_path_buf();
+        let previous = self.playlists[idx].current().path().to_path_buf();
 
         // Find the next decodable entry, skipping (with a warning) files
         // that fail — a deleted or corrupt entry must not kill the daemon.
         let mut next = None;
         for _ in 0..self.playlists[idx].len() {
             self.playlists[idx].advance();
-            let path = self.playlists[idx].current().to_path_buf();
+            let src = self.playlists[idx].current();
+            if src.is_shader() {
+                continue; // not yet renderable from a playlist; skip during rotation
+            }
+            let path = src.path().to_path_buf();
             if self.raw_images.contains_key(&path) {
                 next = Some(path);
                 break;
@@ -1149,7 +1159,11 @@ impl App {
     fn evict_unused_images(&mut self) {
         let mut live: HashSet<PathBuf> =
             self.specs.iter().filter_map(|s| s.image.clone()).collect();
-        live.extend(self.playlists.iter().map(|p| p.current().to_path_buf()));
+        live.extend(
+            self.playlists
+                .iter()
+                .map(|p| p.current().path().to_path_buf()),
+        );
         self.raw_images.retain(|path, _| live.contains(path));
         self.images.retain(|(path, _), _| live.contains(path));
     }

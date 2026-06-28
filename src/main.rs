@@ -107,15 +107,24 @@ fn main() -> Result<()> {
     // daemon — rotation skips them too): seek each list to its first
     // decodable entry, failing only if none decodes.
     for (i, pl) in playlists.iter_mut().enumerate() {
-        let loaded = (0..pl.len()).any(|_| match load_raw(&mut raw_images, pl.current()) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(
-                    path = %pl.current().display(),
-                    "skipping playlist entry: {e:#}"
-                );
+        let loaded = (0..pl.len()).any(|_| {
+            // Shader entries render via the GPU path (wired up in a later
+            // step); for now skip them when seeking the first decodable
+            // image so an image-only list keeps its existing fail-fast.
+            if pl.current().is_shader() {
                 pl.advance();
-                false
+                return false;
+            }
+            match load_raw(&mut raw_images, pl.current().path()) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %pl.current().path().display(),
+                        "skipping playlist entry: {e:#}"
+                    );
+                    pl.advance();
+                    false
+                }
             }
         });
         if !loaded {
