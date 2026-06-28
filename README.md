@@ -229,6 +229,29 @@ Extras beyond swaybg (also per-output-group):
   `binding = <N>` (the `iChannelN` index) and are sampled y-flipped, same as
   `iPrevFrame`. Up to 4 channels per pass. Multi-pass shaders redraw every
   frame. See `examples/shaders/bloom.frag` for a worked separable-blur bloom.
+
+  **Static image channels (`textures`).** A `/*!prism …*/` block can also declare
+  a `textures` map (name → path, resolved relative to the `.frag` file); a channel
+  routes to a texture by naming it, exactly like a buffer. The image is decoded
+  and uploaded once per GPU as an sRGB-sampled texture — so `texture()` returns
+  linear light, matching the working space — with repeat wrap + linear filter. A
+  shader that only wants a texture needs no `//!pass` sections (a plain body plus
+  the metadata block is enough):
+
+  ```glsl
+  /*!prism
+  { "textures": { "noise": "../textures/rgba-noise.png" },
+    "channels": { "image": { "0": "noise" } } }
+  */
+  #version 450
+  layout(set = 1, binding = 0) uniform sampler2D iChannel0; // = noise
+  /* … sample texture(iChannel0, uv) … */
+  ```
+
+  Texture, buffer, and `"self"` channels mix freely in one shader. Texture color
+  management is sRGB-only for now (HDR/wide-gamut sources are flattened to sRGB),
+  and `iChannelResolution` is not yet provided. See `examples/shaders/clouds.frag`
+  (fbm clouds from a noise texture).
 - `--fps <n>` — cap an animated shader's render rate (1..=1000); default is
   the compositor's vsync cadence. `iTime` stays real-time, so animation speed
   is unchanged — it's just sampled less often. Requires `--shader`.

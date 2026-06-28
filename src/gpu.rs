@@ -708,6 +708,317 @@ fn create_buffer_image(gpu: &Gpu, device: &ash::Device, w: u32, h: u32) -> Resul
     })
 }
 
+/// CPU-side pixels for a static image channel: tightly-packed 8-bit sRGB RGBA
+/// (`width*height*4` bytes). Decoded once by the shader surface, then uploaded
+/// to a sampled image on each GPU that renders the shader.
+pub struct TextureData {
+    pub width: u32,
+    pub height: u32,
+    pub rgba_srgb: Vec<u8>,
+}
+
+/// Upload `data` to a sampled `R8G8B8A8_SRGB` image on `gpu` — the sampler
+/// hardware-linearizes sRGB on read, so shaders sample linear light (matching
+/// the ext-linear working space and output). A staging buffer + one-shot copy,
+/// awaited before returning; the image ends in `SHADER_READ_ONLY_OPTIMAL`. The
+/// returned [`BufferImage`] is freed via its `destroy` like a buffer texture.
+fn upload_texture(gpu: &Gpu, device: &ash::Device, data: &TextureData) -> Result<BufferImage> {
+    const FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
+    let range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let (w, h) = (data.width.max(1), data.height.max(1));
+    let byte_len = w as usize * h as usize * 4;
+    if data.rgba_srgb.len() < byte_len {
+        bail!(
+            "texture {w}x{h} needs {byte_len} bytes, got {}",
+            data.rgba_srgb.len()
+        );
+    }
+
+    // Device-local sampled image + memory + view.
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(FORMAT)
+        .extent(vk::Extent3D {
+            width: w,
+            height: h,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    // SAFETY: image_info outlives the call.
+    let image = unsafe { device.create_image(&image_info, None) }.context("creating texture image")?;
+    // SAFETY: image is this device's.
+    let reqs = unsafe { device.get_image_memory_requirements(image) };
+    let Some(mem_type) =
+        gpu.find_memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    else {
+        unsafe { device.destroy_image(image, None) };
+        bail!("no device-local memory for texture image");
+    };
+    let alloc = vk::MemoryAllocateInfo::default()
+        .allocation_size(reqs.size)
+        .memory_type_index(mem_type);
+    // SAFETY: alloc outlives the call; image freed on error.
+    let memory = match unsafe { device.allocate_memory(&alloc, None) } {
+        Ok(m) => m,
+        Err(e) => {
+            unsafe { device.destroy_image(image, None) };
+            return Err(e).context("allocating texture memory");
+        }
+    };
+    // SAFETY: image+memory are this device's; bound once.
+    if let Err(e) = unsafe { device.bind_image_memory(image, memory, 0) } {
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_image(image, None);
+        }
+        return Err(e).context("binding texture memory");
+    }
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(FORMAT)
+        .subresource_range(range);
+    // SAFETY: view_info outlives the call.
+    let view = match unsafe { device.create_image_view(&view_info, None) } {
+        Ok(v) => v,
+        Err(e) => {
+            unsafe {
+                device.free_memory(memory, None);
+                device.destroy_image(image, None);
+            }
+            return Err(e).context("creating texture view");
+        }
+    };
+    let tex = BufferImage {
+        image,
+        view,
+        memory,
+    };
+
+    // Staging buffer holding the pixels, then a one-shot copy + transitions.
+    // On any failure past here, free `tex` (the finished image) too.
+    let upload = upload_into(gpu, device, &tex, &data.rgba_srgb[..byte_len], w, h, range);
+    if let Err(e) = upload {
+        // SAFETY: tex was fully built above; free it exactly once.
+        unsafe { tex.destroy(device) };
+        return Err(e);
+    }
+    Ok(tex)
+}
+
+/// Stage `pixels` into `tex.image` and transition it to `SHADER_READ_ONLY`.
+/// Split out so [`upload_texture`] can free the image on any failure here.
+fn upload_into(
+    gpu: &Gpu,
+    device: &ash::Device,
+    tex: &BufferImage,
+    pixels: &[u8],
+    w: u32,
+    h: u32,
+    range: vk::ImageSubresourceRange,
+) -> Result<()> {
+    // Host-visible staging buffer with the pixels copied in.
+    let staging_info = vk::BufferCreateInfo::default()
+        .size(pixels.len() as u64)
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    // SAFETY: staging_info outlives the call.
+    let staging = unsafe { device.create_buffer(&staging_info, None) }
+        .context("creating texture staging buffer")?;
+    // SAFETY: staging is this device's.
+    let reqs = unsafe { device.get_buffer_memory_requirements(staging) };
+    let Some(mem_type) = gpu.find_memory_type(
+        reqs.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    ) else {
+        unsafe { device.destroy_buffer(staging, None) };
+        bail!("no host-visible memory for texture staging");
+    };
+    let alloc = vk::MemoryAllocateInfo::default()
+        .allocation_size(reqs.size)
+        .memory_type_index(mem_type);
+    // SAFETY: alloc outlives the call; staging freed on error.
+    let smem = match unsafe { device.allocate_memory(&alloc, None) } {
+        Ok(m) => m,
+        Err(e) => {
+            unsafe { device.destroy_buffer(staging, None) };
+            return Err(e).context("allocating texture staging memory");
+        }
+    };
+    // From here free (smem, staging) on any failure.
+    let free_staging = |device: &ash::Device| unsafe {
+        device.free_memory(smem, None);
+        device.destroy_buffer(staging, None);
+    };
+    // SAFETY: staging+smem are this device's; bound once.
+    if let Err(e) = unsafe { device.bind_buffer_memory(staging, smem, 0) } {
+        free_staging(device);
+        return Err(e).context("binding texture staging memory");
+    }
+    // SAFETY: smem is host-visible+coherent; map for the copy, then unmap.
+    let mapped = unsafe { device.map_memory(smem, 0, pixels.len() as u64, vk::MemoryMapFlags::empty()) };
+    match mapped {
+        Ok(ptr) => unsafe {
+            std::ptr::copy_nonoverlapping(pixels.as_ptr(), ptr as *mut u8, pixels.len());
+            device.unmap_memory(smem);
+        },
+        Err(e) => {
+            free_staging(device);
+            return Err(e).context("mapping texture staging");
+        }
+    }
+
+    // One-shot: UNDEFINED→TRANSFER_DST, copy, TRANSFER_DST→SHADER_READ.
+    let alloc_cb = vk::CommandBufferAllocateInfo::default()
+        .command_pool(gpu.command_pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    // SAFETY: alloc_cb references gpu.command_pool.
+    let cb = match unsafe { device.allocate_command_buffers(&alloc_cb) } {
+        Ok(v) => v[0],
+        Err(e) => {
+            free_staging(device);
+            return Err(e).context("allocating texture upload cb");
+        }
+    };
+    // Record + submit in a closure so an early `?` returns *here*, not out of
+    // the function — the cb and staging buffer below must be freed either way.
+    // SAFETY: cb valid; images/barriers this device's; submit+wait drains before free.
+    let result = (|| unsafe {
+        device
+            .begin_command_buffer(
+                cb,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .context("begin texture upload cb")?;
+        let to_dst = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(tex.image)
+            .subresource_range(range);
+        device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_dst],
+        );
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .image_extent(vk::Extent3D {
+                width: w,
+                height: h,
+                depth: 1,
+            });
+        device.cmd_copy_buffer_to_image(
+            cb,
+            staging,
+            tex.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[region],
+        );
+        let to_read = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(tex.image)
+            .subresource_range(range);
+        device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_read],
+        );
+        device.end_command_buffer(cb).context("end texture upload cb")?;
+        let cbs = [cb];
+        let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+        device
+            .queue_submit(gpu.queue, &[submit], vk::Fence::null())
+            .context("submitting texture upload")?;
+        device
+            .queue_wait_idle(gpu.queue)
+            .context("waiting on texture upload")
+    })();
+    // SAFETY: the submission has drained (queue_wait_idle), so the cb is free.
+    // Runs on every path now (the closure's `?` returns into `result`).
+    unsafe { device.free_command_buffers(gpu.command_pool, &[cb]) };
+    free_staging(device);
+    result
+}
+
+/// Upload all of a graph's static textures to `gpu`, plus a repeat-wrap,
+/// linear-filter sampler for them (Shadertoy's default). Returns `(vec![], None)`
+/// when there are none. Frees everything uploaded (and the sampler) on failure.
+fn upload_textures(
+    gpu: &Gpu,
+    device: &ash::Device,
+    data: &[TextureData],
+) -> Result<(Vec<BufferImage>, Option<vk::Sampler>)> {
+    if data.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    let sampler_info = vk::SamplerCreateInfo::default()
+        .mag_filter(vk::Filter::LINEAR)
+        .min_filter(vk::Filter::LINEAR)
+        .address_mode_u(vk::SamplerAddressMode::REPEAT)
+        .address_mode_v(vk::SamplerAddressMode::REPEAT)
+        .address_mode_w(vk::SamplerAddressMode::REPEAT);
+    // SAFETY: sampler_info outlives the call.
+    let sampler = unsafe { device.create_sampler(&sampler_info, None) }
+        .context("creating texture sampler")?;
+    let mut images = Vec::with_capacity(data.len());
+    for (i, d) in data.iter().enumerate() {
+        match upload_texture(gpu, device, d) {
+            Ok(img) => images.push(img),
+            Err(e) => {
+                // SAFETY: free the sampler + textures uploaded so far, each once.
+                unsafe {
+                    device.destroy_sampler(sampler, None);
+                    for img in &images {
+                        img.destroy(device);
+                    }
+                }
+                return Err(e).with_context(|| format!("uploading texture #{i}"));
+            }
+        }
+    }
+    Ok((images, Some(sampler)))
+}
+
 /// Clear both buffer textures to black and transition them to
 /// `SHADER_READ_ONLY_OPTIMAL`, so the first frame samples a clean previous
 /// frame. A one-shot command buffer, awaited before returning.
@@ -1129,8 +1440,14 @@ struct GpuPass {
 /// pass with no buffers and no channels; an `iPrevFrame` shader is one buffer
 /// plus a built-in blit image pass; metadata shaders are the general case.
 struct Graph {
-    /// Sampler for channel reads; `None` if no pass samples anything.
+    /// Clamp sampler for buffer/feedback channel reads; `None` if no pass
+    /// samples a buffer.
     sampler: Option<vk::Sampler>,
+    /// Repeat-wrap sampler for static texture channels; `None` if no textures.
+    texture_sampler: Option<vk::Sampler>,
+    /// Static image channels, indexed by [`ChannelSource::Texture`]; uploaded
+    /// once (size-fixed, so not touched by resize). Empty without textures.
+    textures: Vec<BufferImage>,
     /// Off-screen render pass shared by all buffer passes (F16 → SHADER_READ);
     /// `None` if there are no buffers.
     offscreen_render_pass: Option<vk::RenderPass>,
@@ -1172,10 +1489,15 @@ impl ShaderRenderer {
     /// Build the renderer for `spec` — a parsed shader graph: the displayed
     /// image pass plus any offscreen buffer passes it feeds from — with `frames`
     /// per-slot command resources (one per ring buffer).
-    pub fn new(gpu: &Gpu, spec: &GraphSpec, frames: usize) -> Result<ShaderRenderer> {
+    pub fn new(
+        gpu: &Gpu,
+        spec: &GraphSpec,
+        textures: &[TextureData],
+        frames: usize,
+    ) -> Result<ShaderRenderer> {
         let device = gpu.device.clone();
         let render_pass = Self::create_render_pass(&device)?;
-        match Self::build(gpu, device.clone(), render_pass, spec, frames) {
+        match Self::build(gpu, device.clone(), render_pass, spec, textures, frames) {
             Ok(r) => Ok(r),
             Err(e) => {
                 // SAFETY: render_pass created just above, nothing else owns it.
@@ -1249,6 +1571,7 @@ impl ShaderRenderer {
         device: ash::Device,
         render_pass: vk::RenderPass,
         spec: &GraphSpec,
+        textures: &[TextureData],
         frame_count: usize,
     ) -> Result<ShaderRenderer> {
         // Spectrum UBO at set 0, binding 0 (fragment stage). Bound as set 0 of
@@ -1267,10 +1590,12 @@ impl ShaderRenderer {
 
         // The pass graph (compiles every pass; most failure-prone, so first).
         let graph = match Self::build_graph(
+            gpu,
             &device,
             render_pass,
             descriptor_set_layout,
             spec,
+            textures,
             frame_count,
         ) {
             Ok(g) => g,
@@ -1322,10 +1647,12 @@ impl ShaderRenderer {
     /// channel descriptor pool (as needed), then each buffer pass and the image
     /// pass. Frees everything it created on any failure.
     fn build_graph(
+        gpu: &Gpu,
         device: &ash::Device,
         present_render_pass: vk::RenderPass,
         audio_set_layout: vk::DescriptorSetLayout,
         spec: &GraphSpec,
+        texture_data: &[TextureData],
         frame_count: usize,
     ) -> Result<Graph> {
         // Channel accounting (for descriptor pool sizing).
@@ -1516,8 +1843,20 @@ impl ShaderRenderer {
             }
         };
 
+        // Static image channels: upload last, once every pass is built, so the
+        // teardown on failure is the whole graph (image included).
+        let (textures, texture_sampler) = match upload_textures(gpu, device, texture_data) {
+            Ok(v) => v,
+            Err(e) => {
+                fail(device, &mut buffers, Some(image));
+                return Err(e);
+            }
+        };
+
         Ok(Graph {
             sampler,
+            texture_sampler,
+            textures,
             offscreen_render_pass,
             descriptor_pool,
             buffers,
@@ -2387,7 +2726,13 @@ impl Graph {
         for p in &self.buffers {
             p.destroy(device);
         }
+        for t in &self.textures {
+            t.destroy(device);
+        }
         if let Some(s) = self.sampler {
+            device.destroy_sampler(s, None);
+        }
+        if let Some(s) = self.texture_sampler {
             device.destroy_sampler(s, None);
         }
         if let Some(p) = self.descriptor_pool {
@@ -2426,6 +2771,10 @@ fn resolve_channel_view(
             // Earlier buffer → current frame; self or later → previous frame.
             view(pp, j >= order_index)
         }
+        ChannelSource::Texture(t) => {
+            let tex = graph.textures.get(t).context("texture channel index out of range")?;
+            Ok(tex.view)
+        }
     }
 }
 
@@ -2442,11 +2791,17 @@ fn update_pass_channels(
     if pass.channels.is_empty() {
         return Ok(());
     }
-    let sampler = graph.sampler.context("channels without a sampler")?;
     let set = pass.channel_sets[slot];
     let mut infos: Vec<vk::DescriptorImageInfo> = Vec::with_capacity(pass.channels.len());
     for c in &pass.channels {
         let view = resolve_channel_view(graph, pass, c, order_index)?;
+        // Textures get the repeat sampler; buffers/feedback the clamp one.
+        let sampler = match c.source {
+            ChannelSource::Texture(_) => graph
+                .texture_sampler
+                .context("texture channel without a texture sampler")?,
+            _ => graph.sampler.context("buffer channel without a sampler")?,
+        };
         infos.push(
             vk::DescriptorImageInfo::default()
                 .sampler(sampler)
@@ -2523,7 +2878,7 @@ mod tests {
         let mods = gpu.renderable_modifiers();
         let rt = RenderTarget::new(gpu, 320, 200, &mods).expect("render target");
         let spec = shadergraph::parse(DEFAULT_FRAGMENT_GLSL).expect("parse");
-        let renderer = ShaderRenderer::new(gpu, &spec, 1).expect("renderer");
+        let renderer = ShaderRenderer::new(gpu, &spec, &[], 1).expect("renderer");
         let fb = renderer.create_framebuffer(&rt).expect("framebuffer");
         let uniforms = ShaderUniforms {
             resolution: [rt.width as f32, rt.height as f32],
@@ -2577,7 +2932,7 @@ void main() {
         let mods = gpu.renderable_modifiers();
         let rt = RenderTarget::new(gpu, 320, 200, &mods).expect("render target");
         let spec = shadergraph::parse(FEEDBACK_GLSL).expect("parse");
-        let mut renderer = ShaderRenderer::new(gpu, &spec, 2).expect("renderer");
+        let mut renderer = ShaderRenderer::new(gpu, &spec, &[], 2).expect("renderer");
         renderer
             .resize(gpu, rt.width, rt.height)
             .expect("feedback textures");
@@ -2672,7 +3027,7 @@ void main() {
         let rt = RenderTarget::new(gpu, 320, 200, &mods).expect("render target");
         let spec = shadergraph::parse(MULTI_GLSL).expect("parse");
         assert_eq!(spec.buffers.len(), 2);
-        let mut renderer = ShaderRenderer::new(gpu, &spec, 2).expect("renderer");
+        let mut renderer = ShaderRenderer::new(gpu, &spec, &[], 2).expect("renderer");
         renderer
             .resize(gpu, rt.width, rt.height)
             .expect("buffer textures");
@@ -2703,6 +3058,73 @@ void main() {
         }
         // SAFETY: fb came from this renderer; work is drained above.
         unsafe {
+            gpu.device.destroy_framebuffer(fb, None);
+        }
+    }
+
+    /// Build a plain-body shader with a static texture channel, upload a small
+    /// texture, and render a frame sampling it. Exercises the texture upload
+    /// (staging copy + layout transitions), the texture sampler, and the
+    /// `ChannelSource::Texture` descriptor wiring. Run with
+    /// PRISM_BG_VK_VALIDATION=1 to surface validation errors.
+    #[test]
+    #[ignore]
+    fn render_texture() {
+        // A single-pass shader (no //!pass sections) that samples one texture.
+        const TEX_GLSL: &str = r#"/*!prism
+{ "textures": { "tex": "ignored-in-test.png" }, "channels": { "image": {"0": "tex"} } }
+*/
+#version 450
+layout(location = 0) in vec2 fragCoord;
+layout(location = 0) out vec4 outColor;
+layout(push_constant) uniform Push { vec2 iResolution; float iTime; float _pad;
+    vec2 iOutputOffset; vec2 iOutputSize; vec2 iGlobalResolution; } pc;
+layout(set = 1, binding = 0) uniform sampler2D iChannel0;
+void main() {
+    vec2 uv = fragCoord / pc.iResolution;
+    outColor = vec4(texture(iChannel0, uv).rgb, 1.0);
+}
+"#;
+        let mut pool = GpuPool::new().expect("Vulkan bring-up failed");
+        let gpu = pool.any().expect("no usable device");
+        let mods = gpu.renderable_modifiers();
+        let rt = RenderTarget::new(gpu, 320, 200, &mods).expect("render target");
+        let spec = shadergraph::parse(TEX_GLSL).expect("parse");
+        assert_eq!(spec.textures.len(), 1);
+        // A 2×2 sRGB checker; uploaded directly (the metadata path is ignored
+        // here — the renderer takes pixel data, not a file).
+        let tex = TextureData {
+            width: 2,
+            height: 2,
+            rgba_srgb: vec![
+                255, 0, 0, 255, 0, 255, 0, 255, // red, green
+                0, 0, 255, 255, 255, 255, 0, 255, // blue, yellow
+            ],
+        };
+        let renderer = ShaderRenderer::new(gpu, &spec, std::slice::from_ref(&tex), 1)
+            .expect("renderer");
+        let fb = renderer.create_framebuffer(&rt).expect("framebuffer");
+        let uniforms = ShaderUniforms {
+            resolution: [rt.width as f32, rt.height as f32],
+            time: 0.0,
+            _pad: 0.0,
+            output_offset: [0.0, 0.0],
+            output_size: [rt.width as f32, rt.height as f32],
+            global_resolution: [rt.width as f32, rt.height as f32],
+            ref_white: 203.0,
+            max_lum: 203.0,
+            mouse: [0.0; 4],
+            date: [0.0; 4],
+            time_delta: 0.0,
+            frame: 0,
+        };
+        let audio = <AudioUniforms as bytemuck::Zeroable>::zeroed();
+        renderer
+            .render(0, &rt, fb, &uniforms, &audio)
+            .expect("render texture frame");
+        // SAFETY: fb came from this renderer; drain the submission before free.
+        unsafe {
+            let _ = gpu.device.device_wait_idle();
             gpu.device.destroy_framebuffer(fb, None);
         }
     }

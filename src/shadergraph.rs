@@ -33,6 +33,17 @@ pub enum ChannelSource {
     Buffer(usize),
     /// The owning buffer's own previous frame (feedback).
     SelfPrev,
+    /// A static uploaded image. Index into [`GraphSpec::textures`].
+    Texture(usize),
+}
+
+/// A static image channel declared in the metadata `textures` map: a name (for
+/// routing) and a path as written (resolved relative to the `.frag` file by the
+/// loader, not here — the parser stays filesystem-agnostic for testability).
+#[derive(Debug, Clone)]
+pub struct TextureSpec {
+    pub name: String,
+    pub path: String,
 }
 
 /// One input channel binding: which `iChannelN` and what it samples.
@@ -68,6 +79,9 @@ pub enum ImageSpec {
 pub struct GraphSpec {
     /// Offscreen buffer passes, in render order (empty for a plain shader).
     pub buffers: Vec<PassSpec>,
+    /// Static image channels, indexed by [`ChannelSource::Texture`]. Empty
+    /// unless the metadata declares a `textures` map.
+    pub textures: Vec<TextureSpec>,
     pub image: ImageSpec,
 }
 
@@ -87,6 +101,10 @@ struct RawMeta {
     /// `pass name → (channel index string → source string)`.
     #[serde(default)]
     channels: HashMap<String, HashMap<String, String>>,
+    /// `texture name → path` (path resolved relative to the `.frag` by the
+    /// loader). A channel routes to a texture by naming it, same as a buffer.
+    #[serde(default)]
+    textures: HashMap<String, String>,
 }
 
 /// Parse `source` into a [`GraphSpec`]. Authoring-level detection (plain /
@@ -107,12 +125,14 @@ pub fn parse(source: &str) -> Result<GraphSpec> {
                     source: ChannelSource::SelfPrev,
                 }],
             }],
+            textures: Vec::new(),
             image: ImageSpec::ImplicitBlit(0),
         });
     }
     // Plain single pass.
     Ok(GraphSpec {
         buffers: Vec::new(),
+        textures: Vec::new(),
         image: ImageSpec::Explicit(PassSpec {
             name: "image".into(),
             glsl: source.to_string(),
@@ -158,6 +178,26 @@ fn parse_multipass(source: &str, meta_json: &str) -> Result<GraphSpec> {
         }
     }
 
+    // Textures, in name order so the index is deterministic (routing is by name,
+    // so order is internal only). A name can't be both a buffer and a texture.
+    let mut texture_names: Vec<&str> = meta.textures.keys().map(String::as_str).collect();
+    texture_names.sort_unstable();
+    let mut texture_of: HashMap<&str, usize> = HashMap::new();
+    let mut textures = Vec::with_capacity(texture_names.len());
+    for (i, name) in texture_names.iter().enumerate() {
+        if *name == "image" || *name == "common" || *name == "self" {
+            bail!("texture name {name:?} is reserved");
+        }
+        if index_of.contains_key(name) {
+            bail!("name {name:?} is declared as both a buffer and a texture");
+        }
+        texture_of.insert(name, i);
+        textures.push(TextureSpec {
+            name: (*name).to_string(),
+            path: meta.textures[*name].clone(),
+        });
+    }
+
     let resolve = |pass: &str, is_image: bool| -> Result<Vec<Channel>> {
         let Some(routes) = meta.channels.get(pass) else {
             return Ok(Vec::new());
@@ -177,8 +217,10 @@ fn parse_multipass(source: &str, meta_json: &str) -> Result<GraphSpec> {
                 ChannelSource::SelfPrev
             } else if let Some(&j) = index_of.get(src.as_str()) {
                 ChannelSource::Buffer(j)
+            } else if let Some(&t) = texture_of.get(src.as_str()) {
+                ChannelSource::Texture(t)
             } else {
-                bail!("pass {pass:?}: channel {index} references unknown buffer {src:?}");
+                bail!("pass {pass:?}: channel {index} references unknown buffer/texture {src:?}");
             };
             channels.push(Channel { index, source });
         }
@@ -186,6 +228,24 @@ fn parse_multipass(source: &str, meta_json: &str) -> Result<GraphSpec> {
         channels.sort_by_key(|c| c.index);
         Ok(channels)
     };
+
+    // A metadata block with no `//!pass` sections is a plain single-pass shader
+    // that just wants textures: the whole source is the image pass. (Buffers
+    // need sections, so they're disallowed in this shorthand.)
+    if sections.is_empty() {
+        if !meta.buffers.is_empty() {
+            bail!("metadata declares buffers but the shader has no //!pass sections");
+        }
+        return Ok(GraphSpec {
+            buffers: Vec::new(),
+            textures,
+            image: ImageSpec::Explicit(PassSpec {
+                name: "image".into(),
+                glsl: source.to_string(),
+                channels: resolve("image", true)?,
+            }),
+        });
+    }
 
     let mut buffers = Vec::with_capacity(meta.buffers.len());
     for name in &meta.buffers {
@@ -208,7 +268,11 @@ fn parse_multipass(source: &str, meta_json: &str) -> Result<GraphSpec> {
         channels: resolve("image", true)?,
     });
 
-    Ok(GraphSpec { buffers, image })
+    Ok(GraphSpec {
+        buffers,
+        textures,
+        image,
+    })
 }
 
 /// Prepend shared `//!common` code (after the first `#version` line, which must
@@ -355,6 +419,71 @@ void main(){}
 { "buffers": ["a"], "channels": { "a": {"0": "ghost"} } }
 */
 //!pass a
+#version 450
+void main(){}
+//!pass image
+#version 450
+void main(){}
+"#;
+        assert!(parse(src).is_err());
+    }
+
+    #[test]
+    fn texture_channel_resolves_with_plain_body() {
+        // No //!pass sections: the whole source is the image pass, and the
+        // channel routes to the declared texture.
+        let src = r#"/*!prism
+{ "textures": { "noise": "noise.png" }, "channels": { "image": {"0": "noise"} } }
+*/
+#version 450
+void main(){}
+"#;
+        let g = parse(src).unwrap();
+        assert!(g.buffers.is_empty());
+        assert_eq!(g.textures.len(), 1);
+        assert_eq!(g.textures[0].name, "noise");
+        assert_eq!(g.textures[0].path, "noise.png");
+        match &g.image {
+            ImageSpec::Explicit(p) => {
+                assert_eq!(p.channels.len(), 1);
+                assert_eq!(p.channels[0].source, ChannelSource::Texture(0));
+            }
+            _ => panic!("expected explicit image pass"),
+        }
+    }
+
+    #[test]
+    fn buffers_and_textures_share_a_channel_namespace() {
+        let src = r#"/*!prism
+{ "buffers": ["sim"],
+  "textures": { "noise": "n.png" },
+  "channels": { "sim": {"0": "noise"}, "image": {"0": "sim", "1": "noise"} } }
+*/
+//!pass sim
+#version 450
+void main(){}
+//!pass image
+#version 450
+void main(){}
+"#;
+        let g = parse(src).unwrap();
+        assert_eq!(g.buffers[0].channels[0].source, ChannelSource::Texture(0));
+        match &g.image {
+            ImageSpec::Explicit(p) => {
+                assert_eq!(p.channels[0].source, ChannelSource::Buffer(0));
+                assert_eq!(p.channels[1].source, ChannelSource::Texture(0));
+            }
+            _ => panic!("expected explicit image pass"),
+        }
+    }
+
+    #[test]
+    fn name_used_as_both_buffer_and_texture_is_rejected() {
+        let src = r#"/*!prism
+{ "buffers": ["x"], "textures": { "x": "x.png" },
+  "channels": { "image": {"0": "x"} } }
+*/
+//!pass x
 #version 450
 void main(){}
 //!pass image

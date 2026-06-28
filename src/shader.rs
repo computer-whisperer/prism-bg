@@ -45,7 +45,8 @@ use crate::cli::Intent;
 use crate::color::{ColorEncoding, PrimaryVolume, Tf};
 use crate::colormgmt::{ColorState, DescriptionHandle, Status};
 use crate::gpu::{
-    AudioUniforms, Gpu, RenderTarget, ShaderRenderer, ShaderUniforms, RENDER_DRM_FOURCC,
+    AudioUniforms, Gpu, RenderTarget, ShaderRenderer, ShaderUniforms, TextureData,
+    RENDER_DRM_FOURCC,
 };
 
 /// Number of dmabuf targets cycled per surface. Three lets the GPU render
@@ -322,6 +323,25 @@ fn local_date() -> [f32; 4] {
     ]
 }
 
+/// Decode a static image channel into 8-bit sRGB RGBA for upload. Path is
+/// resolved relative to the `.frag` file's directory. The image is re-encoded to
+/// sRGB so the GPU's `R8G8B8A8_SRGB` sampler linearizes it on read (HDR/wide-gamut
+/// sources are flattened to sRGB — texture color management is a later refinement).
+fn load_texture(base_dir: &std::path::Path, tex: &crate::shadergraph::TextureSpec) -> Result<TextureData> {
+    let path = base_dir.join(&tex.path);
+    let decoded = crate::decode::load(&path)
+        .with_context(|| format!("loading texture {:?} ({})", tex.name, path.display()))?;
+    let srgb = decoded.quantized_to_8bit(crate::color::Tf::Srgb);
+    let crate::decode::Pixels::Rgba8(rgba_srgb) = srgb.pixels else {
+        bail!("texture {:?}: expected 8-bit pixels after sRGB quantization", tex.name);
+    };
+    Ok(TextureData {
+        width: srgb.width,
+        height: srgb.height,
+        rgba_srgb,
+    })
+}
+
 /// A copy of shader source with comments and the `push_constant` block removed,
 /// so a substring scan detects USES of a uniform (`pc.iTime`) rather than its
 /// mandatory positional declaration (`float iTime;`). The push block is
@@ -399,6 +419,9 @@ pub struct ShaderSurface {
     /// The shader resolved into its render graph; compiled per GPU into a
     /// `DeviceState`.
     spec: crate::shadergraph::GraphSpec,
+    /// Decoded static image channels (8-bit sRGB), in `spec.textures` order.
+    /// Loaded once on the CPU; each [`DeviceState`] uploads its own copy.
+    textures: Vec<TextureData>,
     /// Whether the shader needs continuous redraw (self-advancing inputs:
     /// `iTime`/`iTimeDelta`, `iFrame`, `iDate`, audio, or buffers). Drives
     /// frame-callback animation; a static shader renders once.
@@ -443,6 +466,7 @@ impl ShaderSurface {
     pub fn new(
         qh: &QueueHandle<App>,
         fragment_glsl: &str,
+        base_dir: &std::path::Path,
         color: Option<&ColorState>,
         fps: Option<u32>,
     ) -> Result<ShaderSurface> {
@@ -451,6 +475,13 @@ impl ShaderSurface {
         // fails at startup rather than silently on the GPU.
         let spec = crate::shadergraph::parse(fragment_glsl)?;
         crate::gpu::validate_graph(&spec)?;
+        // Decode any static image channels now (paths are relative to the .frag),
+        // so a missing/bad texture fails at startup, not on the GPU.
+        let textures = spec
+            .textures
+            .iter()
+            .map(|t| load_texture(base_dir, t))
+            .collect::<Result<Vec<_>>>()?;
         // Feature detection scans for USES, not declarations: the push block is
         // positional, so a shader that reads any late field must declare every
         // field before it — scanning the raw source would flag e.g. every iMouse
@@ -496,6 +527,7 @@ impl ShaderSurface {
         };
         Ok(ShaderSurface {
             spec,
+            textures,
             animated,
             uses_audio,
             uses_mouse,
@@ -644,7 +676,7 @@ impl ShaderSurface {
             self.state = Some(DeviceState {
                 device_dev,
                 device: gpu.device.clone(),
-                renderer: ShaderRenderer::new(gpu, &self.spec, RING)?,
+                renderer: ShaderRenderer::new(gpu, &self.spec, &self.textures, RING)?,
                 ring: Vec::new(),
                 size: (0, 0),
             });
@@ -969,6 +1001,20 @@ mod tests {
 
     // Qualifier variants (`std430`, extra whitespace) must still be stripped, or
     // a declared-but-unused field leaks back into the scan.
+    // Exercises the full texture-load path (relative-path join + decode + sRGB
+    // quantize) on the real example asset, without a GPU.
+    #[test]
+    fn loads_example_noise_texture() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/shaders");
+        let tex = crate::shadergraph::TextureSpec {
+            name: "noise".into(),
+            path: "../textures/rgba-noise.png".into(),
+        };
+        let data = super::load_texture(&base, &tex).expect("load example noise texture");
+        assert_eq!((data.width, data.height), (256, 256));
+        assert_eq!(data.rgba_srgb.len(), 256 * 256 * 4);
+    }
+
     #[test]
     fn push_constant_qualifier_variants_are_stripped() {
         for layout in [

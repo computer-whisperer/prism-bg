@@ -514,7 +514,9 @@ impl App {
     ) -> Result<ShaderSurface> {
         let source = std::fs::read_to_string(path)
             .with_context(|| format!("reading shader {}", path.display()))?;
-        ShaderSurface::new(qh, &source, self.color.as_ref(), fps)
+        // Texture channel paths resolve relative to the .frag file's directory.
+        let base_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        ShaderSurface::new(qh, &source, base_dir, self.color.as_ref(), fps)
     }
 
     /// Feed a dmabuf-feedback event to the named output's shader surface and
