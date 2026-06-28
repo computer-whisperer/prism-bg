@@ -15,9 +15,12 @@
 //! and are rebuilt if the output moves to a different GPU.
 //!
 //! Animation is driven by frame callbacks (vsync-paced, paused when the
-//! surface is occluded); a shader that uses neither `iTime` nor the audio
-//! uniforms renders once. Audio-reactive shaders count as animated so they
-//! keep redrawing to track the spectrum.
+//! surface is occluded). A shader renders once unless it *uses* a
+//! self-advancing input — `iTime`/`iTimeDelta`, `iFrame`, `iDate`, the audio
+//! uniforms, or evolving buffers — in which case it keeps redrawing. Detection
+//! scans uses, not the mandatory positional declarations (see
+//! [`usage_scan_source`]). `iMouse` is event-driven, not self-advancing: a
+//! static mouse shader repaints only on pointer input.
 
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -293,11 +296,112 @@ impl PointerState {
     }
 }
 
+/// Current local wall-clock as the Shadertoy `iDate` vec4: `(year, month
+/// [0-11], day-of-month, seconds-since-midnight)`, the last component fractional
+/// for a smooth sweep. Goes through `localtime_r`, so it honors the system
+/// timezone (Shadertoy's `iDate` is local, not UTC).
+fn local_date() -> [f32; 4] {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs() as libc::time_t;
+    let frac = now.subsec_nanos() as f32 / 1.0e9;
+    // SAFETY: `localtime_r` is the reentrant variant (touches no shared static);
+    // it reads `secs` and writes a fully-initialized `tm` into our stack slot.
+    // On failure it returns null and leaves `tm` zeroed (date reads as epoch),
+    // which is a harmless degradation for a wallpaper clock.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::localtime_r(&secs, &mut tm);
+    }
+    [
+        (tm.tm_year + 1900) as f32,
+        tm.tm_mon as f32,
+        tm.tm_mday as f32,
+        (tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec) as f32 + frac,
+    ]
+}
+
+/// A copy of shader source with comments and the `push_constant` block removed,
+/// so a substring scan detects USES of a uniform (`pc.iTime`) rather than its
+/// mandatory positional declaration (`float iTime;`). The push block is
+/// positional — to read a late field a shader must declare every field before
+/// it — so scanning raw source would flag e.g. every `iMouse` shader as
+/// animated just for declaring `iTime`. Used only for feature detection; the
+/// stripped text is never compiled.
+pub(crate) fn usage_scan_source(source: &str) -> String {
+    strip_push_blocks(&strip_comments(source))
+}
+
+/// Remove `//` line and `/* */` block comments (delimiters are ASCII, so byte
+/// scanning never splits a multibyte char). Also drops `//!pass`/`//!common`
+/// directives, which is fine — only substring detection reads the result.
+fn strip_comments(source: &str) -> String {
+    let b = source.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'/' && b.get(i + 1) == Some(&b'/') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Remove each `layout(push_constant …) uniform … { … }` block, leaving only
+/// the surrounding `layout(` / instance name (neither carries field names).
+/// Brace-matched so it stops at the block's close. Keys on the `push_constant`
+/// token, not the exact `layout(push_constant)` spelling, so qualifier variants
+/// like `layout(push_constant, std430)` or `layout( push_constant )` are caught.
+fn strip_push_blocks(source: &str) -> String {
+    let mut out = source.to_string();
+    while let Some(start) = out.find("push_constant") {
+        let Some(rel_open) = out[start..].find('{') else {
+            break; // malformed; the real compile will report it
+        };
+        let open = start + rel_open;
+        let bytes = out.as_bytes();
+        let mut depth = 0i32;
+        let mut close = None;
+        for (i, &c) in bytes.iter().enumerate().skip(open) {
+            match c {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match close {
+            Some(end) => out.replace_range(start..=end, " "),
+            None => break, // unbalanced; leave it (won't compile anyway)
+        }
+    }
+    out
+}
+
 pub struct ShaderSurface {
     /// The shader resolved into its render graph; compiled per GPU into a
     /// `DeviceState`.
     spec: crate::shadergraph::GraphSpec,
-    /// Whether the shader samples `iTime` (drives frame-callback animation).
+    /// Whether the shader needs continuous redraw (self-advancing inputs:
+    /// `iTime`/`iTimeDelta`, `iFrame`, `iDate`, audio, or buffers). Drives
+    /// frame-callback animation; a static shader renders once.
     animated: bool,
     /// Whether the shader references the audio uniforms (`iAudio*`); if any
     /// surface does, the app spins up the PipeWire capture.
@@ -311,6 +415,11 @@ pub struct ShaderSurface {
     ptr: PointerState,
     /// iTime origin, set on the first rendered frame.
     started: Option<Instant>,
+    /// `iTime` of the previous rendered frame, for `iTimeDelta`; `None` until
+    /// the first frame.
+    last_time: Option<f32>,
+    /// Frames rendered so far (`iFrame`); `0` on the first frame.
+    frame_count: i32,
     /// `--fps` cap as a minimum interval between renders; `None` is uncapped
     /// (vsync). Only throttles animated shaders.
     min_interval: Option<Duration>,
@@ -342,18 +451,30 @@ impl ShaderSurface {
         // fails at startup rather than silently on the GPU.
         let spec = crate::shadergraph::parse(fragment_glsl)?;
         crate::gpu::validate_graph(&spec)?;
-        let uses_audio = fragment_glsl.contains("iAudio");
+        // Feature detection scans for USES, not declarations: the push block is
+        // positional, so a shader that reads any late field must declare every
+        // field before it — scanning the raw source would flag e.g. every iMouse
+        // shader as "uses iTime" merely for the mandatory `float iTime;`. The
+        // scan copy has comments and the push block stripped, leaving only
+        // accesses like `pc.iTime`. See [`usage_scan_source`].
+        let scan = usage_scan_source(fragment_glsl);
+        let uses_audio = scan.contains("iAudio");
         // A shader that reads iMouse becomes pointer-interactive: the app binds
         // a seat pointer and routes events to it. It does *not* make the shader
         // animated — a static mouse shader renders once and then only on
         // pointer events (repaint-on-motion), staying off the frame-callback
         // treadmill when idle.
-        let uses_mouse = fragment_glsl.contains("iMouse");
-        // Multi-pass / feedback shaders evolve their buffers, so they must
-        // redraw every frame and count as animated even without `iTime`; so do
-        // audio-reactive shaders (to track the spectrum).
-        let animated =
-            fragment_glsl.contains("iTime") || uses_audio || spec.has_buffers();
+        let uses_mouse = scan.contains("iMouse");
+        // Anything that advances on its own — iTime/iTimeDelta (the latter
+        // contains "iTime"), the per-frame counter iFrame, the wall clock iDate,
+        // audio, or evolving buffers — needs continuous redraw to progress.
+        // (iMouse is deliberately *not* here: it is event-driven, so a static
+        // mouse shader repaints only on pointer input.)
+        let animated = scan.contains("iTime")
+            || scan.contains("iFrame")
+            || scan.contains("iDate")
+            || uses_audio
+            || spec.has_buffers();
         if fps.is_some() && !animated {
             tracing::warn!("--fps ignored: shader is static (no iTime), renders a single frame");
         }
@@ -379,6 +500,8 @@ impl ShaderSurface {
             uses_audio,
             uses_mouse,
             ptr: PointerState::default(),
+            last_time: None,
+            frame_count: 0,
             started: None,
             min_interval,
             last_render: None,
@@ -554,6 +677,8 @@ impl ShaderSurface {
                 0.0
             }
         };
+        // Wall-clock seconds since the previous rendered frame (0 on the first).
+        let time_delta = self.last_time.map_or(0.0, |prev| (time - prev).max(0.0));
         let mouse = self.ptr.uniform(size, logical);
         // The "clicked this frame" bit is one-shot: clear it now that this
         // render has captured it, so the next frame sees sign(iMouse.w) < 0.
@@ -568,11 +693,17 @@ impl ShaderSurface {
             ref_white: lum.0,
             max_lum: lum.1,
             mouse,
+            date: local_date(),
+            time_delta,
+            frame: self.frame_count,
         };
         let rt = &st.ring[idx];
         st.renderer
             .render(idx, &rt.target, rt.framebuffer, &uniforms, audio)
             .context("rendering shader frame")?;
+        // Advance the per-frame counters now the render is committed to.
+        self.last_time = Some(time);
+        self.frame_count = self.frame_count.wrapping_add(1);
         rt.available.store(false, Ordering::Release);
         surface.attach(Some(&rt.buffer), 0, 0);
         self.last_render = Some(Instant::now());
@@ -788,6 +919,67 @@ impl Dispatch<WlBuffer, Arc<AtomicBool>> for App {
         // The compositor is done with this buffer; free it for reuse.
         if matches!(event, wayland_client::protocol::wl_buffer::Event::Release) {
             available.store(true, Ordering::Release);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::usage_scan_source;
+
+    // The push block is positional, so an iMouse shader must declare `iTime` to
+    // reach iMouse — that declaration must not read as a *use* (else the shader
+    // would be wrongly flagged animated).
+    #[test]
+    fn declaration_is_not_a_use() {
+        let src = r#"
+            layout(push_constant) uniform Push {
+                vec2 iResolution;
+                float iTime;
+                float _pad;
+                vec4 iMouse;
+            } pc;
+            void main() { vec2 m = pc.iMouse.xy; }
+        "#;
+        let scan = usage_scan_source(src);
+        assert!(!scan.contains("iTime"), "declaration-only iTime must not scan as a use");
+        assert!(scan.contains("iMouse"), "pc.iMouse access must scan as a use");
+    }
+
+    #[test]
+    fn line_comment_mention_is_not_a_use() {
+        let src = "// animate using iTime\nvoid main() {}";
+        assert!(!usage_scan_source(src).contains("iTime"));
+    }
+
+    #[test]
+    fn block_comment_mention_is_not_a_use() {
+        let src = "/* an iDate clock idea */ void main() { int f = pc.iFrame; }";
+        let scan = usage_scan_source(src);
+        assert!(!scan.contains("iDate"), "iDate only in a comment must not scan");
+        assert!(scan.contains("iFrame"), "pc.iFrame access must scan");
+    }
+
+    #[test]
+    fn access_through_block_instance_scans() {
+        let src = "layout(push_constant) uniform P { float iTime; } pc; \
+                   void main() { float t = pc.iTime; }";
+        assert!(usage_scan_source(src).contains("iTime"));
+    }
+
+    // Qualifier variants (`std430`, extra whitespace) must still be stripped, or
+    // a declared-but-unused field leaks back into the scan.
+    #[test]
+    fn push_constant_qualifier_variants_are_stripped() {
+        for layout in [
+            "layout(push_constant, std430)",
+            "layout(std430, push_constant)",
+            "layout( push_constant )",
+        ] {
+            let src = format!("{layout} uniform P {{ float iTime; vec4 iMouse; }} pc; void main() {{}}");
+            let scan = usage_scan_source(&src);
+            assert!(!scan.contains("iTime"), "{layout}: declaration leaked");
+            assert!(!scan.contains("iMouse"), "{layout}: declaration leaked");
         }
     }
 }

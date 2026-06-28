@@ -902,9 +902,10 @@ fn rebuild_pingpong(
 /// shader can tile continuously across the whole workspace — see the `Push`
 /// block documented in the module. They are y-up logical pixels with the
 /// origin at the cluster's bottom-left, matching the y-up `fragCoord` the
-/// vertex stage emits. Layout (std430): every field is `vec2`/`float`/`vec4`,
-/// each landing on its natural alignment (the trailing `vec4` at offset 48 is
-/// 16-aligned), so the `repr(C)` order matches the GLSL block with no padding.
+/// vertex stage emits. Layout (std430): every field is `vec2`/`float`/`int`/
+/// `vec4`, each landing on its natural alignment (the two `vec4`s at offsets 48
+/// and 64 are 16-aligned), so the `repr(C)` order matches the GLSL block with no
+/// padding. Total 88 bytes — within the 128-byte guaranteed push-constant range.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ShaderUniforms {
@@ -942,6 +943,17 @@ pub struct ShaderUniforms {
     /// zero until the first click. Only meaningful for surfaces whose shader
     /// references `iMouse` (which are made pointer-interactive); zero otherwise.
     pub mouse: [f32; 4],
+    /// Local wall-clock date (`iDate`): `(year, month [0-11], day-of-month,
+    /// seconds-since-midnight)`, the last component fractional for a smooth
+    /// sweep. Ordered first of the trailing scalars so the `vec4` lands on its
+    /// 16-aligned std430 offset (64) with no padding.
+    pub date: [f32; 4],
+    /// Seconds since the previous rendered frame (`iTimeDelta`); `0.0` on the
+    /// first frame. Wall-clock between actual renders, so for a static shader
+    /// driven only by pointer events it is the gap between those events.
+    pub time_delta: f32,
+    /// Frames rendered since start (`iFrame`), `0` on the first frame.
+    pub frame: i32,
 }
 
 /// Number of spectrum bins handed to audio-reactive shaders (log-spaced,
@@ -2523,6 +2535,9 @@ mod tests {
             ref_white: 203.0,
             max_lum: 203.0,
             mouse: [0.0; 4],
+            date: [0.0; 4],
+            time_delta: 0.0,
+            frame: 0,
         };
         // Exercises the sync_file export + dmabuf import attach on this GPU,
         // plus the spectrum UBO upload + descriptor bind.
@@ -2577,6 +2592,9 @@ void main() {
             ref_white: 203.0,
             max_lum: 203.0,
             mouse: [0.0; 4],
+            date: [0.0; 4],
+            time_delta: 0.0,
+            frame: 0,
         };
         let audio = <AudioUniforms as bytemuck::Zeroable>::zeroed();
         // Two frames: the second samples the first via iPrevFrame (parity flip).
@@ -2669,6 +2687,9 @@ void main() {
             ref_white: 203.0,
             max_lum: 203.0,
             mouse: [0.0; 4],
+            date: [0.0; 4],
+            time_delta: 0.0,
+            frame: 0,
         };
         let audio = <AudioUniforms as bytemuck::Zeroable>::zeroed();
         for slot in 0..2 {

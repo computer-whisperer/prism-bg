@@ -306,11 +306,12 @@ impl App {
         // startup-only read) so the seat's pointer is created — and surfaces get
         // the right input region — before the first output is added. A read
         // failure here just defers to the real error when the shader is built.
-        let wants_mouse = args
-            .specs
-            .iter()
-            .filter_map(|s| s.shader.as_ref())
-            .any(|p| std::fs::read_to_string(p).is_ok_and(|src| src.contains("iMouse")));
+        // Same usage scan as the per-surface detection, so a shader that merely
+        // *declares* iMouse to reach a later field (iDate/iFrame) doesn't count.
+        let wants_mouse = args.specs.iter().filter_map(|s| s.shader.as_ref()).any(|p| {
+            std::fs::read_to_string(p)
+                .is_ok_and(|src| crate::shader::usage_scan_source(&src).contains("iMouse"))
+        });
         if wants_mouse {
             tracing::info!("a shader uses iMouse; binding seat pointer for interactivity");
         }

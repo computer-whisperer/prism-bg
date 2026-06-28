@@ -101,6 +101,9 @@ Extras beyond swaybg (also per-output-group):
       float iRefWhite;         // cd/m²: output value 1.0 = diffuse white
       float iMaxLum;           // cd/m²: peak luminance to master against
       vec4 iMouse;             // xy: cursor (while held); zw: click pos (sign = state)
+      vec4 iDate;              // local (year, month 0-11, day, seconds-since-midnight)
+      float iTimeDelta;        // seconds since the previous frame (0 on the first)
+      int iFrame;              // frames rendered since start (0 on the first)
   } pc;
   ```
 
@@ -144,6 +147,13 @@ Extras beyond swaybg (also per-output-group):
   press happened this frame. All four are zero until the first click. Only
   shaders that reference `iMouse` receive input; every other wallpaper stays
   click-through. See `examples/shaders/pointer.frag`.
+
+  **Timing and date (`iTimeDelta` / `iFrame` / `iDate`).** `iTimeDelta` is the
+  wall-clock seconds since the previous rendered frame (for frame-rate-independent
+  integration), `iFrame` the frame counter since start, and `iDate` the local
+  wall clock as `(year, month 0-11, day, seconds-since-midnight)` with a
+  fractional seconds component — enough for a clock wallpaper. See
+  `examples/shaders/clock.frag`.
 
   A shader can also be **audio-reactive**: reference any of the audio uniforms
   and prism-bg captures the default sink's output over PipeWire, runs an FFT,
