@@ -18,7 +18,6 @@ mod gpu;
 mod playlist;
 mod shader;
 mod shadergraph;
-mod surfaces;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -145,14 +144,7 @@ fn main() -> Result<()> {
     // Created before App: fades insert their ticker via the loop handle.
     let mut event_loop: EventLoop<App> = EventLoop::try_new().context("creating event loop")?;
 
-    let mut app = App::new(
-        &globals,
-        &qh,
-        &args,
-        raw_images,
-        playlists,
-        event_loop.handle(),
-    )?;
+    let mut app = App::new(&globals, &qh, &args, raw_images, playlists)?;
 
     // Setup roundtrips: output enumeration, wl_shm formats, and the color
     // manager's supported_* events (terminated by done). Image treatment

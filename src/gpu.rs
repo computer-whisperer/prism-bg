@@ -24,6 +24,8 @@ use std::collections::HashMap;
 use std::ffi::{c_char, CStr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
+use half::f16;
+
 use anyhow::{bail, Context, Result};
 use ash::vk;
 
@@ -708,31 +710,64 @@ fn create_buffer_image(gpu: &Gpu, device: &ash::Device, w: u32, h: u32) -> Resul
     })
 }
 
-/// CPU-side pixels for a static image channel: tightly-packed 8-bit RGBA
-/// (`width*height*4` bytes), sRGB-encoded as stored. Decoded once by the shader
-/// surface, then uploaded to a sampled image on each GPU that renders the shader.
+/// CPU-side pixels for a texture channel, ready to upload to a sampled
+/// image. Decoded/converted once by the surface, then uploaded to each GPU
+/// that renders it.
 pub struct TextureData {
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
-    /// Upload as sRGB (sampler linearizes on read) for color images; raw
-    /// `UNORM` (Shadertoy-style, no linearization) otherwise — the default.
-    pub srgb: bool,
+    pub pixels: TexturePixels,
 }
 
-/// Upload `data` to a sampled image on `gpu` — `R8G8B8A8_SRGB` (sampler
-/// linearizes on read) for color images or `R8G8B8A8_UNORM` (raw, Shadertoy
-/// default) otherwise, per `data.srgb`. A staging buffer + one-shot copy,
-/// awaited before returning; the image ends in `SHADER_READ_ONLY_OPTIMAL`. The
-/// returned [`BufferImage`] is freed via its `destroy` like a buffer texture.
+/// A texture's pixel payload and how the GPU should interpret it.
+pub enum TexturePixels {
+    /// Tightly-packed 8-bit RGBA. `srgb` uploads as `R8G8B8A8_SRGB` (sampler
+    /// linearizes on read, for color images) vs `R8G8B8A8_UNORM` (raw values
+    /// straight through — the Shadertoy default, for noise/data).
+    Rgba8 { data: Vec<u8>, srgb: bool },
+    /// Tightly-packed fp16 RGBA, already extended-linear in the working
+    /// space; uploaded as `R16G16B16A16_SFLOAT` and sampled verbatim (the
+    /// wallpaper-image path).
+    LinearF16(Vec<f16>),
+}
+
+impl TextureData {
+    fn format(&self) -> vk::Format {
+        match &self.pixels {
+            TexturePixels::Rgba8 { srgb: true, .. } => vk::Format::R8G8B8A8_SRGB,
+            TexturePixels::Rgba8 { srgb: false, .. } => vk::Format::R8G8B8A8_UNORM,
+            TexturePixels::LinearF16(_) => RENDER_FORMAT,
+        }
+    }
+
+    fn bytes_per_pixel(&self) -> usize {
+        match &self.pixels {
+            TexturePixels::Rgba8 { .. } => 4,
+            TexturePixels::LinearF16(_) => 4 * std::mem::size_of::<f16>(),
+        }
+    }
+
+    /// The pixel bytes in upload order. fp16 is reinterpreted as native-endian
+    /// bytes — Vulkan reads the `SFLOAT` format in host byte order, and the
+    /// only targets are little-endian.
+    fn as_bytes(&self) -> &[u8] {
+        match &self.pixels {
+            TexturePixels::Rgba8 { data, .. } => data,
+            // SAFETY: `f16` is repr(transparent) over `u16`; a tightly-packed
+            // `&[f16]` is a valid byte slice of `len * 2` bytes.
+            TexturePixels::LinearF16(d) => unsafe {
+                std::slice::from_raw_parts(d.as_ptr() as *const u8, std::mem::size_of_val(&d[..]))
+            },
+        }
+    }
+}
+
+/// Upload `data` to a sampled image on `gpu` (format per [`TextureData::format`])
+/// via a staging buffer + one-shot copy, awaited before returning; the image
+/// ends in `SHADER_READ_ONLY_OPTIMAL`. The returned [`BufferImage`] is freed
+/// via its `destroy` like a buffer texture.
 fn upload_texture(gpu: &Gpu, device: &ash::Device, data: &TextureData) -> Result<BufferImage> {
-    // sRGB format → the sampler linearizes on read (color images); UNORM → raw
-    // values straight through (Shadertoy-style, correct for noise/data).
-    let format = if data.srgb {
-        vk::Format::R8G8B8A8_SRGB
-    } else {
-        vk::Format::R8G8B8A8_UNORM
-    };
+    let format = data.format();
     let range = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
         base_mip_level: 0,
@@ -741,11 +776,12 @@ fn upload_texture(gpu: &Gpu, device: &ash::Device, data: &TextureData) -> Result
         layer_count: 1,
     };
     let (w, h) = (data.width.max(1), data.height.max(1));
-    let byte_len = w as usize * h as usize * 4;
-    if data.rgba.len() < byte_len {
+    let byte_len = w as usize * h as usize * data.bytes_per_pixel();
+    let bytes = data.as_bytes();
+    if bytes.len() < byte_len {
         bail!(
             "texture {w}x{h} needs {byte_len} bytes, got {}",
-            data.rgba.len()
+            bytes.len()
         );
     }
 
@@ -819,7 +855,7 @@ fn upload_texture(gpu: &Gpu, device: &ash::Device, data: &TextureData) -> Result
 
     // Staging buffer holding the pixels, then a one-shot copy + transitions.
     // On any failure past here, free `tex` (the finished image) too.
-    let upload = upload_into(gpu, device, &tex, &data.rgba[..byte_len], w, h, range);
+    let upload = upload_into(gpu, device, &tex, &bytes[..byte_len], w, h, range);
     if let Err(e) = upload {
         // SAFETY: tex was fully built above; free it exactly once.
         unsafe { tex.destroy(device) };
@@ -1341,6 +1377,95 @@ layout(location = 0) out vec4 outColor;
 layout(set = 1, binding = 0) uniform sampler2D feedbackTex;
 void main() { outColor = texture(feedbackTex, uv); }
 "#;
+
+/// Build a one-pass graph that presents a static image as a full-surface
+/// wallpaper: a single texture channel — the image already converted to
+/// working-space fp16 (extended-linear, sRGB primaries), supplied to the
+/// renderer separately — sampled with `mode`'s geometry and composited over
+/// `bg` (also working-space linear) where the image is translucent or
+/// doesn't cover.
+///
+/// This makes an image a degenerate shader so it rides the exact same
+/// renderer/dmabuf/tagging path: an image is just one pass with one texture.
+/// `img_w`/`img_h` are baked into the GLSL; the surface size comes from the
+/// push constant, so a resize needs no pipeline rebuild.
+pub fn image_graph(img_w: u32, img_h: u32, mode: crate::cli::Mode, bg: [f32; 3]) -> GraphSpec {
+    GraphSpec {
+        buffers: Vec::new(),
+        textures: vec![shadergraph::TextureSpec {
+            // Supplied directly to the renderer; never loaded from disk.
+            name: "wallpaper".into(),
+            path: String::new(),
+            srgb: false,
+        }],
+        image: ImageSpec::Explicit(shadergraph::PassSpec {
+            name: "image".into(),
+            glsl: image_pass_glsl(img_w.max(1), img_h.max(1), mode, bg),
+            channels: vec![shadergraph::Channel {
+                index: 0,
+                source: ChannelSource::Texture(0),
+            }],
+        }),
+    }
+}
+
+/// The fragment shader for [`image_graph`]. Each `mode` sets `uv` (texture
+/// coordinates, top-left origin) and `covered` (false only in letterbox
+/// regions); a shared tail composites the premultiplied sample over `bg` and
+/// writes opaque. `bg` is working-space linear.
+fn image_pass_glsl(img_w: u32, img_h: u32, mode: crate::cli::Mode, bg: [f32; 3]) -> String {
+    use crate::cli::Mode;
+    let bg_lit = format!("vec3({:.6}, {:.6}, {:.6})", bg[0], bg[1], bg[2]);
+    // `ndc` is the fragment in [0,1] with a top-left origin (matching the
+    // image's row order); `S` the surface size, `imageSize` the texture's.
+    let mapping = match mode {
+        // Repeat the image at native size (the REPEAT texture sampler wraps).
+        Mode::Tile => {
+            "    vec2 uv = vec2(fragCoord.x / imageSize.x, (S.y - fragCoord.y) / imageSize.y);\n\
+             \x20   bool covered = true;"
+        }
+        // Fill the surface, ignoring aspect ratio.
+        Mode::Stretch | Mode::SolidColor => "    vec2 uv = ndc;\n    bool covered = true;",
+        // Cover the surface preserving aspect (crop overflow); always covered.
+        Mode::Fill => {
+            "    vec2 r = imageSize * max(S.x / imageSize.x, S.y / imageSize.y) / S;\n\
+             \x20   vec2 uv = (ndc - 0.5) / r + 0.5;\n\
+             \x20   bool covered = true;"
+        }
+        // Fit inside preserving aspect (letterbox the remainder).
+        Mode::Fit => {
+            "    vec2 r = imageSize * min(S.x / imageSize.x, S.y / imageSize.y) / S;\n\
+             \x20   vec2 uv = (ndc - 0.5) / r + 0.5;\n\
+             \x20   bool covered = all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)));"
+        }
+        // Native pixel size, centered (crop if larger, letterbox if smaller).
+        Mode::Center => {
+            "    vec2 r = imageSize / S;\n\
+             \x20   vec2 uv = (ndc - 0.5) / r + 0.5;\n\
+             \x20   bool covered = all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)));"
+        }
+    };
+    format!(
+        "#version 450\n\
+         layout(location = 0) in vec2 fragCoord;\n\
+         layout(location = 0) out vec4 outColor;\n\
+         layout(push_constant) uniform Push {{ vec2 iResolution; float iTime; float _pad; }} pc;\n\
+         layout(set = 1, binding = 0) uniform sampler2D iChannel0;\n\
+         const vec2 imageSize = vec2({img_w}.0, {img_h}.0);\n\
+         const vec3 bgColor = {bg_lit};\n\
+         void main() {{\n\
+         \x20   vec2 S = pc.iResolution;\n\
+         \x20   vec2 ndc = vec2(fragCoord.x / S.x, 1.0 - fragCoord.y / S.y);\n\
+         {mapping}\n\
+         \x20   if (covered) {{\n\
+         \x20       vec4 t = texture(iChannel0, uv);\n\
+         \x20       outColor = vec4(t.rgb + bgColor * (1.0 - t.a), 1.0);\n\
+         \x20   }} else {{\n\
+         \x20       outColor = vec4(bgColor, 1.0);\n\
+         \x20   }}\n\
+         }}\n"
+    )
+}
 
 /// Animated gradient used as the render test subject (kept in sync with
 /// `examples/shaders/gradient.frag`). Outputs extended-linear values; the
@@ -3138,11 +3263,13 @@ void main() {
         let tex = TextureData {
             width: 2,
             height: 2,
-            rgba: vec![
-                255, 0, 0, 255, 0, 255, 0, 255, // red, green
-                0, 0, 255, 255, 255, 255, 0, 255, // blue, yellow
-            ],
-            srgb: false,
+            pixels: TexturePixels::Rgba8 {
+                data: vec![
+                    255, 0, 0, 255, 0, 255, 0, 255, // red, green
+                    0, 0, 255, 255, 255, 255, 0, 255, // blue, yellow
+                ],
+                srgb: false,
+            },
         };
         let renderer =
             ShaderRenderer::new(gpu, &spec, std::slice::from_ref(&tex), 1).expect("renderer");
@@ -3170,5 +3297,47 @@ void main() {
             let _ = gpu.device.device_wait_idle();
             gpu.device.destroy_framebuffer(fb, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod image_graph_tests {
+    use super::*;
+    use crate::cli::Mode;
+
+    #[test]
+    fn every_mode_compiles_and_routes_one_texture() {
+        for mode in [
+            Mode::Stretch,
+            Mode::Fit,
+            Mode::Fill,
+            Mode::Center,
+            Mode::Tile,
+        ] {
+            let g = image_graph(1920, 1080, mode, [0.1, 0.2, 0.3]);
+            assert!(g.buffers.is_empty(), "{mode:?}: an image is a single pass");
+            assert_eq!(g.textures.len(), 1, "{mode:?}: one wallpaper texture");
+            match &g.image {
+                ImageSpec::Explicit(p) => {
+                    assert_eq!(p.channels.len(), 1);
+                    assert_eq!(p.channels[0].source, ChannelSource::Texture(0));
+                }
+                _ => panic!("{mode:?}: image graph needs an explicit image pass"),
+            }
+            // The generated GLSL must compile to SPIR-V (device-independent).
+            validate_graph(&g).unwrap_or_else(|e| panic!("{mode:?} GLSL failed: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn fp16_texture_reports_sfloat_format() {
+        let d = TextureData {
+            width: 2,
+            height: 1,
+            pixels: TexturePixels::LinearF16(vec![f16::from_f32(1.0); 2 * 4]),
+        };
+        assert_eq!(d.format(), RENDER_FORMAT);
+        assert_eq!(d.bytes_per_pixel(), 8);
+        assert_eq!(d.as_bytes().len(), 2 * 8);
     }
 }

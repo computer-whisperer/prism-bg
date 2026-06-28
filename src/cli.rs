@@ -183,9 +183,8 @@ Usage: prism-bg <options...>
                          1h (bare number = seconds). Default: 15m.
       --randomize        Shuffle the playlist order; reshuffles each pass
                          without immediate repeats.
-      --fade <duration>  Crossfade on rotation instead of a hard cut, e.g.
-                         500ms, 2s. Needs --image-list and compositor
-                         support (wp_alpha_modifier_v1).
+      --fade <duration>  Blur-dissolve transition on rotation instead of a
+                         hard cut, e.g. 500ms, 2s. Requires --image-list.
       --cap-luminance <nits>
                          Hard-clip HDR content above this luminance.
       --scale-luminance <nits>

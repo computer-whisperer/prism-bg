@@ -347,8 +347,10 @@ fn load_texture(
     Ok(TextureData {
         width: img8.width,
         height: img8.height,
-        rgba,
-        srgb: tex.srgb,
+        pixels: crate::gpu::TexturePixels::Rgba8 {
+            data: rgba,
+            srgb: tex.srgb,
+        },
     })
 }
 
@@ -468,6 +470,28 @@ pub struct ShaderSurface {
     resolved: Option<ResolvedFeedback>,
     /// Renderer + target ring on the resolved GPU.
     state: Option<DeviceState>,
+    /// The graph/textures were swapped (playlist rotation): rebuild the
+    /// renderer in place on the next render, keeping the dmabuf ring.
+    source_dirty: bool,
+}
+
+/// Build the compositor-side color description for `encoding`, or `None`
+/// without color management (the surface attaches untagged).
+fn make_description(
+    qh: &QueueHandle<App>,
+    color: Option<&ColorState>,
+    encoding: &ColorEncoding,
+) -> Option<DescriptionHandle> {
+    match color {
+        Some(c) => match c.create_description(qh, encoding) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                tracing::warn!("surface color description unavailable: {e:#}; attaching untagged");
+                None
+            }
+        },
+        None => None,
+    }
 }
 
 impl ShaderSurface {
@@ -523,18 +547,7 @@ impl ShaderSurface {
         let min_interval = fps
             .filter(|_| animated)
             .map(|n| Duration::from_secs_f64(1.0 / n as f64));
-        let description = match color {
-            Some(c) => match c.create_description(qh, &SHADER_ENCODING) {
-                Ok(d) => Some(d),
-                Err(e) => {
-                    tracing::warn!(
-                        "shader color description unavailable: {e:#}; attaching untagged"
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
+        let description = make_description(qh, color, &SHADER_ENCODING);
         Ok(ShaderSurface {
             spec,
             textures,
@@ -554,7 +567,72 @@ impl ShaderSurface {
             accum: FeedbackAccum::default(),
             resolved: None,
             state: None,
+            source_dirty: false,
         })
+    }
+
+    /// Prepare a surface that displays a still image as a GPU wallpaper. The
+    /// caller hands over a graph from [`crate::gpu::image_graph`], the image
+    /// already converted to working-space fp16 (one [`TextureData`]), and the
+    /// [`ColorEncoding`] to tag the dmabuf with (the image's working space).
+    /// The surface is static — it renders one frame — with no audio or mouse
+    /// inputs. Like [`Self::new`], the GPU build is deferred until feedback
+    /// resolves the output's device.
+    pub fn from_image(
+        qh: &QueueHandle<App>,
+        graph: crate::shadergraph::GraphSpec,
+        textures: Vec<TextureData>,
+        encoding: &ColorEncoding,
+        color: Option<&ColorState>,
+    ) -> ShaderSurface {
+        ShaderSurface {
+            spec: graph,
+            textures,
+            animated: false,
+            uses_audio: false,
+            uses_mouse: false,
+            ptr: PointerState::default(),
+            last_time: None,
+            frame_count: 0,
+            started: None,
+            min_interval: None,
+            last_render: None,
+            description: make_description(qh, color, encoding),
+            cm: None,
+            tagged: false,
+            feedback: None,
+            accum: FeedbackAccum::default(),
+            resolved: None,
+            state: None,
+            source_dirty: false,
+        }
+    }
+
+    /// Swap the displayed source in place (playlist rotation): replace the
+    /// graph, textures, and color tag, keeping the surface, dmabuf ring, and
+    /// feedback resolution. The new source renders on the next draw; the old
+    /// frame stays presented until then, so the swap is flash-free.
+    pub fn set_source(
+        &mut self,
+        qh: &QueueHandle<App>,
+        graph: crate::shadergraph::GraphSpec,
+        textures: Vec<TextureData>,
+        encoding: &ColorEncoding,
+        color: Option<&ColorState>,
+    ) {
+        self.spec = graph;
+        self.textures = textures;
+        self.source_dirty = true;
+        // Re-tag with the new image's working space.
+        if let Some(cm) = self.cm.take() {
+            cm.destroy();
+        }
+        self.description = make_description(qh, color, encoding);
+        self.tagged = false;
+        // A fresh static image renders one frame from t = 0.
+        self.started = None;
+        self.last_time = None;
+        self.frame_count = 0;
     }
 
     pub fn animated(&self) -> bool {
@@ -691,6 +769,36 @@ impl ShaderSurface {
                 size: (0, 0),
             });
         }
+        // Source swapped (rotation): rebuild the renderer in place, keeping
+        // the dmabuf ring — only the framebuffers (tied to the new render
+        // pass) are recreated. The presented frame is untouched until the
+        // new source renders below. Skipped when there's no ring yet (the
+        // GPU-change branch above already built the new spec).
+        if self.source_dirty {
+            if let Some(st) = self.state.as_mut() {
+                if !st.ring.is_empty() {
+                    let mut renderer = ShaderRenderer::new(gpu, &self.spec, &self.textures, RING)?;
+                    // SAFETY: drain in-flight work before swapping framebuffers.
+                    unsafe {
+                        let _ = st.device.device_wait_idle();
+                        for t in &st.ring {
+                            st.device.destroy_framebuffer(t.framebuffer, None);
+                        }
+                    }
+                    let mut fbs = Vec::with_capacity(st.ring.len());
+                    for t in &st.ring {
+                        fbs.push(renderer.create_framebuffer(&t.target)?);
+                    }
+                    for (t, fb) in st.ring.iter_mut().zip(fbs) {
+                        t.framebuffer = fb;
+                    }
+                    renderer.resize(gpu, st.size.0, st.size.1)?; // no-op (image has no buffers)
+                    st.renderer = renderer; // old renderer dropped here
+                }
+            }
+            self.source_dirty = false;
+        }
+
         // (Re)build the ring if the size changed.
         let need_ring = {
             let st = self.state.as_ref().unwrap();
@@ -940,7 +1048,7 @@ impl Dispatch<ZwpLinuxDmabufFeedbackV1, FeedbackId> for App {
         _: &wayland_client::Connection,
         qh: &QueueHandle<App>,
     ) {
-        state.on_shader_feedback(qh, &data.0, event);
+        state.on_surface_feedback(qh, &data.0, event);
     }
 }
 
@@ -1032,8 +1140,11 @@ mod tests {
         };
         let data = super::load_texture(&base, &tex).expect("load example noise texture");
         assert_eq!((data.width, data.height), (256, 256));
-        assert_eq!(data.rgba.len(), 256 * 256 * 4);
-        assert!(!data.srgb, "textures default to raw (UNORM) sampling");
+        let crate::gpu::TexturePixels::Rgba8 { data: rgba, srgb } = &data.pixels else {
+            panic!("expected 8-bit pixels");
+        };
+        assert_eq!(rgba.len(), 256 * 256 * 4);
+        assert!(!srgb, "textures default to raw (UNORM) sampling");
     }
 
     #[test]

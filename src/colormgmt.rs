@@ -51,11 +51,6 @@ impl ColorState {
         self.features.contains(&f)
     }
 
-    /// Whether the compositor advertised the named TF for `tf`.
-    pub fn supports_tf(&self, tf: Tf) -> bool {
-        self.tfs.contains(&protocol_tf(tf))
-    }
-
     /// Create a parametric image description for `enc`, degrading where
     /// harmless and failing where rendering would be wrong:
     /// - luminances are dropped (with a warning) if `set_luminances` is

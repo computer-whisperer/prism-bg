@@ -55,6 +55,128 @@ impl Chromaticities {
             .iter()
             .all(|(a, b)| (a.0 - b.0).abs() <= tol && (a.1 - b.1).abs() <= tol)
     }
+
+    /// The 3×3 matrix taking linear RGB in these primaries to CIE XYZ
+    /// (Bruce Lindbloom's construction: per-primary xyz scaled so the
+    /// primaries sum to the white point at RGB = (1,1,1)).
+    pub fn rgb_to_xyz(&self) -> Mat3 {
+        let xyz = |(x, y): (f64, f64)| [x / y, 1.0, (1.0 - x - y) / y];
+        let (r, g, b) = (xyz(self.r), xyz(self.g), xyz(self.b));
+        // Columns are the primaries' XYZ.
+        let prim = [[r[0], g[0], b[0]], [r[1], g[1], b[1]], [r[2], g[2], b[2]]];
+        let w = xyz(self.w);
+        let s = mat3_mul_vec(&mat3_inv(&prim), &w);
+        // Scale each column by the corresponding white-balance factor.
+        [
+            [prim[0][0] * s[0], prim[0][1] * s[1], prim[0][2] * s[2]],
+            [prim[1][0] * s[0], prim[1][1] * s[1], prim[1][2] * s[2]],
+            [prim[2][0] * s[0], prim[2][1] * s[1], prim[2][2] * s[2]],
+        ]
+    }
+}
+
+/// A row-major 3×3 matrix (f64 for the colorimetric derivations; the
+/// per-pixel hot path casts the final product to f32).
+pub type Mat3 = [[f64; 3]; 3];
+
+fn mat3_mul(a: &Mat3, b: &Mat3) -> Mat3 {
+    let mut m = [[0.0; 3]; 3];
+    for (i, row) in m.iter_mut().enumerate() {
+        for (j, out) in row.iter_mut().enumerate() {
+            *out = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+        }
+    }
+    m
+}
+
+fn mat3_mul_vec(m: &Mat3, v: &[f64; 3]) -> [f64; 3] {
+    [
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+    ]
+}
+
+fn mat3_inv(m: &Mat3) -> Mat3 {
+    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    let id = 1.0 / det;
+    [
+        [
+            (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * id,
+            (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * id,
+            (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * id,
+        ],
+        [
+            (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * id,
+            (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * id,
+            (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * id,
+        ],
+        [
+            (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * id,
+            (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * id,
+            (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * id,
+        ],
+    ]
+}
+
+impl PrimaryVolume {
+    /// The chromaticities of this volume (named sets resolve to their
+    /// constants).
+    pub fn chromaticities(self) -> Chromaticities {
+        match self {
+            PrimaryVolume::Srgb => SRGB_CHROMA,
+            PrimaryVolume::DisplayP3 => DISPLAY_P3_CHROMA,
+            PrimaryVolume::Bt2020 => BT2020_CHROMA,
+            PrimaryVolume::Custom(c) => c,
+        }
+    }
+}
+
+/// The 3×3 matrix converting linear RGB from `src` primaries to the unified
+/// working space's sRGB primaries (identity when `src` is already sRGB).
+/// Out-of-sRGB-gamut colors land outside `[0,1]`; the working space is
+/// extended-linear (signed fp16) so they survive losslessly.
+pub fn conversion_to_srgb_primaries(src: PrimaryVolume) -> [[f32; 3]; 3] {
+    if matches!(src, PrimaryVolume::Srgb) {
+        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    }
+    let m = mat3_mul(
+        &mat3_inv(&SRGB_CHROMA.rgb_to_xyz()),
+        &src.chromaticities().rgb_to_xyz(),
+    );
+    let mut out = [[0.0f32; 3]; 3];
+    for (o, row) in out.iter_mut().zip(&m) {
+        for (oc, &c) in o.iter_mut().zip(row) {
+            *oc = c as f32;
+        }
+    }
+    out
+}
+
+/// Per-TF default luminances (cd/m², `min` unscaled) for a source that
+/// declares none — mirrors prism's `default_luminances_for_tf` so retagging
+/// an untagged image preserves the brightness the compositor would assume.
+pub fn default_luminances(tf: Tf) -> Luminances {
+    match tf {
+        Tf::Pq => Luminances {
+            min: 0.005,
+            max: 10000.0,
+            reference: 203.0,
+        },
+        Tf::Bt1886 => Luminances {
+            min: 0.01,
+            max: 100.0,
+            reference: 100.0,
+        },
+        // sRGB / Gamma22 / Linear share the IEC sRGB range.
+        _ => Luminances {
+            min: 0.2,
+            max: 80.0,
+            reference: 80.0,
+        },
+    }
 }
 
 /// Transfer function of the encoded pixel data. Restricted to what prism
@@ -318,6 +440,62 @@ mod tests {
         assert!(encoding_from_cicp(1, 13, false).is_none());
         // Unknown primaries refused.
         assert!(encoding_from_cicp(22, 13, true).is_none());
+    }
+
+    #[test]
+    fn srgb_rgb_to_xyz_matches_reference() {
+        // Bruce Lindbloom's published sRGB/D65 RGB→XYZ matrix. Tolerance is
+        // 1.5e-3 because our `D65` constant is rounded to 4 places vs his 5,
+        // which perturbs the last digits — the construction is what's tested.
+        let m = SRGB_CHROMA.rgb_to_xyz();
+        let expected = [
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041],
+        ];
+        for (row, exp) in m.iter().zip(&expected) {
+            for (got, e) in row.iter().zip(exp) {
+                assert!((got - e).abs() < 1.5e-3, "got {got}, expected {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn srgb_to_srgb_is_identity() {
+        let m = conversion_to_srgb_primaries(PrimaryVolume::Srgb);
+        let id = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        assert_eq!(m, id);
+    }
+
+    #[test]
+    fn wide_gamut_white_stays_white_primaries_widen() {
+        // A common D65 white maps to itself under any primary conversion.
+        for src in [PrimaryVolume::DisplayP3, PrimaryVolume::Bt2020] {
+            let m = conversion_to_srgb_primaries(src);
+            let w: Vec<f32> = (0..3)
+                .map(|i| m[i][0] * 1.0 + m[i][1] * 1.0 + m[i][2] * 1.0)
+                .collect();
+            for c in &w {
+                assert!((c - 1.0).abs() < 1e-4, "white channel drifted: {c}");
+            }
+            // Pure source-primary red is more saturated than sRGB red, so in
+            // sRGB it pushes a channel out of [0,1] (green goes negative).
+            let red_g = m[1][0]; // sRGB green response to source red
+            assert!(red_g < 0.0, "wide-gamut red should drive sRGB green < 0");
+        }
+    }
+
+    #[test]
+    fn default_luminances_track_prism() {
+        assert_eq!(default_luminances(Tf::Pq).reference, 203.0);
+        assert_eq!(default_luminances(Tf::Bt1886).reference, 100.0);
+        assert_eq!(default_luminances(Tf::Srgb).reference, 80.0);
+        // Ext-linear (our retag target) shares the sRGB default, so an
+        // untagged sRGB image keeps its assumed brightness when retagged.
+        assert_eq!(
+            default_luminances(Tf::Linear).reference,
+            default_luminances(Tf::Srgb).reference
+        );
     }
 
     #[test]

@@ -1,23 +1,18 @@
-//! The Wayland application: one background layer surface per matched
-//! output, each a solid-color parent (1×1 buffer, viewport-stretched) with
-//! an optional image subsurface on top. The compositor does all scaling
-//! (viewport) and all color conversion (each image surface is tagged with
-//! its source description via `wp_color_management_v1`).
+//! The Wayland application: one background layer surface per matched output.
+//! Every non-solid wallpaper renders on the GPU — images as a degenerate
+//! shader graph, `--shader` wallpapers directly — into an fp16 dmabuf
+//! attached to the layer surface and tagged via `wp_color_management_v1`.
+//! Solid-color wallpapers use a 1×1 viewport-stretched shm buffer.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use smithay_client_toolkit::reexports::calloop::{
-    timer::{TimeoutAction, Timer},
-    LoopHandle,
-};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region, SurfaceData},
     delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
-    delegate_seat, delegate_shm, delegate_simple, delegate_subcompositor,
+    delegate_seat, delegate_shm, delegate_simple,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -39,20 +34,12 @@ use smithay_client_toolkit::{
         slot::{Buffer, SlotPool},
         Shm, ShmHandler,
     },
-    subcompositor::SubcompositorState,
 };
 use wayland_client::{
     globals::GlobalList,
-    protocol::{
-        wl_output, wl_pointer::WlPointer, wl_seat::WlSeat, wl_shm, wl_subsurface::WlSubsurface,
-        wl_surface::WlSurface,
-    },
+    protocol::{wl_output, wl_pointer::WlPointer, wl_seat::WlSeat, wl_shm, wl_surface::WlSurface},
     Connection, Proxy, QueueHandle,
 };
-use wayland_protocols::wp::alpha_modifier::v1::client::{
-    wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1, wp_alpha_modifier_v1::WpAlphaModifierV1,
-};
-use wayland_protocols::wp::color_management::v1::client::wp_color_management_surface_v1::WpColorManagementSurfaceV1;
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
@@ -61,12 +48,11 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLi
 
 use crate::audio::AudioCapture;
 use crate::cli::{Args, Color, Intent, Mode, OutputSpec};
-use crate::colormgmt::{ColorState, DescriptionHandle, Status};
+use crate::colormgmt::ColorState;
 use crate::decode::DecodedImage;
 use crate::gpu::GpuPool;
 use crate::playlist::Playlist;
 use crate::shader::{DmabufState, ShaderSurface, Tiling};
-use crate::surfaces::{place, upload, upload_tiled, WireRgb8};
 
 /// Image identity for deduplication: path + effective luminance treatment
 /// (the same file treated differently for different outputs is different
@@ -84,65 +70,6 @@ pub fn resolve_treatment(
         ..spec.luminance.unwrap_or_default()
     };
     (!t.is_empty()).then_some(t)
-}
-
-/// A decoded, treated, capability-adapted image plus its (shared)
-/// compositor-side description.
-pub struct LoadedImage {
-    pub image: Arc<DecodedImage>,
-    pub description: Option<DescriptionHandle>,
-}
-
-struct ImagePart {
-    subsurface: WlSubsurface,
-    surface: WlSurface,
-    viewport: WpViewport,
-    /// `wp_alpha_modifier_surface_v1`, created only for parts attached
-    /// with a crossfade (the multiplier ramps 0 → max).
-    alpha: Option<WpAlphaModifierSurfaceV1>,
-    /// Keeps the color-management surface wrapper (and with it the
-    /// description binding) alive.
-    cm: Option<WpColorManagementSurfaceV1>,
-    image: Arc<DecodedImage>,
-    mode: Mode,
-    /// What this part shows, for change detection in [`App::service`].
-    key: ImageKey,
-}
-
-impl Drop for ImagePart {
-    /// wayland-client proxies don't send destructors on Drop; rotation
-    /// (and output removal) need the subsurface tree actually gone.
-    /// wl_subsurface.destroy unmaps the child immediately.
-    fn drop(&mut self) {
-        if let Some(cm) = &self.cm {
-            cm.destroy();
-        }
-        // The protocol requires destroying this before the wl_surface.
-        if let Some(alpha) = &self.alpha {
-            alpha.destroy();
-        }
-        self.viewport.destroy();
-        self.subsurface.destroy();
-        self.surface.destroy();
-    }
-}
-
-/// An in-flight crossfade: the outgoing part stays mapped (stacked below
-/// the incoming one) while the incoming surface's alpha multiplier ramps
-/// up, then both are dropped here at completion. The compositor does the
-/// blend — prism in linear fp16, so the dissolve is gamma-correct.
-struct Fade {
-    /// Set on the first ticker step, not at attach: the buffer upload
-    /// for this output and image preparation for any other outputs in
-    /// the same service pass run synchronously after attach, and that
-    /// time must not be charged to the ramp (the dissolve would visibly
-    /// begin partway in).
-    start: Option<Instant>,
-    duration: Duration,
-    /// Outgoing subsurface tree, destroyed when the fade finishes.
-    _old_part: ImagePart,
-    /// The outgoing part's pixels must outlive its surface.
-    _old_buffer: Option<Buffer>,
 }
 
 /// The luminance an output advertises (cd/m²), resolved from its preferred
@@ -177,14 +104,12 @@ struct Wallpaper {
     layer: LayerSurface,
     viewport: WpViewport,
     color: Color,
-    /// Built lazily by [`App::service`] once the tone target (if `auto`)
-    /// and the image description are resolved.
-    image_part: Option<ImagePart>,
-    /// Crossfade in progress (`--fade`), stepped by the shared calloop
-    /// ticker (see [`App::arm_fade_timer`]).
-    fade: Option<Fade>,
     /// Image preparation failed; don't retry every service pass.
     broken: bool,
+    /// The image source currently loaded into the GPU surface (path +
+    /// luminance treatment); drives staleness detection in [`App::service`].
+    /// `None` for shader/solid wallpapers and before the first image loads.
+    loaded: Option<ImageKey>,
     /// Keeps the preferred-description subscription alive (auto mode).
     _feedback: Option<
         wayland_protocols::wp::color_management::v1::client
@@ -193,10 +118,13 @@ struct Wallpaper {
     /// Logical size from the last configure; 0 until configured.
     size: (u32, u32),
     scale: i32,
+    /// 1×1 solid background buffer (solid-color wallpapers, and the
+    /// pre-render background of image wallpapers).
     color_buffer: Option<Buffer>,
-    image_buffer: Option<Buffer>,
-    /// GPU shader wallpaper (`--shader`); mutually exclusive with the image
-    /// path. Renders into dmabuf buffers attached to the layer surface.
+    /// The GPU surface that renders this wallpaper — an image (as a degenerate
+    /// graph) or a `--shader`. `None` for solid-color wallpapers and until an
+    /// image wallpaper's first source is built. Renders dmabufs attached to
+    /// the layer surface.
     shader: Option<ShaderSurface>,
 }
 
@@ -206,7 +134,6 @@ pub struct App {
     pub shm: Shm,
     pub pool: SlotPool,
     pub compositor: CompositorState,
-    pub subcompositor: SubcompositorState,
     pub layer_shell: LayerShell,
     pub viewporter: SimpleViewporter,
     /// Seats are always tracked, but a pointer is only created (and surfaces
@@ -219,17 +146,12 @@ pub struct App {
     /// interactive surfaces input-receiving (non-interactive ones get an empty
     /// input region so they stay click-through, as a wallpaper should).
     wants_mouse: bool,
-    /// `wp_alpha_modifier_v1` if the compositor has it; `--fade` degrades
-    /// to a hard cut without it.
-    pub alpha_modifier: Option<WpAlphaModifierV1>,
     pub color: Option<ColorState>,
     pub intent: Intent,
     pub specs: Vec<OutputSpec>,
     /// Raw decoded images by path, kept for deriving treated variants
     /// (per-output tone targets, hotplug).
     pub raw_images: HashMap<PathBuf, Arc<DecodedImage>>,
-    /// Treated + capability-adapted images by (path, treatment).
-    pub images: HashMap<ImageKey, LoadedImage>,
     /// Resolved per-output advertised luminance, from the preferred image
     /// description: the reference white (shader `1.0` maps here) and the peak
     /// to master against. Drives both `--tone-map auto` (the `max`) and the
@@ -241,10 +163,6 @@ pub struct App {
     /// Rotation state per `--image-list` spec group, indexed by
     /// `OutputSpec::playlist`. Advanced by per-playlist timers in `main`.
     pub playlists: Vec<Playlist>,
-    /// For inserting the fade ticker when a crossfade starts.
-    loop_handle: LoopHandle<'static, App>,
-    /// A fade ticker is currently inserted (one drives all fades).
-    fade_timer_armed: bool,
     wallpapers: Vec<Wallpaper>,
     // Declared after `wallpapers` so they drop *after* it: a ShaderSurface
     // tears down its Vulkan objects in Drop using devices the pool owns.
@@ -259,9 +177,6 @@ pub struct App {
     audio: Option<AudioCapture>,
 }
 
-/// Crossfade tick period, ~60 Hz.
-const FADE_TICK: Duration = Duration::from_millis(16);
-
 pub type SimpleViewporter = smithay_client_toolkit::registry::SimpleGlobal<WpViewporter, 1>;
 
 impl App {
@@ -271,13 +186,9 @@ impl App {
         args: &Args,
         raw_images: HashMap<PathBuf, Arc<DecodedImage>>,
         playlists: Vec<Playlist>,
-        loop_handle: LoopHandle<'static, App>,
     ) -> Result<App> {
         let compositor =
             CompositorState::bind(globals, qh).context("wl_compositor not available")?;
-        let subcompositor =
-            SubcompositorState::bind(compositor.wl_compositor().clone(), globals, qh)
-                .context("wl_subcompositor not available")?;
         let layer_shell = LayerShell::bind(globals, qh).context(
             "zwlr_layer_shell_v1 not available (compositor without layer-shell support?)",
         )?;
@@ -285,12 +196,6 @@ impl App {
         let pool = SlotPool::new(4096, &shm).context("creating shm pool")?;
         let viewporter =
             SimpleViewporter::bind(globals, qh).context("wp_viewporter not available")?;
-        let alpha_modifier: Option<WpAlphaModifierV1> = globals.bind(qh, 1..=1, ()).ok();
-        if alpha_modifier.is_none() && args.specs.iter().any(|s| s.fade.is_some()) {
-            tracing::warn!(
-                "compositor lacks wp_alpha_modifier_v1; --fade disabled (rotation cuts hard)"
-            );
-        }
         let color = if args.no_color_management {
             None
         } else {
@@ -304,9 +209,14 @@ impl App {
             c
         };
 
-        // Shader wallpapers need the GPU backend and dmabuf import. Only pay
-        // for them when a --shader spec is present.
-        let wants_shader = args.specs.iter().any(|s| s.shader.is_some());
+        // Every non-solid wallpaper now renders on the GPU (images as a
+        // degenerate shader graph, shaders directly), so the GPU backend and
+        // dmabuf import are needed whenever any spec draws something.
+        let wants_gpu = args.specs.iter().any(|s| {
+            s.shader.is_some()
+                || ((s.image.is_some() || s.image_list.is_some())
+                    && s.effective_mode() != Mode::SolidColor)
+        });
         // Does any shader want pointer input? Peek the source files now (a cheap
         // startup-only read) so the seat's pointer is created — and surfaces get
         // the right input region — before the first output is added. A read
@@ -324,21 +234,19 @@ impl App {
         if wants_mouse {
             tracing::info!("a shader uses iMouse; binding seat pointer for interactivity");
         }
-        let gpus = if wants_shader {
-            Some(GpuPool::new().context("initializing GPU backend for --shader")?)
+        let gpus = if wants_gpu {
+            Some(GpuPool::new().context("initializing GPU backend for wallpaper rendering")?)
         } else {
             None
         };
         // Bind at version 4 for per-surface feedback (the output's GPU +
-        // importable modifiers). Required when shaders are requested.
+        // importable modifiers). Required for GPU-rendered wallpapers.
         let dmabuf = globals
             .bind::<ZwpLinuxDmabufV1, _, _>(qh, 4..=4, ())
             .ok()
             .map(|proxy| DmabufState { proxy });
-        if wants_shader && dmabuf.is_none() {
-            bail!(
-                "compositor lacks zwp_linux_dmabuf_v1 v4; --shader needs it for GPU presentation"
-            );
+        if wants_gpu && dmabuf.is_none() {
+            bail!("compositor lacks zwp_linux_dmabuf_v1 v4; needed for GPU wallpaper presentation");
         }
 
         Ok(App {
@@ -347,23 +255,18 @@ impl App {
             shm,
             pool,
             compositor,
-            subcompositor,
             layer_shell,
             viewporter,
             seat_state: SeatState::new(globals, qh),
             pointers: Vec::new(),
             wants_mouse,
-            alpha_modifier,
             color,
             intent: args.intent,
             specs: args.specs.clone(),
             raw_images,
-            images: HashMap::new(),
             output_lums: HashMap::new(),
             pending_targets: HashMap::new(),
             playlists,
-            loop_handle,
-            fade_timer_armed: false,
             wallpapers: Vec::new(),
             gpus,
             dmabuf,
@@ -500,14 +403,12 @@ impl App {
             layer,
             viewport,
             color,
-            image_part: None,
-            fade: None,
             broken: shader_broken,
+            loaded: None,
             _feedback: feedback,
             size: (0, 0),
             scale,
             color_buffer: None,
-            image_buffer: None,
             shader,
         });
     }
@@ -528,10 +429,10 @@ impl App {
         ShaderSurface::new(qh, &source, base_dir, self.color.as_ref(), fps)
     }
 
-    /// Feed a dmabuf-feedback event to the named output's shader surface and
-    /// (re)draw if it resolved a new GPU/modifier set. Called from the
-    /// feedback dispatch handler.
-    pub fn on_shader_feedback(
+    /// Feed a dmabuf-feedback event to the named output's GPU surface (image
+    /// or shader) and (re)draw if it resolved a new GPU/modifier set. Called
+    /// from the feedback dispatch handler.
+    pub fn on_surface_feedback(
         &mut self,
         qh: &QueueHandle<App>,
         output: &str,
@@ -550,22 +451,20 @@ impl App {
         }
     }
 
-    /// Attach images to wallpapers whose prerequisites have resolved:
-    /// the tone target (when `--tone-map auto`) and the image description
-    /// readiness. A wallpaper needs attention when its desired image (the
-    /// playlist's current entry) differs from the attached one — the old
-    /// part keeps showing until the new one is ready. Called from the
-    /// main loop after every dispatch — cheap when nothing is pending.
+    /// Update wallpapers whose desired image differs from what's loaded into
+    /// their GPU surface: resolve the tone target (deferring `--tone-map auto`
+    /// until the output's luminance lands), then (re)build the image surface.
+    /// The old frame keeps showing until the new one renders. Called from the
+    /// main loop after every dispatch — cheap when nothing changed.
     pub fn service(&mut self, qh: &QueueHandle<App>) {
         for i in 0..self.wallpapers.len() {
             let wp = &self.wallpapers[i];
-            if wp.broken || wp.shader.is_some() {
-                continue; // shader wallpapers render via the GPU path, not here
+            if wp.broken || wp.spec.shader.is_some() {
+                continue; // --shader wallpapers render via feedback/frame, not here
             }
-            let spec = wp.spec.clone();
             let name = wp.name.clone();
-            // Playlist specs show the playlist's current entry.
-            let path = match spec.playlist {
+            // Desired image path: the playlist's current entry, or static -i.
+            let path = match wp.spec.playlist {
                 Some(p) => {
                     let src = self.playlists[p].current();
                     if src.is_shader() {
@@ -573,17 +472,17 @@ impl App {
                     }
                     src.path().to_path_buf()
                 }
-                None => match spec.image.clone() {
+                None => match wp.spec.image.clone() {
                     Some(path) => path,
-                    None => continue,
+                    None => continue, // solid color: drawn at configure
                 },
             };
-            if spec.effective_mode() == Mode::SolidColor {
+            if wp.spec.effective_mode() == Mode::SolidColor {
                 continue;
             }
 
-            // Resolve the tone target.
-            let tone = match spec.tone_map {
+            // Resolve the tone target (auto waits for the output's luminance).
+            let tone = match wp.spec.tone_map {
                 Some(crate::cli::ToneMap::Nits(n)) => Some(n),
                 Some(crate::cli::ToneMap::Auto) => {
                     if self.color.is_none() {
@@ -598,304 +497,82 @@ impl App {
                 None => None,
             };
 
-            let treatment = resolve_treatment(&spec, tone);
+            let treatment = resolve_treatment(&self.wallpapers[i].spec, tone);
             let key: ImageKey = (path, treatment.map(|t| t.key()));
-            if self.wallpapers[i]
-                .image_part
-                .as_ref()
-                .is_some_and(|p| p.key == key)
-            {
+            if self.wallpapers[i].loaded.as_ref() == Some(&key) {
                 continue; // already showing it
             }
-            if let Err(e) = self.ensure_image(qh, &key, treatment) {
+            if let Err(e) = self.show_image(qh, i, &key, treatment) {
                 tracing::error!(output = name, "preparing image failed: {e:#}");
                 self.wallpapers[i].broken = true;
-                continue;
-            }
-            let ready = match &self.images[&key].description {
-                None => true, // no color management; attach untagged
-                Some(d) => match d.status() {
-                    Status::Ready => true,
-                    Status::Pending => false, // ready event will re-trigger
-                    Status::Failed(msg) => {
-                        tracing::error!(
-                            output = name,
-                            "compositor rejected image description: {msg}"
-                        );
-                        self.wallpapers[i].broken = true;
-                        continue;
-                    }
-                },
-            };
-            if ready {
-                self.attach_image(qh, i, &key);
             }
         }
     }
 
-    /// Treat + capability-adapt + describe the image for `key` if it isn't
-    /// cached yet.
-    fn ensure_image(
+    /// Build (or swap in place) the GPU surface that renders wallpaper `i`'s
+    /// current image: convert the raw decode to working-space fp16 (applying
+    /// `treatment` first, so `--tone-map`/`--scale`/`--cap` remastering is
+    /// preserved), wrap it in an [`crate::gpu::image_graph`], and create the
+    /// surface (first load) or [`ShaderSurface::set_source`] it (rotation).
+    fn show_image(
         &mut self,
         qh: &QueueHandle<App>,
+        i: usize,
         key: &ImageKey,
         treatment: Option<crate::color::LuminanceControl>,
     ) -> Result<()> {
-        if self.images.contains_key(key) {
-            return Ok(());
-        }
+        use crate::color::Tf;
+
         let raw = self
             .raw_images
             .get(&key.0)
             .context("raw image missing (bug)")?
             .clone();
-        let treated = match treatment {
+        // Apply luminance shaping (if any), then convert to the unified
+        // working space (extended-linear, sRGB primaries) for the GPU.
+        let (pixels, encoding, w, h) = match treatment {
             Some(ctrl) => {
                 let t = raw.luminance_controlled(ctrl);
-                tracing::info!(
-                    path = %key.0.display(),
-                    ?ctrl,
-                    luminances = ?t.encoding.luminances,
-                    "luminance treatment applied"
-                );
-                Arc::new(t)
+                tracing::info!(path = %key.0.display(), ?ctrl, "luminance treatment applied");
+                let (p, e) = t.to_working_space();
+                (p, e, t.width, t.height)
             }
-            None => raw,
-        };
-        let adapted = self.adapt_image(treated)?;
-        let description = match &self.color {
-            Some(color) => Some(color.create_description(qh, &adapted.encoding)?),
-            None => None,
-        };
-        self.images.insert(
-            key.clone(),
-            LoadedImage {
-                image: adapted,
-                description,
-            },
-        );
-        Ok(())
-    }
-
-    /// Adapt one image to compositor capabilities, two ordered axes (see
-    /// the module docs in `decode`): TF vocabulary first (full-precision
-    /// pixels), buffer container second (fp16 → unorm16+PQ → 8-bit).
-    fn adapt_image(&self, image: Arc<DecodedImage>) -> Result<Arc<DecodedImage>> {
-        use crate::color::Tf;
-        use wayland_client::protocol::wl_shm::Format;
-
-        let formats = self.shm.formats();
-        let fp16_ok = formats.contains(&Format::Abgr16161616f)
-            && std::env::var_os("PRISM_BG_FORCE_NO_FP16").is_none();
-        let unorm16_ok = formats.contains(&Format::Abgr16161616);
-        let sdr_tf = match &self.color {
-            Some(c) => [Tf::Srgb, Tf::Gamma22, Tf::Bt1886]
-                .into_iter()
-                .find(|&t| c.supports_tf(t)),
-            None => Some(Tf::Srgb),
-        };
-
-        let mut image = image;
-
-        // Axis 1: TF vocabulary.
-        if let Some(color) = &self.color {
-            let tf = image.encoding.tf;
-            if !color.supports_tf(tf) {
-                match tf {
-                    Tf::Srgb | Tf::Gamma22 | Tf::Bt1886 | Tf::Linear => {
-                        let target =
-                            sdr_tf.context("compositor supports no display-referred TF")?;
-                        if tf == Tf::Linear {
-                            tracing::warn!(
-                                ?target,
-                                "compositor lacks ext_linear; re-encoding (HDR clips at \
-                                 reference white)"
-                            );
-                        } else {
-                            tracing::info!(from = ?tf, to = ?target, "re-encoding TF");
-                        }
-                        image = Arc::new(image.reencoded_tf(target));
-                    }
-                    Tf::Pq => anyhow::bail!("compositor does not support the PQ transfer function"),
-                }
+            None => {
+                let (p, e) = raw.to_working_space();
+                (p, e, raw.width, raw.height)
             }
-        }
-
-        // Axis 2: buffer container.
-        if !fp16_ok && matches!(image.pixels, crate::decode::Pixels::RgbaF16(_)) {
-            let target = sdr_tf.context("compositor supports no display-referred TF")?;
-            if unorm16_ok {
-                let pq_ok = self.color.as_ref().is_some_and(|c| c.supports_tf(Tf::Pq));
-                tracing::info!(
-                    pq = pq_ok && image.encoding.tf == Tf::Linear,
-                    "compositor lacks fp16 shm; repacking as 16-bit unorm"
-                );
-                image = Arc::new(image.repacked_unorm16(pq_ok, target));
-            } else {
-                tracing::warn!(
-                    ?target,
-                    "compositor lacks fp16 and 16-bit shm; quantizing to 8-bit"
-                );
-                image = Arc::new(image.quantized_to_8bit(target));
-            }
-        }
-        Ok(image)
-    }
-
-    /// Build the image subsurface for wallpaper `i` from the prepared
-    /// image at `key`, tag it, and draw. When this replaces an existing
-    /// part and `--fade` is in effect, the old part stays mapped (a new
-    /// subsurface stacks topmost, so the incoming one covers it) and the
-    /// incoming surface fades in over it.
-    fn attach_image(&mut self, qh: &QueueHandle<App>, i: usize, key: &ImageKey) {
-        // A fade still running here means rotation outpaced it; cut it
-        // short so there is exactly one outgoing part.
-        self.finish_fade(i);
-
-        let wp = &self.wallpapers[i];
-        let fade_duration = wp
-            .spec
-            .fade
-            .filter(|_| self.alpha_modifier.is_some() && wp.image_part.is_some());
-
-        let loaded = &self.images[key];
-        let (subsurface, child) = self
-            .subcompositor
-            .create_subsurface(wp.layer.wl_surface().clone(), qh);
-        let viewport = self.get_viewport(qh, &child);
-        let cm = match (&self.color, &loaded.description) {
-            (Some(color), Some(desc)) => Some(color.tag_surface(qh, &child, desc, self.intent)),
-            _ => None,
         };
-        let alpha = fade_duration.map(|_| {
-            let alpha = self
-                .alpha_modifier
-                .as_ref()
-                .expect("checked above")
-                .get_surface(&child, qh, ());
-            alpha.set_multiplier(0);
-            alpha
-        });
-        // The opaque-region hint must reflect what the compositor may
-        // skip drawing under us: a fading part is translucent whatever
-        // its pixels say, so it gets the hint at fade completion instead.
-        if !loaded.image.has_alpha && fade_duration.is_none() {
-            if let Ok(region) = Region::new(&self.compositor) {
-                region.add(0, 0, i32::MAX, i32::MAX);
-                child.set_opaque_region(Some(region.wl_region()));
-            }
-        }
-        let part = ImagePart {
-            subsurface,
-            surface: child,
-            viewport,
-            alpha,
-            cm,
-            image: loaded.image.clone(),
-            mode: wp.spec.effective_mode(),
-            key: key.clone(),
+        let texture = crate::gpu::TextureData {
+            width: w,
+            height: h,
+            pixels: crate::gpu::TexturePixels::LinearF16(pixels),
         };
-        tracing::info!(output = wp.name, fade = ?fade_duration, "image attached");
+        let mode = self.wallpapers[i].spec.effective_mode();
+        let c = self.wallpapers[i].color;
+        // The letterbox/background color, converted to working-space linear.
+        let bg = [
+            Tf::Srgb.eotf(c.r as f32),
+            Tf::Srgb.eotf(c.g as f32),
+            Tf::Srgb.eotf(c.b as f32),
+        ];
+        let graph = crate::gpu::image_graph(w, h, mode, bg);
+
+        let color = self.color.as_ref();
+        let dmabuf = self.dmabuf.as_ref();
         let wp = &mut self.wallpapers[i];
-        let old_part = wp.image_part.replace(part);
-        let old_buffer = wp.image_buffer.take();
-        if let Some(duration) = fade_duration {
-            wp.fade = Some(Fade {
-                start: None,
-                duration,
-                _old_part: old_part.expect("fade only replaces an existing part"),
-                _old_buffer: old_buffer,
-            });
-            self.arm_fade_timer();
+        match wp.shader.as_mut() {
+            Some(s) => s.set_source(qh, graph, vec![texture], &encoding, color),
+            None => {
+                let mut s = ShaderSurface::from_image(qh, graph, vec![texture], &encoding, color);
+                if let Some(dmabuf) = dmabuf {
+                    s.request_feedback(dmabuf, qh, wp.layer.wl_surface(), wp.name.clone());
+                }
+                wp.shader = Some(s);
+            }
         }
+        wp.loaded = Some(key.clone());
         self.draw(qh, i);
-    }
-
-    /// Insert the fade ticker if it isn't running. A calloop timer rather
-    /// than frame callbacks: an occluded surface gets no frame callbacks
-    /// (the parent is always hidden under its own opaque image part, and
-    /// the whole wallpaper may sit under a fullscreen window), which
-    /// would stall a callback-paced fade indefinitely.
-    fn arm_fade_timer(&mut self) {
-        if self.fade_timer_armed {
-            return;
-        }
-        let inserted = self.loop_handle.insert_source(
-            Timer::from_duration(FADE_TICK),
-            |_, _, app: &mut App| {
-                if app.step_fades() {
-                    TimeoutAction::ToDuration(FADE_TICK)
-                } else {
-                    app.fade_timer_armed = false;
-                    TimeoutAction::Drop
-                }
-            },
-        );
-        match inserted {
-            Ok(_) => self.fade_timer_armed = true,
-            Err(e) => {
-                // Can't animate; cut every pending fade to its end state.
-                tracing::error!("inserting fade timer: {e}; cutting hard");
-                for i in 0..self.wallpapers.len() {
-                    self.finish_fade(i);
-                    self.wallpapers[i].layer.commit();
-                }
-            }
-        }
-    }
-
-    /// Advance every running crossfade by one tick; returns whether any
-    /// is still running (keeps the ticker alive).
-    fn step_fades(&mut self) -> bool {
-        for i in 0..self.wallpapers.len() {
-            self.step_fade(i);
-        }
-        self.wallpapers.iter().any(|w| w.fade.is_some())
-    }
-
-    /// Advance wallpaper `i`'s crossfade: bump the incoming surface's
-    /// alpha multiplier and re-commit (the subsurface is sync, so the
-    /// parent commit latches it).
-    fn step_fade(&mut self, i: usize) {
-        let Some(fade) = &mut self.wallpapers[i].fade else {
-            return;
-        };
-        let start = *fade.start.get_or_insert_with(Instant::now);
-        let t = start.elapsed().as_secs_f64() / fade.duration.as_secs_f64();
-        tracing::trace!(output = self.wallpapers[i].name, t, "fade step");
-        if t >= 1.0 {
-            self.finish_fade(i);
-            self.wallpapers[i].layer.commit();
-            return;
-        }
-        let wp = &self.wallpapers[i];
-        let part = wp.image_part.as_ref().expect("fading wallpaper has a part");
-        let alpha = part.alpha.as_ref().expect("fading part has a multiplier");
-        alpha.set_multiplier((t * u32::MAX as f64) as u32);
-        part.surface.commit();
-        wp.layer.commit();
-    }
-
-    /// Complete wallpaper `i`'s crossfade, if one is running: full
-    /// opacity, the deferred opaque-region hint, and the outgoing part
-    /// dropped (destroying its subsurface tree). The caller commits the
-    /// parent to latch the child state.
-    fn finish_fade(&mut self, i: usize) {
-        let wp = &mut self.wallpapers[i];
-        let Some(_fade) = wp.fade.take() else {
-            return;
-        };
-        let part = wp.image_part.as_ref().expect("fading wallpaper has a part");
-        let alpha = part.alpha.as_ref().expect("fading part has a multiplier");
-        alpha.set_multiplier(u32::MAX);
-        if !part.image.has_alpha {
-            if let Ok(region) = Region::new(&self.compositor) {
-                region.add(0, 0, i32::MAX, i32::MAX);
-                part.surface.set_opaque_region(Some(region.wl_region()));
-            }
-        }
-        part.surface.commit();
-        // _fade drops here: outgoing subsurface destroyed, buffer freed.
+        Ok(())
     }
 
     fn get_viewport(&self, qh: &QueueHandle<App>, surface: &WlSurface) -> WpViewport {
@@ -909,7 +586,9 @@ impl App {
         let result = if self.wallpapers[index].shader.is_some() {
             self.try_draw_shader(qh, index)
         } else {
-            self.try_draw(index)
+            // No GPU surface yet (a solid-color wallpaper, or an image whose
+            // surface service() hasn't built): show the solid background.
+            self.draw_color(index)
         };
         if let Err(e) = result {
             tracing::error!(
@@ -1028,56 +707,15 @@ impl App {
         }
     }
 
-    fn try_draw(&mut self, index: usize) -> Result<()> {
-        let wp = &mut self.wallpapers[index];
-        let (w, h) = wp.size;
+    /// Attach the solid background: a 1×1 color buffer, viewport-stretched to
+    /// the whole output. Used for solid-color wallpapers and as the immediate
+    /// background of an image wallpaper before its GPU surface first renders.
+    fn draw_color(&mut self, index: usize) -> Result<()> {
+        let (w, h) = self.wallpapers[index].size;
         if w == 0 || h == 0 {
             return Ok(());
         }
-
-        // 8-bit wire format: Abgr8888 matches RGBA memory directly but is
-        // optional (KWin lacks it); fall back to swizzling into the
-        // spec-mandatory Argb8888. PRISM_BG_FORCE_ARGB=1 forces the
-        // swizzle path for testing.
-        let wire = if self.shm.formats().contains(&wl_shm::Format::Abgr8888)
-            && std::env::var_os("PRISM_BG_FORCE_ARGB").is_none()
-        {
-            WireRgb8::Abgr
-        } else {
-            WireRgb8::ArgbSwizzled
-        };
-
-        // Image subsurface first; as a synchronized subsurface its state is
-        // latched by the parent commit below.
-        if let Some(part) = &wp.image_part {
-            let placement = place(
-                part.mode,
-                (w, h),
-                wp.scale,
-                (part.image.width, part.image.height),
-            );
-            let buffer = match placement.tile {
-                Some((tw, th)) => upload_tiled(&mut self.pool, &part.image, tw, th, wire)?,
-                None => upload(&mut self.pool, &part.image, wire)?,
-            };
-            buffer
-                .attach_to(&part.surface)
-                .context("attaching image buffer")?;
-            if let Some((x, y, sw, sh)) = placement.src {
-                part.viewport.set_source(x, y, sw, sh);
-            } else {
-                part.viewport.set_source(-1.0, -1.0, -1.0, -1.0);
-            }
-            part.viewport
-                .set_destination(placement.dest.0, placement.dest.1);
-            part.subsurface
-                .set_position(placement.pos.0, placement.pos.1);
-            part.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-            part.surface.commit();
-            wp.image_buffer = Some(buffer);
-        }
-
-        // Parent: 1×1 solid color, viewport-stretched to the whole output.
+        let color = self.wallpapers[index].color;
         // sRGB-encoded, premultiplied (alpha 1): plain 8-bit is exact.
         let (buffer, canvas) = self
             .pool
@@ -1086,7 +724,8 @@ impl App {
         let px = |v: f64| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
         // The pool may hand back a canvas larger than requested (minimum
         // slot size); only the buffer's own bytes matter.
-        canvas[..4].copy_from_slice(&[px(wp.color.b), px(wp.color.g), px(wp.color.r), 0xff]);
+        canvas[..4].copy_from_slice(&[px(color.b), px(color.g), px(color.r), 0xff]);
+        let wp = &mut self.wallpapers[index];
         buffer
             .attach_to(wp.layer.wl_surface())
             .context("attaching color buffer")?;
@@ -1165,7 +804,6 @@ impl App {
                 .map(|p| p.current().path().to_path_buf()),
         );
         self.raw_images.retain(|path, _| live.contains(path));
-        self.images.retain(|(path, _), _| live.contains(path));
     }
 
     fn remove_output(&mut self, output: &wl_output::WlOutput) {
@@ -1261,16 +899,9 @@ impl OutputHandler for App {
         if let Some(i) = self.wallpapers.iter().position(|w| w.output == output) {
             if self.wallpapers[i].scale != info.scale_factor {
                 self.wallpapers[i].scale = info.scale_factor;
-                // Scale affects center (1:1 pixels) and tile (assembled
-                // buffer); other modes are scale-independent. A shader's
-                // device-pixel target size scales too, so it always redraws.
-                let affected = self.wallpapers[i].shader.is_some()
-                    || self.wallpapers[i]
-                        .image_part
-                        .as_ref()
-                        .is_some_and(|p| matches!(p.mode, Mode::Center | Mode::Tile));
-                if affected {
-                    self.finish_fade(i); // don't leave the outgoing part stale
+                // A GPU surface's device-pixel target scales with the output,
+                // so it must re-render; a solid-color buffer is scale-free.
+                if self.wallpapers[i].shader.is_some() {
                     self.draw(qh, i);
                 }
             }
@@ -1320,9 +951,6 @@ impl LayerShellHandler for App {
         if new_size == self.wallpapers[i].size && drawn {
             return;
         }
-        // A resize mid-fade would leave the outgoing part at stale
-        // geometry (only the current part is redrawn); cut to the end.
-        self.finish_fade(i);
         self.wallpapers[i].size = new_size;
         self.draw(qh, i);
     }
@@ -1456,7 +1084,6 @@ impl AsMut<SimpleViewporter> for App {
 }
 
 delegate_compositor!(App);
-delegate_subcompositor!(App);
 delegate_output!(App);
 delegate_shm!(App);
 delegate_layer!(App);
@@ -1465,8 +1092,6 @@ delegate_pointer!(App);
 delegate_registry!(App);
 delegate_simple!(App, WpViewporter, 1);
 wayland_client::delegate_noop!(App: ignore WpViewport);
-wayland_client::delegate_noop!(App: WpAlphaModifierV1);
-wayland_client::delegate_noop!(App: WpAlphaModifierSurfaceV1);
 
 /// An output's logical rectangle in layout (y-down) pixels: `((x, y), (w, h))`.
 type LogicalRect = ((i32, i32), (i32, i32));

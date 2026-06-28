@@ -4,9 +4,10 @@
 //! own encoding, plus what we know about that encoding (a resolved
 //! [`ColorEncoding`], or an ICC profile still to be resolved). [`finish`]
 //! then runs ICC resolution (see [`crate::cms`]), premultiplies alpha, and
-//! packs into one of the two wire formats we ship to the compositor:
-//! 8-bit RGBA for ordinary SDR content, fp16 RGBA for everything that
-//! needs more range or precision (>8-bit sources, linear/PQ encodings).
+//! packs into one of two pixel formats: 8-bit RGBA for ordinary SDR
+//! content, fp16 RGBA for everything that needs more range or precision
+//! (>8-bit sources, linear/PQ encodings). [`DecodedImage::to_working_space`]
+//! then converts to the GPU's extended-linear working space for rendering.
 //!
 //! Format dispatch is by magic bytes, not extension.
 
@@ -23,15 +24,12 @@ use half::f16;
 use crate::cms;
 use crate::color::{ColorEncoding, Tf};
 
-/// Wire pixel formats. Decoding produces `Rgba8` (`Abgr8888`) or `RgbaF16`
-/// (`Abgr16161616f`); `Rgba16` (`Abgr16161616`, 16-bit unorm) only appears
-/// via capability adaptation, for compositors with deep integer buffers
-/// but no fp16 shm (KWin). Premultiplied alpha, tightly packed, RGBA
-/// memory order.
+/// Wire pixel formats. Decoding produces `Rgba8` (`Abgr8888`) for ordinary
+/// SDR content or `RgbaF16` (`Abgr16161616f`) for everything that needs more
+/// range or precision. Premultiplied alpha, tightly packed, RGBA memory order.
 #[derive(Debug, Clone)]
 pub enum Pixels {
     Rgba8(Vec<u8>),
-    Rgba16(Vec<u16>),
     RgbaF16(Vec<f16>),
 }
 
@@ -41,25 +39,21 @@ pub struct DecodedImage {
     pub height: u32,
     pub pixels: Pixels,
     pub encoding: ColorEncoding,
-    /// Whether any pixel has alpha < 1 (drives the surface opaque region).
+    /// Whether any pixel has alpha < 1. Informational decode metadata — the
+    /// GPU wallpaper path composites every image over an opaque background,
+    /// so it doesn't currently branch on this; retained (and test-exercised)
+    /// as part of the decoder contract.
+    #[allow(dead_code)]
     pub has_alpha: bool,
 }
 
 impl DecodedImage {
-    /// Lossy fallback for compositors that don't accept fp16 shm buffers:
-    /// quantize to 8-bit, encoding linear-light content with `target_tf`
-    /// first (8-bit linear bands horribly in the darks) and retagging.
-    /// Values above 1.0 clip to reference white. Display-referred TFs just
-    /// clamp and keep their tag.
+    /// Quantize to 8-bit RGBA — used to prepare a shader's static image
+    /// channels for upload (Shadertoy textures are 8-bit). Linear-light
+    /// content is encoded through `target_tf` first (8-bit linear bands
+    /// horribly in the darks) and retagged; values above 1.0 clip to
+    /// reference white. Display-referred TFs just clamp and keep their tag.
     pub fn quantized_to_8bit(&self, target_tf: Tf) -> DecodedImage {
-        if let Pixels::Rgba16(d) = &self.pixels {
-            // Already display-referred unorm (adaptation output); just
-            // drop precision.
-            return DecodedImage {
-                pixels: Pixels::Rgba8(d.iter().map(|&v| (v >> 8) as u8).collect()),
-                ..self.clone()
-            };
-        }
         let Pixels::RgbaF16(d) = &self.pixels else {
             return self.clone();
         };
@@ -95,92 +89,6 @@ impl DecodedImage {
         DecodedImage {
             pixels: Pixels::Rgba8(out),
             encoding,
-            ..self.clone()
-        }
-    }
-
-    /// Re-encode through a different display-referred TF (for compositors
-    /// whose named-TF vocabulary lacks the source's — e.g. KWin dropped the
-    /// protocol-deprecated `srgb`). Pixels are decoded with the source EOTF
-    /// and re-encoded with the target OETF, through straight alpha; linear
-    /// sources clip above reference white and drop their luminances.
-    pub fn reencoded_tf(&self, target_tf: Tf) -> DecodedImage {
-        let src_tf = self.encoding.tf;
-        let convert = |v: f32| target_tf.oetf(src_tf.eotf(v.clamp(0.0, 1.0)));
-        let pixels = match &self.pixels {
-            Pixels::Rgba8(d) => {
-                // Opaque pixels go through a per-channel LUT; translucent
-                // ones need straight-alpha math.
-                let lut: Vec<u8> = (0..=255u16)
-                    .map(|v| (convert(v as f32 / 255.0) * 255.0 + 0.5) as u8)
-                    .collect();
-                let mut out = Vec::with_capacity(d.len());
-                for px in d.chunks_exact(4) {
-                    let a = px[3];
-                    if a == 255 {
-                        out.extend_from_slice(&[
-                            lut[px[0] as usize],
-                            lut[px[1] as usize],
-                            lut[px[2] as usize],
-                            255,
-                        ]);
-                    } else {
-                        let af = a as f32 / 255.0;
-                        for &c in &px[..3] {
-                            let v = if a == 0 {
-                                0.0
-                            } else {
-                                convert(c as f32 / 255.0 / af) * af
-                            };
-                            out.push((v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
-                        }
-                        out.push(a);
-                    }
-                }
-                Pixels::Rgba8(out)
-            }
-            Pixels::Rgba16(d) => {
-                let mut out = Vec::with_capacity(d.len());
-                for px in d.chunks_exact(4) {
-                    let a = px[3] as f32 / 65535.0;
-                    for &c in &px[..3] {
-                        let v = if a > 0.0 {
-                            convert(c as f32 / 65535.0 / a) * a
-                        } else {
-                            0.0
-                        };
-                        out.push((v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16);
-                    }
-                    out.push(px[3]);
-                }
-                Pixels::Rgba16(out)
-            }
-            Pixels::RgbaF16(d) => {
-                let mut out = Vec::with_capacity(d.len());
-                for px in d.chunks_exact(4) {
-                    let a = px[3].to_f32().clamp(0.0, 1.0);
-                    for &c in &px[..3] {
-                        let v = if a > 0.0 {
-                            convert(c.to_f32() / a) * a
-                        } else {
-                            0.0
-                        };
-                        out.push(f16::from_f32(v));
-                    }
-                    out.push(f16::from_f32(a));
-                }
-                Pixels::RgbaF16(out)
-            }
-        };
-        DecodedImage {
-            pixels,
-            encoding: ColorEncoding {
-                tf: target_tf,
-                primaries: self.encoding.primaries,
-                // Display-referred either side; luminance declarations
-                // don't survive the conversion (linear sources clipped).
-                luminances: None,
-            },
             ..self.clone()
         }
     }
@@ -323,70 +231,85 @@ impl DecodedImage {
         }
     }
 
-    /// Repack fp16 pixels into 16-bit unorm (`Abgr16161616`) for
-    /// compositors with deep integer shm but no fp16 (KWin). Electrical
-    /// content ([0,1] by definition) converts losslessly-for-display;
-    /// linear HDR content PQ-encodes (perceptually transparent at 16 bits,
-    /// preserving the full luminance range — this is the path that keeps
-    /// HDR alive without fp16) or, without compositor PQ support, falls
-    /// back to `sdr_tf` with highlights clipped at reference white.
-    pub fn repacked_unorm16(&self, pq_supported: bool, sdr_tf: Tf) -> DecodedImage {
-        let Pixels::RgbaF16(d) = &self.pixels else {
-            return self.clone();
-        };
-        let q = |v: f32| (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
-        let linear = self.encoding.tf == Tf::Linear;
-        // 1.0 in linear content = this many cd/m² (scRGB 80, scene-linear
-        // 203 — always set by the decoders that produce Tf::Linear).
-        let ref_nits = self
+    /// Convert to the unified GPU working space: premultiplied
+    /// extended-linear light with sRGB primaries, `1.0` = the source's
+    /// reference white. Returns the fp16 RGBA pixels plus the
+    /// [`ColorEncoding`] to tag the rendered dmabuf with (always `Linear` +
+    /// sRGB primaries).
+    ///
+    /// The source's luminances are carried through, so brightness — and any
+    /// `--tone-map`/`--scale`/`--cap` remastering applied via
+    /// [`Self::luminance_controlled`] beforehand — survives across render
+    /// intents: ext-linear and the source TFs share the `1.0 = reference
+    /// white` anchoring, so perceptual/relative are invariant and absolute
+    /// matches because the reference is preserved. This step is purely a
+    /// color-space change; apply luminance shaping first if wanted.
+    pub fn to_working_space(&self) -> (Vec<f16>, ColorEncoding) {
+        use crate::color::{conversion_to_srgb_primaries, default_luminances, pq_eotf};
+        use crate::color::{PrimaryVolume, Tf};
+
+        let lum = self
             .encoding
             .luminances
-            .map(|l| l.reference)
-            .unwrap_or(80.0) as f32;
+            .unwrap_or_else(|| default_luminances(self.encoding.tf));
+        let ref_nits = lum.reference as f32;
+        let tf = self.encoding.tf;
+        let m = conversion_to_srgb_primaries(self.encoding.primaries);
 
-        let (convert, encoding): (Box<dyn Fn(f32) -> f32>, _) = if !linear {
-            // Electrical signal already; just requantize.
-            (Box::new(|v: f32| v), self.encoding)
-        } else if pq_supported {
-            (
-                Box::new(move |v: f32| crate::color::pq_oetf(v.max(0.0) * ref_nits / 10000.0)),
-                ColorEncoding {
-                    tf: Tf::Pq,
-                    primaries: self.encoding.primaries,
-                    luminances: None,
-                },
-            )
-        } else {
-            (
-                Box::new(move |v: f32| sdr_tf.oetf(v.clamp(0.0, 1.0))),
-                ColorEncoding {
-                    tf: sdr_tf,
-                    primaries: self.encoding.primaries,
-                    luminances: None,
-                },
-            )
+        // Straight electrical channel value → reference-relative linear light.
+        let to_linear = |v: f32| -> f32 {
+            match tf {
+                // PQ EOTF yields absolute nits (×10000); rebase onto reference.
+                Tf::Pq => pq_eotf(v.clamp(0.0, 1.0)) * 10000.0 / ref_nits,
+                // Already linear (1.0 = reference white); keep extended values.
+                Tf::Linear => v,
+                // Display-referred curves decode to [0,1], 1.0 = reference white.
+                Tf::Srgb | Tf::Gamma22 | Tf::Bt1886 => tf.eotf(v.clamp(0.0, 1.0)),
+            }
         };
 
-        let mut out = Vec::with_capacity(d.len());
-        for px in d.chunks_exact(4) {
-            let a = px[3].to_f32().clamp(0.0, 1.0);
-            for &c in &px[..3] {
-                // Through straight alpha: transform the straight value,
-                // re-premultiply the encoded result.
-                let v = if a > 0.0 {
-                    convert(c.to_f32() / a) * a
-                } else {
-                    0.0
-                };
-                out.push(q(v));
+        // Source pixels are premultiplied; the TF/primary math runs on
+        // straight values, with alpha re-applied to the linear result.
+        let count = (self.width as usize) * (self.height as usize);
+        let mut out: Vec<f16> = Vec::with_capacity(count * 4);
+        let mut emit = |straight: [f32; 3], a: f32| {
+            let lin = [
+                to_linear(straight[0]),
+                to_linear(straight[1]),
+                to_linear(straight[2]),
+            ];
+            for row in &m {
+                let c = row[0] * lin[0] + row[1] * lin[1] + row[2] * lin[2];
+                out.push(f16::from_f32(c * a));
             }
-            out.push(q(a));
+            out.push(f16::from_f32(a));
+        };
+        let unpremul = |c: f32, a: f32| if a > 0.0 { c / a } else { 0.0 };
+        match &self.pixels {
+            Pixels::Rgba8(d) => {
+                for px in d.chunks_exact(4) {
+                    let a = px[3] as f32 / 255.0;
+                    let n = |i: usize| unpremul(px[i] as f32 / 255.0, a);
+                    emit([n(0), n(1), n(2)], a);
+                }
+            }
+            Pixels::RgbaF16(d) => {
+                for px in d.chunks_exact(4) {
+                    let a = px[3].to_f32().clamp(0.0, 1.0);
+                    let n = |i: usize| unpremul(px[i].to_f32(), a);
+                    emit([n(0), n(1), n(2)], a);
+                }
+            }
         }
-        DecodedImage {
-            pixels: Pixels::Rgba16(out),
-            encoding,
-            ..self.clone()
-        }
+
+        (
+            out,
+            ColorEncoding {
+                tf: Tf::Linear,
+                primaries: PrimaryVolume::Srgb,
+                luminances: Some(lum),
+            },
+        )
     }
 }
 
@@ -660,17 +583,6 @@ mod jxr_probe {
                     }
                 }
             }
-            super::Pixels::Rgba16(d) => {
-                for px in d.chunks_exact(4) {
-                    for &c in &px[..3] {
-                        let v = c as f32 / 65535.0;
-                        mn = mn.min(v);
-                        mx = mx.max(v);
-                        sum += v as f64;
-                        n += 1;
-                    }
-                }
-            }
             super::Pixels::RgbaF16(d) => {
                 for px in d.chunks_exact(4) {
                     for &c in &px[..3] {
@@ -757,84 +669,71 @@ mod quantize_tests {
 }
 
 #[cfg(test)]
-mod reencode_tests {
+mod working_space_tests {
     use super::*;
-    use crate::color::{ColorEncoding, PrimaryVolume, Tf};
+    use crate::color::{ColorEncoding, Luminances, PrimaryVolume, Tf};
 
-    fn srgb_image(pixels: Pixels) -> DecodedImage {
+    fn srgb8(rgba: [u8; 4]) -> DecodedImage {
         DecodedImage {
             width: 1,
             height: 1,
-            pixels,
+            pixels: Pixels::Rgba8(rgba.to_vec()),
             encoding: ColorEncoding::SRGB,
-            has_alpha: false,
+            has_alpha: rgba[3] != 255,
         }
     }
 
     #[test]
-    fn srgb_to_gamma22_reencodes_opaque_8bit() {
-        // sRGB 188 → linear ≈0.5029 → gamma2.2 ≈ 0.7316 → 187.
-        let img = srgb_image(Pixels::Rgba8(vec![188, 0, 255, 255]));
-        let out = img.reencoded_tf(Tf::Gamma22);
-        assert_eq!(out.encoding.tf, Tf::Gamma22);
-        let Pixels::Rgba8(d) = &out.pixels else {
-            panic!()
-        };
-        assert_eq!(&d[..], &[187, 0, 255, 255]);
+    fn srgb_white_stays_white_tagged_extlinear() {
+        let (px, enc) = srgb8([255, 255, 255, 255]).to_working_space();
+        assert_eq!(enc.tf, Tf::Linear);
+        assert_eq!(enc.primaries, PrimaryVolume::Srgb);
+        // Untagged sRGB inherits the 80-nit sRGB default reference.
+        assert_eq!(enc.luminances.unwrap().reference, 80.0);
+        for c in &px[..3] {
+            assert!((c.to_f32() - 1.0).abs() < 1e-3, "white→{}", c.to_f32());
+        }
+        assert!((px[3].to_f32() - 1.0).abs() < 1e-3);
     }
 
     #[test]
-    fn reencode_respects_premultiplied_alpha() {
-        // Straight value 188 premultiplied by a=0.5 → 94 in the buffer.
-        // Conversion must go through the straight value: 188→187, then
-        // re-premultiply → round(187 * 128/255) = 94.
-        let img = srgb_image(Pixels::Rgba8(vec![94, 0, 128, 128]));
-        let out = img.reencoded_tf(Tf::Gamma22);
-        let Pixels::Rgba8(d) = &out.pixels else {
-            panic!()
-        };
-        // straight 94/(128/255)=187.3→ converted ≈186.5 → ×0.502 ≈ 94
-        assert!((d[0] as i32 - 94).abs() <= 1, "got {}", d[0]);
-        assert_eq!(d[3], 128);
+    fn srgb_decodes_through_the_eotf() {
+        let byte = 188u8;
+        let (px, _) = srgb8([byte, byte, byte, 255]).to_working_space();
+        let expect = Tf::Srgb.eotf(byte as f32 / 255.0);
+        assert!(
+            (px[0].to_f32() - expect).abs() < 1e-3,
+            "got {} want {expect}",
+            px[0].to_f32()
+        );
     }
 
     #[test]
-    fn gamma22_quantize_target() {
-        // linear 0.5 → 0.5^(1/2.2) ≈ 0.7297 → 186
-        let d: Vec<f16> = [0.5f32, 0.0, 1.0, 1.0]
-            .iter()
-            .map(|&v| f16::from_f32(v))
-            .collect();
+    fn premultiplied_alpha_recovered() {
+        // Straight white-ish red at 50% alpha, stored premultiplied.
+        let (px, _) = srgb8([128, 0, 0, 128]).to_working_space();
+        let a = px[3].to_f32();
+        assert!((a - 128.0 / 255.0).abs() < 1e-3);
+        // straight red = (128/255)/(128/255) = 1.0 → linear 1.0, re-premul → a.
+        assert!(
+            (px[0].to_f32() - a).abs() < 2e-2,
+            "premul red {}",
+            px[0].to_f32()
+        );
+        assert!(px[1].to_f32().abs() < 1e-3 && px[2].to_f32().abs() < 1e-3);
+    }
+
+    #[test]
+    fn scrgb_linear_passes_through() {
         let img = DecodedImage {
             width: 1,
             height: 1,
-            pixels: Pixels::RgbaF16(d),
-            encoding: ColorEncoding {
-                tf: Tf::Linear,
-                primaries: PrimaryVolume::Srgb,
-                luminances: None,
-            },
-            has_alpha: false,
-        };
-        let q = img.quantized_to_8bit(Tf::Gamma22);
-        assert_eq!(q.encoding.tf, Tf::Gamma22);
-        let Pixels::Rgba8(d) = &q.pixels else {
-            panic!()
-        };
-        assert_eq!(&d[..], &[186, 0, 255, 255]);
-    }
-}
-
-#[cfg(test)]
-mod repack_tests {
-    use super::*;
-    use crate::color::{pq_eotf, ColorEncoding, Luminances, PrimaryVolume, Tf};
-
-    fn scrgb(vals: [f32; 4]) -> DecodedImage {
-        DecodedImage {
-            width: 1,
-            height: 1,
-            pixels: Pixels::RgbaF16(vals.iter().map(|&v| f16::from_f32(v)).collect()),
+            pixels: Pixels::RgbaF16(
+                [1.0f32, 5.0, 0.0, 1.0]
+                    .iter()
+                    .map(|&v| f16::from_f32(v))
+                    .collect(),
+            ),
             encoding: ColorEncoding {
                 tf: Tf::Linear,
                 primaries: PrimaryVolume::Srgb,
@@ -845,81 +744,36 @@ mod repack_tests {
                 }),
             },
             has_alpha: false,
-        }
-    }
-
-    #[test]
-    fn linear_with_pq_keeps_absolute_luminance() {
-        // scRGB 1.0 = 80 nits; 5.0 = 400 nits. PQ round-trip must recover
-        // the nits (16-bit unorm + PQ is ~perceptually lossless).
-        let img = scrgb([1.0, 5.0, 0.0, 1.0]);
-        let out = img.repacked_unorm16(true, Tf::Gamma22);
-        assert_eq!(out.encoding.tf, Tf::Pq);
-        assert_eq!(out.encoding.primaries, PrimaryVolume::Srgb);
-        let Pixels::Rgba16(d) = &out.pixels else {
-            panic!()
         };
-        let nits = |v: u16| pq_eotf(v as f32 / 65535.0) * 10000.0;
-        assert!((nits(d[0]) - 80.0).abs() < 0.1, "got {}", nits(d[0]));
-        assert!((nits(d[1]) - 400.0).abs() < 0.5, "got {}", nits(d[1]));
-        assert_eq!(d[2], 0);
-        assert_eq!(d[3], 65535);
+        let (px, enc) = img.to_working_space();
+        assert_eq!(enc.tf, Tf::Linear);
+        assert!((px[0].to_f32() - 1.0).abs() < 1e-2);
+        assert!((px[1].to_f32() - 5.0).abs() < 1e-2); // extended (>1) survives
+        assert!(px[2].to_f32().abs() < 1e-2);
+        assert_eq!(enc.luminances.unwrap().reference, 80.0); // preserved
     }
 
     #[test]
-    fn linear_without_pq_clips_to_sdr() {
-        // 0.5 linear → gamma2.2-encoded; 5.0 clips to 1.0.
-        let img = scrgb([0.5, 5.0, 0.0, 1.0]);
-        let out = img.repacked_unorm16(false, Tf::Gamma22);
-        assert_eq!(out.encoding.tf, Tf::Gamma22);
-        let Pixels::Rgba16(d) = &out.pixels else {
-            panic!()
-        };
-        let expect = (0.5f32.powf(1.0 / 2.2) * 65535.0 + 0.5) as u16;
-        assert_eq!(d[0], expect);
-        assert_eq!(d[1], 65535);
-    }
-
-    #[test]
-    fn electrical_fp16_requantizes_verbatim() {
-        // PQ-encoded fp16 (HDR AVIF/JXL path): signal is [0,1] electrical,
-        // repack must not touch the values or the tag.
+    fn wide_gamut_neutral_stays_neutral() {
+        // A BT.2020 neutral gray must remain neutral after the primary
+        // conversion to sRGB (equal channels in, equal channels out).
         let img = DecodedImage {
             width: 1,
             height: 1,
-            pixels: Pixels::RgbaF16(
-                [0.25f32, 0.5, 0.75, 1.0]
-                    .iter()
-                    .map(|&v| f16::from_f32(v))
-                    .collect(),
-            ),
+            pixels: Pixels::Rgba8(vec![150, 150, 150, 255]),
             encoding: ColorEncoding {
-                tf: Tf::Pq,
+                tf: Tf::Srgb,
                 primaries: PrimaryVolume::Bt2020,
                 luminances: None,
             },
             has_alpha: false,
         };
-        let out = img.repacked_unorm16(true, Tf::Gamma22);
-        assert_eq!(out.encoding.tf, Tf::Pq);
-        let Pixels::Rgba16(d) = &out.pixels else {
-            panic!()
-        };
-        assert_eq!(d[0], (0.25 * 65535.0 + 0.5) as u16);
-        assert_eq!(d[1], (0.5 * 65535.0 + 0.5) as u16);
-        assert_eq!(d[3], 65535);
-    }
-
-    #[test]
-    fn pq_oetf_eotf_roundtrip() {
-        for nits in [0.0f32, 0.1, 1.0, 80.0, 203.0, 1000.0, 10000.0] {
-            let e = crate::color::pq_oetf(nits / 10000.0);
-            let back = pq_eotf(e) * 10000.0;
-            assert!(
-                (back - nits).abs() < nits.max(1.0) * 1e-3,
-                "{nits} -> {e} -> {back}"
-            );
-        }
+        let (px, _) = img.to_working_space();
+        let (r, g, b) = (px[0].to_f32(), px[1].to_f32(), px[2].to_f32());
+        assert!(
+            (r - g).abs() < 1e-3 && (g - b).abs() < 1e-3,
+            "neutral drifted: {r},{g},{b}"
+        );
     }
 }
 
