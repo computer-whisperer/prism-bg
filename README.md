@@ -144,6 +144,46 @@ Extras beyond swaybg (also per-output-group):
 
   See `examples/shaders/feedback.frag`. Feedback shaders redraw every frame to
   evolve (cap with `--fps`); on the first frame `iPrevFrame` is black.
+
+  For effects that need more than one buffer — separable blur, bloom, fluid,
+  multi-stage simulation — a shader can declare a full **multi-pass render
+  graph** with a `/*!prism …*/` JSON metadata block. It lists named offscreen
+  buffer passes (each an `RGBA16_SFLOAT` ping-pong target) and wires each pass's
+  `iChannel0..3` inputs; the pass bodies follow in `//!pass <name>` sections,
+  with optional shared code in a `//!common` section (spliced into every pass
+  after its `#version`):
+
+  ```glsl
+  /*!prism
+  { "buffers": ["scene", "bloom"],
+    "channels": {
+      "bloom": {"0": "scene"},               // reads the scene buffer
+      "image": {"0": "scene", "1": "bloom"}  // displayed pass reads both
+    } }
+  */
+  //!common
+  /* uniforms + helpers shared by all passes */
+  //!pass scene
+  #version 450
+  /* … renders into the "scene" buffer … */
+  //!pass bloom
+  #version 450
+  layout(set = 1, binding = 0) uniform sampler2D iChannel0; // = scene
+  /* … */
+  //!pass image
+  #version 450
+  layout(set = 1, binding = 0) uniform sampler2D iChannel0; // = scene
+  layout(set = 1, binding = 1) uniform sampler2D iChannel1; // = bloom
+  /* … the displayed result … */
+  ```
+
+  Buffers render in declared order, then the `image` pass to the screen. A
+  channel reads the referenced buffer's *current* frame if that buffer rendered
+  earlier this frame, else its *previous* frame; `"self"` reads a buffer's own
+  previous frame (feedback, like `iPrevFrame`). Channels are `set = 1`,
+  `binding = <N>` (the `iChannelN` index) and are sampled y-flipped, same as
+  `iPrevFrame`. Up to 4 channels per pass. Multi-pass shaders redraw every
+  frame. See `examples/shaders/bloom.frag` for a worked separable-blur bloom.
 - `--fps <n>` — cap an animated shader's render rate (1..=1000); default is
   the compositor's vsync cadence. `iTime` stays real-time, so animation speed
   is unchanged — it's just sampled less often. Requires `--shader`.

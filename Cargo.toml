@@ -58,6 +58,11 @@ jpegxr = "0.3"
 pipewire = "0.9.2"
 rustfft = "6.4"
 
+# Multi-pass shaders: the `/*!prism … */` metadata block (buffers + channel
+# routing) embedded in a .frag is parsed as JSON.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 # jpegxr 0.3.1 vendored: its pinned bindgen 0.69 generates opaque structs
 # with current libclang (forward-declared tagPKImageDecode); bumped to
 # bindgen 0.72. Drop the patch when upstream updates.

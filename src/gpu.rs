@@ -27,6 +27,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use anyhow::{bail, Context, Result};
 use ash::vk;
 
+use crate::shadergraph::{self, ChannelSource, GraphSpec, ImageSpec};
+
 /// Render format: 16-bit float per channel. Matches the `Abgr16161616f`
 /// shm format the image path already uses, so the color-management story
 /// is identical — the shader authors in extended-linear and the surface is
@@ -621,11 +623,11 @@ impl Drop for RenderTarget {
     }
 }
 
-/// Create one internal F16 feedback texture (optimal tiling, color-attachment +
+/// Create one internal F16 buffer texture (optimal tiling, color-attachment +
 /// sampled, device-local) and its view. Unlike [`RenderTarget`] it isn't a
 /// dmabuf — it's sampled and rendered entirely within our queue. The caller
 /// owns the returned handles.
-fn create_feedback_image(gpu: &Gpu, device: &ash::Device, w: u32, h: u32) -> Result<FeedbackImage> {
+fn create_buffer_image(gpu: &Gpu, device: &ash::Device, w: u32, h: u32) -> Result<BufferImage> {
     let image_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(RENDER_FORMAT)
@@ -688,7 +690,7 @@ fn create_feedback_image(gpu: &Gpu, device: &ash::Device, w: u32, h: u32) -> Res
             base_array_layer: 0,
             layer_count: 1,
         });
-    // SAFETY: view_info outlives the call; freed via FeedbackImage::destroy.
+    // SAFETY: view_info outlives the call; freed via BufferImage::destroy.
     let view = match unsafe { device.create_image_view(&view_info, None) } {
         Ok(v) => v,
         Err(e) => {
@@ -699,20 +701,20 @@ fn create_feedback_image(gpu: &Gpu, device: &ash::Device, w: u32, h: u32) -> Res
             return Err(e).context("creating feedback image view");
         }
     };
-    Ok(FeedbackImage {
+    Ok(BufferImage {
         image,
         view,
         memory,
     })
 }
 
-/// Clear both feedback textures to black and transition them to
+/// Clear both buffer textures to black and transition them to
 /// `SHADER_READ_ONLY_OPTIMAL`, so the first frame samples a clean previous
 /// frame. A one-shot command buffer, awaited before returning.
-fn clear_feedback_textures(
+fn clear_buffer_textures(
     gpu: &Gpu,
     device: &ash::Device,
-    textures: &[FeedbackImage; 2],
+    textures: &[BufferImage; 2],
 ) -> Result<()> {
     let alloc = vk::CommandBufferAllocateInfo::default()
         .command_pool(gpu.command_pool)
@@ -799,6 +801,96 @@ fn clear_feedback_textures(
     // SAFETY: the submission has drained (queue_wait_idle), so the cb is free.
     unsafe { device.free_command_buffers(gpu.command_pool, &[cb]) };
     result
+}
+
+/// (Re)build one buffer pass's ping-pong: free old textures/framebuffers,
+/// create two fresh F16 textures + framebuffers (for `render_pass`), clear both
+/// to black → SHADER_READ, and reset parity. Tracks both in Vecs so a mid-build
+/// allocation failure frees everything built so far.
+fn rebuild_pingpong(
+    gpu: &Gpu,
+    device: &ash::Device,
+    render_pass: vk::RenderPass,
+    pp: &mut PingPong,
+    w: u32,
+    h: u32,
+) -> Result<()> {
+    // SAFETY: caller drained in-flight work; free the previous generation.
+    unsafe {
+        if let Some(t) = &pp.textures {
+            for img in t {
+                img.destroy(device);
+            }
+        }
+        for f in pp.framebuffers {
+            if f != vk::Framebuffer::null() {
+                device.destroy_framebuffer(f, None);
+            }
+        }
+    }
+    pp.textures = None;
+    pp.framebuffers = [vk::Framebuffer::null(); 2];
+
+    let mut images: Vec<BufferImage> = Vec::with_capacity(2);
+    let mut fbs: Vec<vk::Framebuffer> = Vec::with_capacity(2);
+    // SAFETY: frees every handle built so far in this loop, each once.
+    let undo = |device: &ash::Device, images: &[BufferImage], fbs: &[vk::Framebuffer]| unsafe {
+        for f in fbs {
+            device.destroy_framebuffer(*f, None);
+        }
+        for i in images {
+            i.destroy(device);
+        }
+    };
+    for _ in 0..2 {
+        let img = match create_buffer_image(gpu, device, w, h) {
+            Ok(i) => i,
+            Err(e) => {
+                undo(device, &images, &fbs);
+                return Err(e);
+            }
+        };
+        let fb_info = vk::FramebufferCreateInfo::default()
+            .render_pass(render_pass)
+            .attachments(std::slice::from_ref(&img.view))
+            .width(w)
+            .height(h)
+            .layers(1);
+        // SAFETY: fb_info outlives the call.
+        let framebuffer = match unsafe { device.create_framebuffer(&fb_info, None) } {
+            Ok(f) => f,
+            Err(e) => {
+                // SAFETY: this image isn't tracked yet; free it + the rest.
+                unsafe { img.destroy(device) };
+                undo(device, &images, &fbs);
+                return Err(e).context("creating buffer framebuffer");
+            }
+        };
+        images.push(img);
+        fbs.push(framebuffer);
+    }
+    let framebuffers = [fbs[0], fbs[1]];
+    let textures = [images.remove(0), images.remove(0)];
+
+    // Clear both to black + move to SHADER_READ so the first frame samples a
+    // clean previous frame (no NaNs to poison a feedback loop).
+    if let Err(e) = clear_buffer_textures(gpu, device, &textures) {
+        // SAFETY: not yet stored; free them.
+        unsafe {
+            for img in &textures {
+                img.destroy(device);
+            }
+            for f in framebuffers {
+                device.destroy_framebuffer(f, None);
+            }
+        }
+        return Err(e);
+    }
+
+    pp.textures = Some(textures);
+    pp.framebuffers = framebuffers;
+    pp.parity.set(0);
+    Ok(())
 }
 
 /// Shadertoy-ish uniforms handed to the fragment shader as push constants
@@ -888,7 +980,7 @@ void main() {
 const BLIT_FRAGMENT_GLSL: &str = r#"#version 450
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 outColor;
-layout(set = 0, binding = 0) uniform sampler2D feedbackTex;
+layout(set = 1, binding = 0) uniform sampler2D feedbackTex;
 void main() { outColor = texture(feedbackTex, uv); }
 "#;
 
@@ -907,11 +999,17 @@ void main() {
 }
 "#;
 
-/// Compile a fragment shader to SPIR-V and discard it — a device-independent
-/// validity check so a bad `--shader` fails at startup with the GLSL
-/// compiler's diagnostic, before any GPU work or output mapping.
-pub fn validate_fragment(source: &str) -> Result<()> {
-    compile_glsl(source, shaderc::ShaderKind::Fragment, "wallpaper.frag")?;
+/// Compile every pass of a [`GraphSpec`] to SPIR-V and discard it — a
+/// device-independent validity check so a bad `--shader` fails at startup with
+/// the GLSL compiler's diagnostic, before any GPU work or output mapping. The
+/// built-in blit (`ImageSpec::ImplicitBlit`) is known-good and skipped.
+pub fn validate_graph(spec: &GraphSpec) -> Result<()> {
+    for pass in &spec.buffers {
+        compile_glsl(&pass.glsl, shaderc::ShaderKind::Fragment, &pass.name)?;
+    }
+    if let ImageSpec::Explicit(p) = &spec.image {
+        compile_glsl(&p.glsl, shaderc::ShaderKind::Fragment, &p.name)?;
+    }
     Ok(())
 }
 
@@ -947,16 +1045,16 @@ struct Frame {
     descriptor_set: vk::DescriptorSet,
 }
 
-/// One internal F16 feedback texture (not a dmabuf — it never leaves our
-/// queue). Two of these ping-pong so a feedback shader can sample the previous
-/// frame while writing the next.
-struct FeedbackImage {
+/// One internal F16 buffer texture (not a dmabuf — it never leaves our queue).
+/// Two of these ping-pong per pass so a pass can sample the previous frame (its
+/// own or another buffer's) while writing the next.
+struct BufferImage {
     image: vk::Image,
     view: vk::ImageView,
     memory: vk::DeviceMemory,
 }
 
-impl FeedbackImage {
+impl BufferImage {
     // SAFETY: handles are the owner's device's; called once in teardown.
     unsafe fn destroy(&self, device: &ash::Device) {
         device.destroy_image_view(self.view, None);
@@ -965,47 +1063,65 @@ impl FeedbackImage {
     }
 }
 
-/// Everything a feedback (`iPrevFrame`) shader needs beyond the base renderer:
-/// a ping-pong pair of internal textures, the off-screen render pass that
-/// writes them, and the built-in blit pipeline that presents the latest into
-/// the dmabuf. The user shader's pipeline itself lives in [`ShaderRenderer`]
-/// (`pipeline`/`layout`), built against [`Self::render_pass`] with the extra
-/// sampler set; this holds the rest.
-struct Feedback {
-    /// Linear sampler for `iPrevFrame` and the blit.
-    sampler: vk::Sampler,
-    /// Off-screen pass writing a feedback texture (F16, → SHADER_READ).
-    render_pass: vk::RenderPass,
-    /// Layout of the single combined-image-sampler set, used as set 1 of the
-    /// user pipeline (`iPrevFrame`) and set 0 of the blit.
-    sampler_set_layout: vk::DescriptorSetLayout,
-    descriptor_pool: vk::DescriptorPool,
-    /// `tex_sets[i]` samples `textures[i]`; re-pointed when textures resize.
-    tex_sets: [vk::DescriptorSet; 2],
-    blit_layout: vk::PipelineLayout,
-    blit_pipeline: vk::Pipeline,
-    /// The ping-pong textures and their framebuffers; rebuilt on resize.
-    textures: Option<[FeedbackImage; 2]>,
+/// A ping-pong pair of offscreen textures for one buffer pass: the shader
+/// writes one while sampling the other (the previous frame). Rebuilt on resize.
+struct PingPong {
+    textures: Option<[BufferImage; 2]>,
     framebuffers: [vk::Framebuffer; 2],
-    size: (u32, u32),
-    /// Which texture is the current write target this frame; toggles each
-    /// render. `Cell` so [`ShaderRenderer::render`] can stay `&self`.
+    /// Which texture is written this frame; toggles after each render.
+    /// `Cell` so [`ShaderRenderer::render`] stays `&self`.
     parity: std::cell::Cell<usize>,
 }
 
-/// The render pass + graphics pipeline for one fragment shader. Renders a
-/// fullscreen triangle into an fp16 [`RenderTarget`]; viewport/scissor are
-/// dynamic so a resize reuses the pipeline.
+/// One pass of the render [`Graph`]: a compiled pipeline plus its input-channel
+/// wiring. A buffer pass writes its [`PingPong`] target; the image pass writes
+/// straight into the dmabuf (`target` is `None`).
+struct GpuPass {
+    pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+    /// `set = 1` combined-image-sampler layout; `None` if the pass has no
+    /// channels (then the pipeline layout is just the audio UBO set).
+    channel_set_layout: Option<vk::DescriptorSetLayout>,
+    /// Resolved channel sources (which `iChannelN` reads which buffer).
+    channels: Vec<shadergraph::Channel>,
+    /// One channel descriptor set per ring slot, re-pointed each frame at the
+    /// right ping-pong textures (safe: gated by the slot's fence). Empty when
+    /// the pass has no channels.
+    channel_sets: Vec<vk::DescriptorSet>,
+    /// Offscreen ping-pong target for a buffer pass; `None` for the image pass.
+    target: Option<PingPong>,
+}
+
+/// The multi-pass render graph for one shader: the offscreen buffer passes (in
+/// render order) and the displayed image pass. A plain shader is just an image
+/// pass with no buffers and no channels; an `iPrevFrame` shader is one buffer
+/// plus a built-in blit image pass; metadata shaders are the general case.
+struct Graph {
+    /// Sampler for channel reads; `None` if no pass samples anything.
+    sampler: Option<vk::Sampler>,
+    /// Off-screen render pass shared by all buffer passes (F16 → SHADER_READ);
+    /// `None` if there are no buffers.
+    offscreen_render_pass: Option<vk::RenderPass>,
+    /// Pool for every pass's per-slot channel descriptor sets; `None` if no
+    /// pass has channels.
+    descriptor_pool: Option<vk::DescriptorPool>,
+    buffers: Vec<GpuPass>,
+    image: GpuPass,
+    size: (u32, u32),
+}
+
+/// The render graph + per-slot command resources for one shader. The image
+/// pass renders a fullscreen triangle into an fp16 [`RenderTarget`] (dmabuf);
+/// any buffer passes render into offscreen ping-pong textures first.
 pub struct ShaderRenderer {
     device: ash::Device,
     queue: vk::Queue,
     queue_family: u32,
+    /// The dmabuf (present) render pass; the image pass targets it.
     render_pass: vk::RenderPass,
-    layout: vk::PipelineLayout,
-    pipeline: vk::Pipeline,
     /// Spectrum-UBO descriptor layout (set 0, binding 0) and the pool the
-    /// per-slot sets are allocated from. Always present so every shader's
-    /// pipeline layout is uniform; a shader that ignores the UBO is fine.
+    /// per-slot sets are allocated from. Bound as set 0 of every pass; a shader
+    /// that ignores the UBO is fine.
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
     /// One [`Frame`] per ring slot; indexed by the slot passed to [`Self::render`].
@@ -1016,43 +1132,18 @@ pub struct ShaderRenderer {
     /// compositor an implicit fence and never block. False (rare) falls back
     /// to a CPU fence wait before presenting.
     sync_file: bool,
-    /// Feedback machinery, present only when the shader samples `iPrevFrame`.
-    /// When set, `pipeline` renders the user shader into a feedback texture
-    /// (via `feedback.render_pass`) and the blit presents it; when `None`, the
-    /// shader renders straight into the dmabuf as before.
-    feedback: Option<Feedback>,
+    /// The pass graph (buffers + image).
+    graph: Graph,
 }
 
 impl ShaderRenderer {
-    /// Build the pipeline for `fragment_glsl` (a fragment shader providing
-    /// `main` and the `Push` uniform block — see [`DEFAULT_FRAGMENT_GLSL`]),
-    /// with `frames` per-slot command resources (one per ring buffer). When
-    /// `feedback` is set, the shader samples `iPrevFrame` (its previous output):
-    /// it's rendered into a ping-pong texture and presented via a built-in blit.
-    pub fn new(
-        gpu: &Gpu,
-        fragment_glsl: &str,
-        frames: usize,
-        feedback: bool,
-    ) -> Result<ShaderRenderer> {
+    /// Build the renderer for `spec` — a parsed shader graph: the displayed
+    /// image pass plus any offscreen buffer passes it feeds from — with `frames`
+    /// per-slot command resources (one per ring buffer).
+    pub fn new(gpu: &Gpu, spec: &GraphSpec, frames: usize) -> Result<ShaderRenderer> {
         let device = gpu.device.clone();
-        let vert_spv = compile_glsl(VERTEX_GLSL, shaderc::ShaderKind::Vertex, "fullscreen.vert")?;
-        let frag_spv = compile_glsl(
-            fragment_glsl,
-            shaderc::ShaderKind::Fragment,
-            "wallpaper.frag",
-        )?;
-
         let render_pass = Self::create_render_pass(&device)?;
-        match Self::build(
-            gpu,
-            device.clone(),
-            render_pass,
-            &vert_spv,
-            &frag_spv,
-            frames,
-            feedback,
-        ) {
+        match Self::build(gpu, device.clone(), render_pass, spec, frames) {
             Ok(r) => Ok(r),
             Err(e) => {
                 // SAFETY: render_pass created just above, nothing else owns it.
@@ -1125,125 +1216,35 @@ impl ShaderRenderer {
         gpu: &Gpu,
         device: ash::Device,
         render_pass: vk::RenderPass,
-        vert_spv: &[u32],
-        frag_spv: &[u32],
+        spec: &GraphSpec,
         frame_count: usize,
-        feedback: bool,
     ) -> Result<ShaderRenderer> {
-        // SAFETY: SPIR-V slices are valid for the duration of module creation.
-        let vert = unsafe {
-            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(vert_spv), None)
-        }
-        .context("creating vertex shader module")?;
-        let frag = unsafe {
-            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(frag_spv), None)
-        };
-        let frag = match frag {
-            Ok(f) => f,
-            Err(e) => {
-                unsafe { device.destroy_shader_module(vert, None) };
-                return Err(e).context("creating fragment shader module");
-            }
-        };
-
-        // Spectrum UBO at set 0, binding 0 (fragment stage). Created even for
-        // shaders that don't sample audio, so the pipeline layout is uniform.
+        // Spectrum UBO at set 0, binding 0 (fragment stage). Bound as set 0 of
+        // every pass; a shader that ignores it is fine.
         let ubo_binding = vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT);
         let ubo_bindings = [ubo_binding];
-        let set_layout_info =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(&ubo_bindings);
+        let set_layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&ubo_bindings);
         // SAFETY: set_layout_info outlives the call.
         let descriptor_set_layout =
             unsafe { device.create_descriptor_set_layout(&set_layout_info, None) }
-                .context("creating descriptor set layout")?;
+                .context("creating audio descriptor set layout")?;
 
-        // Feedback machinery first (when requested): the user pipeline must be
-        // built against its off-screen render pass and gain the sampler set.
-        let feedback = if feedback {
-            match Self::build_feedback(&device, render_pass) {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    // SAFETY: only these three exist so far.
-                    unsafe {
-                        device.destroy_shader_module(vert, None);
-                        device.destroy_shader_module(frag, None);
-                        device.destroy_descriptor_set_layout(descriptor_set_layout, None);
-                    }
-                    return Err(e);
-                }
-            }
-        } else {
-            None
-        };
-
-        // Helper to unwind everything created above on a later failure (no
-        // ShaderRenderer exists yet, so Drop won't run). render_pass is freed
-        // by the caller (`new`).
-        let cleanup = |layout: Option<vk::PipelineLayout>, pipeline: Option<vk::Pipeline>| {
-            // SAFETY: each handle was created above and is freed once here.
-            unsafe {
-                if let Some(p) = pipeline {
-                    device.destroy_pipeline(p, None);
-                }
-                if let Some(l) = layout {
-                    device.destroy_pipeline_layout(l, None);
-                }
-                if let Some(f) = &feedback {
-                    f.destroy(&device);
-                }
-                device.destroy_descriptor_set_layout(descriptor_set_layout, None);
-            }
-        };
-
-        // User pipeline layout: set 0 = audio UBO; set 1 = `iPrevFrame` sampler
-        // (feedback only).
-        let push_range = vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
-            .offset(0)
-            .size(std::mem::size_of::<ShaderUniforms>() as u32);
-        let push_ranges = [push_range];
-        let mut set_layouts = vec![descriptor_set_layout];
-        if let Some(f) = &feedback {
-            set_layouts.push(f.sampler_set_layout);
-        }
-        let layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&set_layouts)
-            .push_constant_ranges(&push_ranges);
-        // SAFETY: layout_info outlives the call.
-        let layout = match unsafe { device.create_pipeline_layout(&layout_info, None) } {
-            Ok(l) => l,
+        // The pass graph (compiles every pass; most failure-prone, so first).
+        let graph = match Self::build_graph(
+            &device,
+            render_pass,
+            descriptor_set_layout,
+            spec,
+            frame_count,
+        ) {
+            Ok(g) => g,
             Err(e) => {
-                // SAFETY: shader modules still live here.
-                unsafe {
-                    device.destroy_shader_module(vert, None);
-                    device.destroy_shader_module(frag, None);
-                }
-                cleanup(None, None);
-                return Err(e).context("creating pipeline layout");
-            }
-        };
-
-        // Feedback shaders render into the off-screen feedback pass; otherwise
-        // straight into the dmabuf render pass.
-        let user_render_pass = feedback
-            .as_ref()
-            .map(|f| f.render_pass)
-            .unwrap_or(render_pass);
-        let pipeline_result = Self::create_pipeline(&device, user_render_pass, layout, vert, frag);
-        // Shader modules are consumed by pipeline creation; destroy regardless.
-        // SAFETY: vert/frag are this device's, no longer referenced.
-        unsafe {
-            device.destroy_shader_module(vert, None);
-            device.destroy_shader_module(frag, None);
-        }
-        let pipeline = match pipeline_result {
-            Ok(p) => p,
-            Err(e) => {
-                cleanup(Some(layout), None);
+                // SAFETY: only the audio layout exists so far.
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
                 return Err(e);
             }
         };
@@ -1256,14 +1257,17 @@ impl ShaderRenderer {
             );
         }
 
-        // The descriptor pool and per-slot resources, with self-contained
-        // cleanup: on any failure here `build_frames` frees what it created and
-        // we tear down everything else above.
+        // Per-slot command resources (audio UBO sets included). On failure,
+        // unwind the graph + audio layout (no ShaderRenderer yet to Drop).
         let (descriptor_pool, frames) =
             match Self::build_frames(gpu, &device, descriptor_set_layout, sync_file, frame_count) {
                 Ok(v) => v,
                 Err(e) => {
-                    cleanup(Some(layout), Some(pipeline));
+                    // SAFETY: graph + audio layout created above, freed once.
+                    unsafe {
+                        graph.destroy(&device);
+                        device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+                    }
                     return Err(e);
                 }
             };
@@ -1273,14 +1277,362 @@ impl ShaderRenderer {
             queue: gpu.queue,
             queue_family: gpu.queue_family,
             render_pass,
-            layout,
-            pipeline,
             descriptor_set_layout,
             descriptor_pool,
             frames,
             external_semaphore_fd_fn: gpu.external_semaphore_fd_fn.clone(),
             sync_file,
-            feedback,
+            graph,
+        })
+    }
+
+    /// Build the whole pass graph: shared offscreen render pass + sampler +
+    /// channel descriptor pool (as needed), then each buffer pass and the image
+    /// pass. Frees everything it created on any failure.
+    fn build_graph(
+        device: &ash::Device,
+        present_render_pass: vk::RenderPass,
+        audio_set_layout: vk::DescriptorSetLayout,
+        spec: &GraphSpec,
+        frame_count: usize,
+    ) -> Result<Graph> {
+        // Channel accounting (for descriptor pool sizing).
+        let image_channels = match &spec.image {
+            ImageSpec::Explicit(p) => p.channels.len(),
+            ImageSpec::ImplicitBlit(_) => 1,
+        };
+        let total_channels: usize =
+            spec.buffers.iter().map(|b| b.channels.len()).sum::<usize>() + image_channels;
+        let passes_with_channels = spec.buffers.iter().filter(|b| !b.channels.is_empty()).count()
+            + usize::from(image_channels > 0);
+
+        // Shared offscreen render pass for buffer targets.
+        let offscreen_render_pass = if spec.has_buffers() {
+            Some(Self::create_offscreen_render_pass(device)?)
+        } else {
+            None
+        };
+        let drop_rp = |device: &ash::Device| {
+            // SAFETY: created just above; freed once on an early error.
+            if let Some(rp) = offscreen_render_pass {
+                unsafe { device.destroy_render_pass(rp, None) };
+            }
+        };
+
+        // Sampler + channel descriptor pool, only if anything samples.
+        let (sampler, descriptor_pool) = if passes_with_channels > 0 {
+            let sampler_info = vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+            // SAFETY: sampler_info outlives the call.
+            let sampler = match unsafe { device.create_sampler(&sampler_info, None) } {
+                Ok(s) => s,
+                Err(e) => {
+                    drop_rp(device);
+                    return Err(e).context("creating channel sampler");
+                }
+            };
+            let pool_size = vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count((frame_count * total_channels) as u32);
+            let pool_sizes = [pool_size];
+            let pool_info = vk::DescriptorPoolCreateInfo::default()
+                .max_sets((frame_count * passes_with_channels) as u32)
+                .pool_sizes(&pool_sizes);
+            // SAFETY: pool_info outlives the call.
+            let pool = match unsafe { device.create_descriptor_pool(&pool_info, None) } {
+                Ok(p) => p,
+                Err(e) => {
+                    // SAFETY: sampler created just above.
+                    unsafe { device.destroy_sampler(sampler, None) };
+                    drop_rp(device);
+                    return Err(e).context("creating channel descriptor pool");
+                }
+            };
+            (Some(sampler), Some(pool))
+        } else {
+            (None, None)
+        };
+
+        // Shared fullscreen vertex shader for buffer + explicit-image passes.
+        let vert_spv = match compile_glsl(VERTEX_GLSL, shaderc::ShaderKind::Vertex, "fullscreen.vert")
+        {
+            Ok(s) => s,
+            Err(e) => {
+                // SAFETY: sampler/pool/rp created above.
+                unsafe {
+                    if let Some(s) = sampler {
+                        device.destroy_sampler(s, None);
+                    }
+                    if let Some(p) = descriptor_pool {
+                        device.destroy_descriptor_pool(p, None);
+                    }
+                }
+                drop_rp(device);
+                return Err(e);
+            }
+        };
+
+        // Build passes, tearing down everything built so far on failure.
+        let mut buffers: Vec<GpuPass> = Vec::with_capacity(spec.buffers.len());
+        let fail = |device: &ash::Device, buffers: &mut Vec<GpuPass>, image: Option<GpuPass>| {
+            // SAFETY: each handle freed once; passes own their pipelines/sets.
+            unsafe {
+                if let Some(p) = image {
+                    p.destroy(device);
+                }
+                for p in buffers.drain(..) {
+                    p.destroy(device);
+                }
+                if let Some(s) = sampler {
+                    device.destroy_sampler(s, None);
+                }
+                if let Some(p) = descriptor_pool {
+                    device.destroy_descriptor_pool(p, None);
+                }
+            }
+            drop_rp(device);
+        };
+
+        let offscreen = offscreen_render_pass.unwrap_or(vk::RenderPass::null());
+        for pass in &spec.buffers {
+            let frag_spv =
+                match compile_glsl(&pass.glsl, shaderc::ShaderKind::Fragment, &pass.name) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        fail(device, &mut buffers, None);
+                        return Err(e);
+                    }
+                };
+            match Self::build_pass(
+                device,
+                &vert_spv,
+                &frag_spv,
+                &pass.channels,
+                offscreen,
+                audio_set_layout,
+                descriptor_pool,
+                frame_count,
+                true,
+            ) {
+                Ok(p) => buffers.push(p),
+                Err(e) => {
+                    fail(device, &mut buffers, None);
+                    return Err(e);
+                }
+            }
+        }
+
+        // Image pass: an explicit shader, or the built-in blit of one buffer.
+        let image = match &spec.image {
+            ImageSpec::Explicit(p) => {
+                let frag_spv =
+                    match compile_glsl(&p.glsl, shaderc::ShaderKind::Fragment, "image") {
+                        Ok(s) => s,
+                        Err(e) => {
+                            fail(device, &mut buffers, None);
+                            return Err(e);
+                        }
+                    };
+                Self::build_pass(
+                    device,
+                    &vert_spv,
+                    &frag_spv,
+                    &p.channels,
+                    present_render_pass,
+                    audio_set_layout,
+                    descriptor_pool,
+                    frame_count,
+                    false,
+                )
+            }
+            ImageSpec::ImplicitBlit(idx) => {
+                let blit_vert =
+                    compile_glsl(BLIT_VERTEX_GLSL, shaderc::ShaderKind::Vertex, "blit.vert");
+                let blit_frag =
+                    compile_glsl(BLIT_FRAGMENT_GLSL, shaderc::ShaderKind::Fragment, "blit.frag");
+                match (blit_vert, blit_frag) {
+                    (Ok(v), Ok(f)) => {
+                        let channels = [shadergraph::Channel {
+                            index: 0,
+                            source: ChannelSource::Buffer(*idx),
+                        }];
+                        Self::build_pass(
+                            device,
+                            &v,
+                            &f,
+                            &channels,
+                            present_render_pass,
+                            audio_set_layout,
+                            descriptor_pool,
+                            frame_count,
+                            false,
+                        )
+                    }
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                }
+            }
+        };
+        let image = match image {
+            Ok(p) => p,
+            Err(e) => {
+                fail(device, &mut buffers, None);
+                return Err(e);
+            }
+        };
+
+        Ok(Graph {
+            sampler,
+            offscreen_render_pass,
+            descriptor_pool,
+            buffers,
+            image,
+            size: (0, 0),
+        })
+    }
+
+    /// Build one pass: its channel sampler set layout (if any), pipeline layout
+    /// (set 0 = audio UBO, set 1 = channels), pipeline (against `render_pass`),
+    /// and per-slot channel descriptor sets. `make_target` gives a buffer pass
+    /// an (empty) ping-pong target. Cleans up on internal failure.
+    #[allow(clippy::too_many_arguments)]
+    fn build_pass(
+        device: &ash::Device,
+        vert_spv: &[u32],
+        frag_spv: &[u32],
+        channels: &[shadergraph::Channel],
+        render_pass: vk::RenderPass,
+        audio_set_layout: vk::DescriptorSetLayout,
+        pool: Option<vk::DescriptorPool>,
+        frame_count: usize,
+        make_target: bool,
+    ) -> Result<GpuPass> {
+        // Channel set layout (set 1): one combined-image-sampler per channel.
+        let channel_set_layout = if channels.is_empty() {
+            None
+        } else {
+            let bindings: Vec<_> = channels
+                .iter()
+                .map(|c| {
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(c.index)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                })
+                .collect();
+            let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+            // SAFETY: info outlives the call.
+            Some(
+                unsafe { device.create_descriptor_set_layout(&info, None) }
+                    .context("creating channel set layout")?,
+            )
+        };
+
+        let push_range = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(std::mem::size_of::<ShaderUniforms>() as u32);
+        let push_ranges = [push_range];
+        let mut set_layouts = vec![audio_set_layout];
+        if let Some(l) = channel_set_layout {
+            set_layouts.push(l);
+        }
+        let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&push_ranges);
+        let cleanup_setlayout = |device: &ash::Device| {
+            // SAFETY: channel_set_layout (if any) created just above.
+            if let Some(l) = channel_set_layout {
+                unsafe { device.destroy_descriptor_set_layout(l, None) };
+            }
+        };
+        // SAFETY: layout_info outlives the call.
+        let layout = match unsafe { device.create_pipeline_layout(&layout_info, None) } {
+            Ok(l) => l,
+            Err(e) => {
+                cleanup_setlayout(device);
+                return Err(e).context("creating pass pipeline layout");
+            }
+        };
+
+        // SAFETY: SPIR-V slices live across module creation.
+        let vert = match unsafe {
+            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(vert_spv), None)
+        } {
+            Ok(m) => m,
+            Err(e) => {
+                unsafe { device.destroy_pipeline_layout(layout, None) };
+                cleanup_setlayout(device);
+                return Err(e).context("creating pass vertex module");
+            }
+        };
+        let frag = match unsafe {
+            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(frag_spv), None)
+        } {
+            Ok(m) => m,
+            Err(e) => {
+                unsafe {
+                    device.destroy_shader_module(vert, None);
+                    device.destroy_pipeline_layout(layout, None);
+                }
+                cleanup_setlayout(device);
+                return Err(e).context("creating pass fragment module");
+            }
+        };
+        let pipeline_result = Self::create_pipeline(device, render_pass, layout, vert, frag);
+        // SAFETY: modules consumed by pipeline creation.
+        unsafe {
+            device.destroy_shader_module(vert, None);
+            device.destroy_shader_module(frag, None);
+        }
+        let pipeline = match pipeline_result {
+            Ok(p) => p,
+            Err(e) => {
+                unsafe { device.destroy_pipeline_layout(layout, None) };
+                cleanup_setlayout(device);
+                return Err(e);
+            }
+        };
+
+        // Per-slot channel descriptor sets (re-pointed at textures each frame).
+        let channel_sets = if let (Some(set_layout), Some(pool)) = (channel_set_layout, pool) {
+            let layouts = vec![set_layout; frame_count];
+            let alloc = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&layouts);
+            // SAFETY: alloc outlives the call; pool sized for these.
+            match unsafe { device.allocate_descriptor_sets(&alloc) } {
+                Ok(s) => s,
+                Err(e) => {
+                    unsafe {
+                        device.destroy_pipeline(pipeline, None);
+                        device.destroy_pipeline_layout(layout, None);
+                    }
+                    cleanup_setlayout(device);
+                    return Err(e).context("allocating channel descriptor sets");
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        let target = make_target.then(|| PingPong {
+            textures: None,
+            framebuffers: [vk::Framebuffer::null(); 2],
+            parity: std::cell::Cell::new(0),
+        });
+
+        Ok(GpuPass {
+            pipeline,
+            layout,
+            channel_set_layout,
+            channels: channels.to_vec(),
+            channel_sets,
+            target,
         })
     }
 
@@ -1512,177 +1864,13 @@ impl ShaderRenderer {
         Ok((buffer, memory, mapped, descriptor_set))
     }
 
-    /// Build the size-independent feedback machinery: sampler, off-screen
-    /// render pass, the combined-image-sampler set layout + pool + two sets,
-    /// and the blit pipeline (presents a feedback texture into the dmabuf via
-    /// `present_render_pass`). Textures/framebuffers come later, on resize.
-    /// Cleans up on any internal failure.
-    fn build_feedback(
-        device: &ash::Device,
-        present_render_pass: vk::RenderPass,
-    ) -> Result<Feedback> {
-        let sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::LINEAR)
-            .min_filter(vk::Filter::LINEAR)
-            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
-        // SAFETY: sampler_info outlives the call.
-        let sampler = unsafe { device.create_sampler(&sampler_info, None) }
-            .context("creating feedback sampler")?;
-
-        let render_pass = match Self::create_feedback_render_pass(device) {
-            Ok(r) => r,
-            Err(e) => {
-                unsafe { device.destroy_sampler(sampler, None) };
-                return Err(e);
-            }
-        };
-
-        // Combined image sampler at binding 0 (fragment): set 1 of the user
-        // pipeline (iPrevFrame), set 0 of the blit.
-        let binding = vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
-        let bindings = [binding];
-        let sl_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-        // SAFETY: sl_info outlives the call.
-        let sampler_set_layout =
-            match unsafe { device.create_descriptor_set_layout(&sl_info, None) } {
-                Ok(l) => l,
-                Err(e) => {
-                    unsafe {
-                        device.destroy_render_pass(render_pass, None);
-                        device.destroy_sampler(sampler, None);
-                    }
-                    return Err(e).context("creating feedback sampler set layout");
-                }
-            };
-
-        // Cleanup helper for the remaining steps.
-        let undo = |pool: Option<vk::DescriptorPool>, blit_layout: Option<vk::PipelineLayout>| {
-            // SAFETY: each handle was created in this fn and is freed once.
-            unsafe {
-                if let Some(l) = blit_layout {
-                    device.destroy_pipeline_layout(l, None);
-                }
-                if let Some(p) = pool {
-                    device.destroy_descriptor_pool(p, None);
-                }
-                device.destroy_descriptor_set_layout(sampler_set_layout, None);
-                device.destroy_render_pass(render_pass, None);
-                device.destroy_sampler(sampler, None);
-            }
-        };
-
-        let pool_size = vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(2);
-        let pool_sizes = [pool_size];
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(2)
-            .pool_sizes(&pool_sizes);
-        // SAFETY: pool_info outlives the call.
-        let descriptor_pool = match unsafe { device.create_descriptor_pool(&pool_info, None) } {
-            Ok(p) => p,
-            Err(e) => {
-                undo(None, None);
-                return Err(e).context("creating feedback descriptor pool");
-            }
-        };
-
-        let layouts = [sampler_set_layout, sampler_set_layout];
-        let set_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(descriptor_pool)
-            .set_layouts(&layouts);
-        // SAFETY: set_alloc outlives the call; pool sized for 2 sets.
-        let tex_sets = match unsafe { device.allocate_descriptor_sets(&set_alloc) } {
-            Ok(s) => [s[0], s[1]],
-            Err(e) => {
-                undo(Some(descriptor_pool), None);
-                return Err(e).context("allocating feedback descriptor sets");
-            }
-        };
-
-        // Blit pipeline layout: just the sampler set (no push constants).
-        let blit_set_layouts = [sampler_set_layout];
-        let blit_layout_info =
-            vk::PipelineLayoutCreateInfo::default().set_layouts(&blit_set_layouts);
-        // SAFETY: blit_layout_info outlives the call.
-        let blit_layout = match unsafe { device.create_pipeline_layout(&blit_layout_info, None) } {
-            Ok(l) => l,
-            Err(e) => {
-                undo(Some(descriptor_pool), None);
-                return Err(e).context("creating blit pipeline layout");
-            }
-        };
-
-        // Blit pipeline: compile the built-in blit shaders and build against the
-        // dmabuf (present) render pass.
-        let blit_pipeline = match Self::build_blit_pipeline(device, present_render_pass, blit_layout)
-        {
-            Ok(p) => p,
-            Err(e) => {
-                undo(Some(descriptor_pool), Some(blit_layout));
-                return Err(e);
-            }
-        };
-
-        Ok(Feedback {
-            sampler,
-            render_pass,
-            sampler_set_layout,
-            descriptor_pool,
-            tex_sets,
-            blit_layout,
-            blit_pipeline,
-            textures: None,
-            framebuffers: [vk::Framebuffer::null(); 2],
-            size: (0, 0),
-            parity: std::cell::Cell::new(0),
-        })
-    }
-
-    /// Compile and build the built-in blit pipeline (textured fullscreen
-    /// triangle) for `render_pass`.
-    fn build_blit_pipeline(
-        device: &ash::Device,
-        render_pass: vk::RenderPass,
-        layout: vk::PipelineLayout,
-    ) -> Result<vk::Pipeline> {
-        let vert_spv = compile_glsl(BLIT_VERTEX_GLSL, shaderc::ShaderKind::Vertex, "blit.vert")?;
-        let frag_spv = compile_glsl(BLIT_FRAGMENT_GLSL, shaderc::ShaderKind::Fragment, "blit.frag")?;
-        // SAFETY: SPIR-V slices live across module creation.
-        let vert = unsafe {
-            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert_spv), None)
-        }
-        .context("creating blit vertex module")?;
-        let frag = match unsafe {
-            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&frag_spv), None)
-        } {
-            Ok(f) => f,
-            Err(e) => {
-                unsafe { device.destroy_shader_module(vert, None) };
-                return Err(e).context("creating blit fragment module");
-            }
-        };
-        let result = Self::create_pipeline(device, render_pass, layout, vert, frag);
-        // SAFETY: modules consumed by pipeline creation.
-        unsafe {
-            device.destroy_shader_module(vert, None);
-            device.destroy_shader_module(frag, None);
-        }
-        result
-    }
-
-    /// Off-screen render pass writing a feedback texture (F16, → SHADER_READ).
-    /// The subpass dependencies make this frame's write visible to later
-    /// fragment reads (blit + next frame's sample), and order this write after
-    /// the previous frame's read of the same ping-pong texture (a WAR hazard the
-    /// 3-deep per-slot fence doesn't cover, since parity cycles every 2 frames).
-    fn create_feedback_render_pass(device: &ash::Device) -> Result<vk::RenderPass> {
+    /// Off-screen render pass writing a buffer texture (F16, → SHADER_READ),
+    /// shared by every buffer pass. The subpass dependencies make this frame's
+    /// write visible to later fragment reads (downstream passes + next frame's
+    /// sample), and order this write after the previous frame's read of the same
+    /// ping-pong texture (a WAR hazard the 3-deep per-slot fence doesn't cover,
+    /// since a buffer's parity cycles every 2 frames).
+    fn create_offscreen_render_pass(device: &ash::Device) -> Result<vk::RenderPass> {
         let attachment = vk::AttachmentDescription::default()
             .format(RENDER_FORMAT)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -1731,112 +1919,36 @@ impl ShaderRenderer {
         unsafe { device.create_render_pass(&info, None) }.context("creating feedback render pass")
     }
 
-    /// (Re)create the feedback ping-pong textures + framebuffers at `w`×`h`,
-    /// re-point the descriptor sets at them, and clear both to black. No-op for
-    /// non-feedback renderers or an unchanged size. Called from the ring rebuild.
-    pub fn resize_feedback(&mut self, gpu: &Gpu, w: u32, h: u32) -> Result<()> {
-        let Some(fb) = self.feedback.as_mut() else {
-            return Ok(());
-        };
-        if fb.textures.is_some() && fb.size == (w, h) {
+    /// (Re)create every buffer pass's ping-pong textures + framebuffers at
+    /// `w`×`h` and clear them to black. No-op for a shader with no buffers or an
+    /// unchanged size. Channel descriptor sets are re-pointed per frame in
+    /// [`Self::render`], not here. Called from the ring rebuild.
+    pub fn resize(&mut self, gpu: &Gpu, w: u32, h: u32) -> Result<()> {
+        if self.graph.buffers.is_empty() {
             return Ok(());
         }
-        let device = &self.device;
-        // SAFETY: wait for any in-flight use before freeing the old textures.
+        let built = self
+            .graph
+            .buffers
+            .iter()
+            .all(|b| b.target.as_ref().is_some_and(|t| t.textures.is_some()));
+        if built && self.graph.size == (w, h) {
+            return Ok(());
+        }
+        let device = self.device.clone();
+        let render_pass = self
+            .graph
+            .offscreen_render_pass
+            .context("graph has buffers but no offscreen render pass")?;
+        // SAFETY: drain in-flight work before freeing the old textures.
         unsafe {
             let _ = device.device_wait_idle();
-            if let Some(t) = &fb.textures {
-                for img in t {
-                    img.destroy(device);
-                }
-            }
-            for f in fb.framebuffers {
-                if f != vk::Framebuffer::null() {
-                    device.destroy_framebuffer(f, None);
-                }
-            }
         }
-        fb.textures = None;
-        fb.framebuffers = [vk::Framebuffer::null(); 2];
-
-        // Create the two textures + their framebuffers. Track both in Vecs so a
-        // mid-loop allocation failure can free everything built so far.
-        let mut images: Vec<FeedbackImage> = Vec::with_capacity(2);
-        let mut fbs: Vec<vk::Framebuffer> = Vec::with_capacity(2);
-        // SAFETY: frees every handle built so far in this loop, each once.
-        let undo = |device: &ash::Device, images: &[FeedbackImage], fbs: &[vk::Framebuffer]| unsafe {
-            for f in fbs {
-                device.destroy_framebuffer(*f, None);
-            }
-            for i in images {
-                i.destroy(device);
-            }
-        };
-        for _ in 0..2 {
-            let img = match create_feedback_image(gpu, device, w, h) {
-                Ok(i) => i,
-                Err(e) => {
-                    undo(device, &images, &fbs);
-                    return Err(e);
-                }
-            };
-            let fb_info = vk::FramebufferCreateInfo::default()
-                .render_pass(fb.render_pass)
-                .attachments(std::slice::from_ref(&img.view))
-                .width(w)
-                .height(h)
-                .layers(1);
-            // SAFETY: fb_info outlives the call.
-            let framebuffer = match unsafe { device.create_framebuffer(&fb_info, None) } {
-                Ok(f) => f,
-                Err(e) => {
-                    // SAFETY: this image isn't tracked yet; free it + the rest.
-                    unsafe { img.destroy(device) };
-                    undo(device, &images, &fbs);
-                    return Err(e).context("creating feedback framebuffer");
-                }
-            };
-            images.push(img);
-            fbs.push(framebuffer);
+        for pass in &mut self.graph.buffers {
+            let pp = pass.target.as_mut().expect("buffer pass has a target");
+            rebuild_pingpong(gpu, &device, render_pass, pp, w, h)?;
         }
-        let framebuffers = [fbs[0], fbs[1]];
-
-        // Point each descriptor set at its texture.
-        for (set, img) in fb.tex_sets.iter().zip(images.iter()) {
-            let info = vk::DescriptorImageInfo::default()
-                .sampler(fb.sampler)
-                .image_view(img.view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-            let infos = [info];
-            let write = vk::WriteDescriptorSet::default()
-                .dst_set(*set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&infos);
-            // SAFETY: write references live handles for the call.
-            unsafe { device.update_descriptor_sets(&[write], &[]) };
-        }
-
-        // Clear both to black and move them to SHADER_READ so the first frame
-        // samples a clean previous frame (no NaNs to poison the feedback loop).
-        let textures = [images.remove(0), images.remove(0)];
-        if let Err(e) = clear_feedback_textures(gpu, device, &textures) {
-            // SAFETY: textures/framebuffers not yet stored; free them.
-            unsafe {
-                for img in &textures {
-                    img.destroy(device);
-                }
-                for f in framebuffers {
-                    device.destroy_framebuffer(f, None);
-                }
-            }
-            return Err(e);
-        }
-
-        fb.textures = Some(textures);
-        fb.framebuffers = framebuffers;
-        fb.size = (w, h);
-        fb.parity.set(0);
+        self.graph.size = (w, h);
         Ok(())
     }
 
@@ -1984,98 +2096,87 @@ impl ShaderRenderer {
                 max_depth: 1.0,
             };
 
-            if let Some(fb) = &self.feedback {
-                // Two-pass feedback. Pass 1: the user shader renders into the
-                // ping-pong write target, sampling the previous frame as
-                // `iPrevFrame`. Pass 2: a built-in blit presents that result
-                // into the dmabuf. The feedback render pass's own dependencies
-                // order the cross-frame WAR and the pass1→pass2 RAW.
-                let textures = fb
-                    .textures
-                    .as_ref()
-                    .context("feedback render before textures built")?;
-                let _ = textures; // presence checked; framebuffers index in lockstep
-                let curr = fb.parity.get();
-                let prev = 1 - curr;
+            // Bind a pass (set 0 = audio UBO, set 1 = channels if any), set
+            // dynamic state, push the uniforms, and draw the fullscreen triangle.
+            let bind_and_draw = |pass: &GpuPass| {
+                device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pass.pipeline);
+                let mut sets = [frame.descriptor_set, vk::DescriptorSet::null()];
+                let count = if pass.channels.is_empty() {
+                    1
+                } else {
+                    sets[1] = pass.channel_sets[slot];
+                    2
+                };
+                device.cmd_bind_descriptor_sets(
+                    cb,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pass.layout,
+                    0,
+                    &sets[..count],
+                    &[],
+                );
+                device.cmd_set_viewport(cb, 0, &[viewport]);
+                device.cmd_set_scissor(cb, 0, &[area]);
+                device.cmd_push_constants(
+                    cb,
+                    pass.layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    bytemuck::bytes_of(uniforms),
+                );
+                device.cmd_draw(cb, 3, 1, 0, 0);
+            };
 
-                // Pass 1: user shader → feedback[curr]. loadOp is DONT_CARE, so
-                // no clear values.
-                let rp1 = vk::RenderPassBeginInfo::default()
-                    .render_pass(fb.render_pass)
-                    .framebuffer(fb.framebuffers[curr])
+            // Buffer passes, in order, into their offscreen ping-pong targets.
+            // The offscreen render pass's dependencies order the cross-frame WAR
+            // and the pass→pass / pass→image RAW.
+            let offscreen = self.graph.offscreen_render_pass.unwrap_or_default();
+            // Offscreen framebuffers are sized to graph.size; the caller resizes
+            // the ring and the buffers together, so this must match the target.
+            debug_assert!(
+                self.graph.buffers.is_empty()
+                    || self.graph.size == (target.width, target.height),
+                "buffer size {:?} != target {}x{}",
+                self.graph.size,
+                target.width,
+                target.height
+            );
+            for (i, pass) in self.graph.buffers.iter().enumerate() {
+                let pp = pass.target.as_ref().expect("buffer pass has a target");
+                if pp.textures.is_none() {
+                    bail!("buffer render before textures built");
+                }
+                let curr = pp.parity.get();
+                // Point this slot's channel set at the right curr/prev textures.
+                update_pass_channels(device, &self.graph, pass, slot, i)?;
+                // loadOp is DONT_CARE for buffers → no clear values.
+                let rp = vk::RenderPassBeginInfo::default()
+                    .render_pass(offscreen)
+                    .framebuffer(pp.framebuffers[curr])
                     .render_area(area);
-                device.cmd_begin_render_pass(cb, &rp1, vk::SubpassContents::INLINE);
-                device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
-                device.cmd_bind_descriptor_sets(
-                    cb,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.layout,
-                    0,
-                    &[frame.descriptor_set, fb.tex_sets[prev]],
-                    &[],
-                );
-                device.cmd_set_viewport(cb, 0, &[viewport]);
-                device.cmd_set_scissor(cb, 0, &[area]);
-                device.cmd_push_constants(
-                    cb,
-                    self.layout,
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    0,
-                    bytemuck::bytes_of(uniforms),
-                );
-                device.cmd_draw(cb, 3, 1, 0, 0);
+                device.cmd_begin_render_pass(cb, &rp, vk::SubpassContents::INLINE);
+                bind_and_draw(pass);
                 device.cmd_end_render_pass(cb);
+            }
 
-                // Pass 2: blit feedback[curr] → dmabuf (clears, then samples).
-                let rp2 = vk::RenderPassBeginInfo::default()
-                    .render_pass(self.render_pass)
-                    .framebuffer(framebuffer)
-                    .render_area(area)
-                    .clear_values(&clears);
-                device.cmd_begin_render_pass(cb, &rp2, vk::SubpassContents::INLINE);
-                device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, fb.blit_pipeline);
-                device.cmd_bind_descriptor_sets(
-                    cb,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    fb.blit_layout,
-                    0,
-                    &[fb.tex_sets[curr]],
-                    &[],
-                );
-                device.cmd_set_viewport(cb, 0, &[viewport]);
-                device.cmd_set_scissor(cb, 0, &[area]);
-                device.cmd_draw(cb, 3, 1, 0, 0);
-                device.cmd_end_render_pass(cb);
+            // Image pass → dmabuf (all buffers count as "earlier", so it reads
+            // their current frame).
+            update_pass_channels(device, &self.graph, &self.graph.image, slot, self.graph.buffers.len())?;
+            let rp = vk::RenderPassBeginInfo::default()
+                .render_pass(self.render_pass)
+                .framebuffer(framebuffer)
+                .render_area(area)
+                .clear_values(&clears);
+            device.cmd_begin_render_pass(cb, &rp, vk::SubpassContents::INLINE);
+            bind_and_draw(&self.graph.image);
+            device.cmd_end_render_pass(cb);
 
-                fb.parity.set(prev);
-            } else {
-                // Single pass: the shader renders straight into the dmabuf.
-                let rp_begin = vk::RenderPassBeginInfo::default()
-                    .render_pass(self.render_pass)
-                    .framebuffer(framebuffer)
-                    .render_area(area)
-                    .clear_values(&clears);
-                device.cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
-                device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
-                device.cmd_bind_descriptor_sets(
-                    cb,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.layout,
-                    0,
-                    &[frame.descriptor_set],
-                    &[],
-                );
-                device.cmd_set_viewport(cb, 0, &[viewport]);
-                device.cmd_set_scissor(cb, 0, &[area]);
-                device.cmd_push_constants(
-                    cb,
-                    self.layout,
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    0,
-                    bytemuck::bytes_of(uniforms),
-                );
-                device.cmd_draw(cb, 3, 1, 0, 0);
-                device.cmd_end_render_pass(cb);
+            // Advance every buffer's ping-pong now that all reads of this frame's
+            // parities are recorded.
+            for pass in &self.graph.buffers {
+                if let Some(pp) = &pass.target {
+                    pp.parity.set(1 - pp.parity.get());
+                }
             }
 
             // Release ownership to the compositor's (foreign) queue. For the
@@ -2212,42 +2313,130 @@ impl Drop for ShaderRenderer {
                 self.device.destroy_buffer(frame.ubo, None);
                 self.device.free_memory(frame.ubo_memory, None);
             }
-            // Sets are freed with the pool.
+            // Audio UBO sets are freed with the pool.
             self.device.destroy_descriptor_pool(self.descriptor_pool, None);
             self.device
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
-            self.device.destroy_pipeline(self.pipeline, None);
-            self.device.destroy_pipeline_layout(self.layout, None);
-            if let Some(fb) = &self.feedback {
-                fb.destroy(&self.device);
-            }
+            self.graph.destroy(&self.device);
             self.device.destroy_render_pass(self.render_pass, None);
         }
     }
 }
 
-impl Feedback {
-    /// Free every owned object. SAFETY: called once (Drop or a build error
-    /// path), after in-flight work has drained; handles are `device`'s.
+impl GpuPass {
+    /// SAFETY: called once after in-flight work has drained; handles are
+    /// `device`'s. Channel descriptor sets are freed with the graph's pool.
     unsafe fn destroy(&self, device: &ash::Device) {
-        if let Some(textures) = &self.textures {
-            for img in textures {
-                img.destroy(device);
+        device.destroy_pipeline(self.pipeline, None);
+        device.destroy_pipeline_layout(self.layout, None);
+        if let Some(l) = self.channel_set_layout {
+            device.destroy_descriptor_set_layout(l, None);
+        }
+        if let Some(t) = &self.target {
+            if let Some(textures) = &t.textures {
+                for img in textures {
+                    img.destroy(device);
+                }
+            }
+            for f in t.framebuffers {
+                if f != vk::Framebuffer::null() {
+                    device.destroy_framebuffer(f, None);
+                }
             }
         }
-        for f in self.framebuffers {
-            if f != vk::Framebuffer::null() {
-                device.destroy_framebuffer(f, None);
-            }
-        }
-        device.destroy_pipeline(self.blit_pipeline, None);
-        device.destroy_pipeline_layout(self.blit_layout, None);
-        // tex_sets are freed with the pool.
-        device.destroy_descriptor_pool(self.descriptor_pool, None);
-        device.destroy_descriptor_set_layout(self.sampler_set_layout, None);
-        device.destroy_render_pass(self.render_pass, None);
-        device.destroy_sampler(self.sampler, None);
     }
+}
+
+impl Graph {
+    /// SAFETY: called once after in-flight work has drained. Passes (with their
+    /// framebuffers) are freed before the render pass and pool they reference.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        self.image.destroy(device);
+        for p in &self.buffers {
+            p.destroy(device);
+        }
+        if let Some(s) = self.sampler {
+            device.destroy_sampler(s, None);
+        }
+        if let Some(p) = self.descriptor_pool {
+            device.destroy_descriptor_pool(p, None);
+        }
+        if let Some(rp) = self.offscreen_render_pass {
+            device.destroy_render_pass(rp, None);
+        }
+    }
+}
+
+/// Resolve which texture a pass's channel reads this frame: a buffer's *current*
+/// frame if it renders before `order_index`, else its *previous* frame (its own
+/// feedback, or a later buffer's last output).
+fn resolve_channel_view(
+    graph: &Graph,
+    pass: &GpuPass,
+    channel: &shadergraph::Channel,
+    order_index: usize,
+) -> Result<vk::ImageView> {
+    let view = |pp: &PingPong, prev: bool| -> Result<vk::ImageView> {
+        let t = pp.textures.as_ref().context("channel buffer not built")?;
+        let p = pp.parity.get();
+        Ok(t[if prev { 1 - p } else { p }].view)
+    };
+    match channel.source {
+        ChannelSource::SelfPrev => {
+            let pp = pass.target.as_ref().context("\"self\" channel on the image pass")?;
+            view(pp, true)
+        }
+        ChannelSource::Buffer(j) => {
+            let pp = graph.buffers[j]
+                .target
+                .as_ref()
+                .context("buffer channel target missing")?;
+            // Earlier buffer → current frame; self or later → previous frame.
+            view(pp, j >= order_index)
+        }
+    }
+}
+
+/// Re-point `pass`'s channel descriptor set for ring `slot` at the textures it
+/// should sample this frame. Safe: the slot's fence was awaited, so the set
+/// isn't in use. No-op for a pass with no channels.
+fn update_pass_channels(
+    device: &ash::Device,
+    graph: &Graph,
+    pass: &GpuPass,
+    slot: usize,
+    order_index: usize,
+) -> Result<()> {
+    if pass.channels.is_empty() {
+        return Ok(());
+    }
+    let sampler = graph.sampler.context("channels without a sampler")?;
+    let set = pass.channel_sets[slot];
+    let mut infos: Vec<vk::DescriptorImageInfo> = Vec::with_capacity(pass.channels.len());
+    for c in &pass.channels {
+        let view = resolve_channel_view(graph, pass, c, order_index)?;
+        infos.push(
+            vk::DescriptorImageInfo::default()
+                .sampler(sampler)
+                .image_view(view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+        );
+    }
+    let writes: Vec<_> = pass
+        .channels
+        .iter()
+        .enumerate()
+        .map(|(k, c)| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(c.index)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&infos[k..k + 1])
+        })
+        .collect();
+    // SAFETY: writes reference live handles + infos for the call's duration.
+    unsafe { device.update_descriptor_sets(&writes, &[]) };
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2301,7 +2490,8 @@ mod tests {
         let gpu = pool.any().expect("no usable device");
         let mods = gpu.renderable_modifiers();
         let rt = RenderTarget::new(gpu, 320, 200, &mods).expect("render target");
-        let renderer = ShaderRenderer::new(gpu, DEFAULT_FRAGMENT_GLSL, 1, false).expect("renderer");
+        let spec = shadergraph::parse(DEFAULT_FRAGMENT_GLSL).expect("parse");
+        let renderer = ShaderRenderer::new(gpu, &spec, 1).expect("renderer");
         let fb = renderer.create_framebuffer(&rt).expect("framebuffer");
         let uniforms = ShaderUniforms {
             resolution: [rt.width as f32, rt.height as f32],
@@ -2348,9 +2538,10 @@ void main() {
         let gpu = pool.any().expect("no usable device");
         let mods = gpu.renderable_modifiers();
         let rt = RenderTarget::new(gpu, 320, 200, &mods).expect("render target");
-        let mut renderer = ShaderRenderer::new(gpu, FEEDBACK_GLSL, 2, true).expect("renderer");
+        let spec = shadergraph::parse(FEEDBACK_GLSL).expect("parse");
+        let mut renderer = ShaderRenderer::new(gpu, &spec, 2).expect("renderer");
         renderer
-            .resize_feedback(gpu, rt.width, rt.height)
+            .resize(gpu, rt.width, rt.height)
             .expect("feedback textures");
         let fb = renderer.create_framebuffer(&rt).expect("framebuffer");
         let uniforms = ShaderUniforms {
@@ -2368,6 +2559,94 @@ void main() {
                 .render(slot, &rt, fb, &uniforms, &audio)
                 .expect("render feedback frame");
             // SAFETY: drain before reusing/reading on the next iteration.
+            unsafe {
+                let _ = gpu.device.device_wait_idle();
+            }
+        }
+        // SAFETY: fb came from this renderer; work is drained above.
+        unsafe {
+            gpu.device.destroy_framebuffer(fb, None);
+        }
+    }
+
+    /// Build a two-buffer graph with cross-buffer routing (a `//!pass` shader
+    /// with a `/*!prism …*/` metadata block) and render two frames. Exercises
+    /// the multi-buffer offscreen passes, channel descriptor sets pointing at
+    /// other buffers, the explicit image pass sampling a buffer, and parity
+    /// across both buffers. Run with PRISM_BG_VK_VALIDATION=1.
+    #[test]
+    #[ignore]
+    fn render_multibuffer() {
+        // Two ping-pong buffers: `a` feeds back on itself and reads `b`; `b`
+        // reads `a`. The image pass samples `a`. Covers self + cross + image
+        // routing and both current/previous-frame resolution.
+        const MULTI_GLSL: &str = r#"/*!prism
+{ "buffers": ["a", "b"],
+  "channels": {
+    "a": {"0": "a", "1": "b"},
+    "b": {"0": "a"},
+    "image": {"0": "a"} } }
+*/
+//!common
+layout(push_constant) uniform Push { vec2 iResolution; float iTime; float _pad;
+    vec2 iOutputOffset; vec2 iOutputSize; vec2 iGlobalResolution; } pc;
+vec2 flip(vec2 uv) { return vec2(uv.x, 1.0 - uv.y); }
+//!pass a
+#version 450
+layout(location = 0) in vec2 fragCoord;
+layout(location = 0) out vec4 outColor;
+layout(set = 1, binding = 0) uniform sampler2D iChannel0;
+layout(set = 1, binding = 1) uniform sampler2D iChannel1;
+void main() {
+    vec2 uv = fragCoord / pc.iResolution;
+    vec3 self = texture(iChannel0, flip(uv)).rgb;
+    vec3 other = texture(iChannel1, flip(uv)).rgb;
+    outColor = vec4(self * 0.9 + other * 0.05 + vec3(uv, 0.5) * 0.05, 1.0);
+}
+//!pass b
+#version 450
+layout(location = 0) in vec2 fragCoord;
+layout(location = 0) out vec4 outColor;
+layout(set = 1, binding = 0) uniform sampler2D iChannel0;
+void main() {
+    vec2 uv = fragCoord / pc.iResolution;
+    outColor = vec4(texture(iChannel0, flip(uv)).rgb * 0.5 + 0.25, 1.0);
+}
+//!pass image
+#version 450
+layout(location = 0) in vec2 fragCoord;
+layout(location = 0) out vec4 outColor;
+layout(set = 1, binding = 0) uniform sampler2D iChannel0;
+void main() {
+    vec2 uv = fragCoord / pc.iResolution;
+    outColor = vec4(texture(iChannel0, flip(uv)).rgb, 1.0);
+}
+"#;
+        let mut pool = GpuPool::new().expect("Vulkan bring-up failed");
+        let gpu = pool.any().expect("no usable device");
+        let mods = gpu.renderable_modifiers();
+        let rt = RenderTarget::new(gpu, 320, 200, &mods).expect("render target");
+        let spec = shadergraph::parse(MULTI_GLSL).expect("parse");
+        assert_eq!(spec.buffers.len(), 2);
+        let mut renderer = ShaderRenderer::new(gpu, &spec, 2).expect("renderer");
+        renderer
+            .resize(gpu, rt.width, rt.height)
+            .expect("buffer textures");
+        let fb = renderer.create_framebuffer(&rt).expect("framebuffer");
+        let uniforms = ShaderUniforms {
+            resolution: [rt.width as f32, rt.height as f32],
+            time: 0.0,
+            _pad: 0.0,
+            output_offset: [0.0, 0.0],
+            output_size: [rt.width as f32, rt.height as f32],
+            global_resolution: [rt.width as f32, rt.height as f32],
+        };
+        let audio = <AudioUniforms as bytemuck::Zeroable>::zeroed();
+        for slot in 0..2 {
+            renderer
+                .render(slot, &rt, fb, &uniforms, &audio)
+                .expect("render multibuffer frame");
+            // SAFETY: drain before the next iteration reuses the slot.
             unsafe {
                 let _ = gpu.device.device_wait_idle();
             }

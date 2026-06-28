@@ -17,6 +17,7 @@ mod decode;
 mod gpu;
 mod playlist;
 mod shader;
+mod shadergraph;
 mod surfaces;
 
 use std::collections::HashMap;
