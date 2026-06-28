@@ -3931,6 +3931,27 @@ mod tests {
         .expect("blend fragment compiles");
     }
 
+    /// Parse and compile every checked-in example shader. This stays
+    /// device-independent while catching broken docs/examples before release.
+    #[test]
+    fn example_shaders_compile() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/shaders");
+        let mut paths: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read examples/shaders")
+            .map(|entry| entry.expect("example entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "frag"))
+            .collect();
+        paths.sort();
+
+        for path in paths {
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let spec = shadergraph::parse(&source)
+                .unwrap_or_else(|e| panic!("parse {}: {e:#}", path.display()));
+            validate_graph(&spec).unwrap_or_else(|e| panic!("compile {}: {e:#}", path.display()));
+        }
+    }
+
     /// Brings up Vulkan on the local machine. Ignored by default so CI
     /// (no GPU) is unaffected; run with `cargo test --ignored gpu_init`.
     #[test]
