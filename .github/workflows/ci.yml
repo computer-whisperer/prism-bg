@@ -33,11 +33,13 @@ jobs:
         with:
           components: clippy
       # libdav1d for AVIF decode (image/avif-native -> dav1d-sys via
-      # pkg-config); clang for the vendored jpegxr's bindgen build.
+      # pkg-config); clang for the vendored jpegxr's bindgen build;
+      # libpipewire-0.3-dev for audio-reactive shaders (pipewire ->
+      # libspa-sys/pipewire-sys, both found via pkg-config).
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libdav1d-dev clang pkg-config
+          sudo apt-get install -y libdav1d-dev clang pkg-config libpipewire-0.3-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --locked -- -D warnings
 

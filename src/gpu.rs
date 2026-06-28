@@ -648,8 +648,8 @@ fn create_buffer_image(gpu: &Gpu, device: &ash::Device, w: u32, h: u32) -> Resul
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED);
     // SAFETY: image_info outlives the call.
-    let image = unsafe { device.create_image(&image_info, None) }
-        .context("creating feedback image")?;
+    let image =
+        unsafe { device.create_image(&image_info, None) }.context("creating feedback image")?;
 
     // SAFETY: image is this device's.
     let reqs = unsafe { device.get_image_memory_requirements(image) };
@@ -766,7 +766,8 @@ fn upload_texture(gpu: &Gpu, device: &ash::Device, data: &TextureData) -> Result
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED);
     // SAFETY: image_info outlives the call.
-    let image = unsafe { device.create_image(&image_info, None) }.context("creating texture image")?;
+    let image =
+        unsafe { device.create_image(&image_info, None) }.context("creating texture image")?;
     // SAFETY: image is this device's.
     let reqs = unsafe { device.get_image_memory_requirements(image) };
     let Some(mem_type) =
@@ -877,7 +878,8 @@ fn upload_into(
         return Err(e).context("binding texture staging memory");
     }
     // SAFETY: smem is host-visible+coherent; map for the copy, then unmap.
-    let mapped = unsafe { device.map_memory(smem, 0, pixels.len() as u64, vk::MemoryMapFlags::empty()) };
+    let mapped =
+        unsafe { device.map_memory(smem, 0, pixels.len() as u64, vk::MemoryMapFlags::empty()) };
     match mapped {
         Ok(ptr) => unsafe {
             std::ptr::copy_nonoverlapping(pixels.as_ptr(), ptr as *mut u8, pixels.len());
@@ -972,7 +974,9 @@ fn upload_into(
             &[],
             &[to_read],
         );
-        device.end_command_buffer(cb).context("end texture upload cb")?;
+        device
+            .end_command_buffer(cb)
+            .context("end texture upload cb")?;
         let cbs = [cb];
         let submit = vk::SubmitInfo::default().command_buffers(&cbs);
         device
@@ -1108,7 +1112,9 @@ fn clear_buffer_textures(
                 &[to_read],
             );
         }
-        device.end_command_buffer(cb).context("end feedback clear cb")?;
+        device
+            .end_command_buffer(cb)
+            .context("end feedback clear cb")?;
         let cbs = [cb];
         let submit = vk::SubmitInfo::default().command_buffers(&cbs);
         device
@@ -1525,11 +1531,12 @@ impl ShaderRenderer {
         let mut props = vk::ExternalSemaphoreProperties::default();
         // SAFETY: physical_device came from gpu.instance; props is owned here.
         unsafe {
-            gpu.instance.get_physical_device_external_semaphore_properties(
-                gpu.physical_device,
-                &info,
-                &mut props,
-            )
+            gpu.instance
+                .get_physical_device_external_semaphore_properties(
+                    gpu.physical_device,
+                    &info,
+                    &mut props,
+                )
         };
         props
             .external_semaphore_features
@@ -1671,7 +1678,11 @@ impl ShaderRenderer {
         };
         let total_channels: usize =
             spec.buffers.iter().map(|b| b.channels.len()).sum::<usize>() + image_channels;
-        let passes_with_channels = spec.buffers.iter().filter(|b| !b.channels.is_empty()).count()
+        let passes_with_channels = spec
+            .buffers
+            .iter()
+            .filter(|b| !b.channels.is_empty())
+            .count()
             + usize::from(image_channels > 0);
 
         // Shared offscreen render pass for buffer targets.
@@ -1726,23 +1737,23 @@ impl ShaderRenderer {
         };
 
         // Shared fullscreen vertex shader for buffer + explicit-image passes.
-        let vert_spv = match compile_glsl(VERTEX_GLSL, shaderc::ShaderKind::Vertex, "fullscreen.vert")
-        {
-            Ok(s) => s,
-            Err(e) => {
-                // SAFETY: sampler/pool/rp created above.
-                unsafe {
-                    if let Some(s) = sampler {
-                        device.destroy_sampler(s, None);
+        let vert_spv =
+            match compile_glsl(VERTEX_GLSL, shaderc::ShaderKind::Vertex, "fullscreen.vert") {
+                Ok(s) => s,
+                Err(e) => {
+                    // SAFETY: sampler/pool/rp created above.
+                    unsafe {
+                        if let Some(s) = sampler {
+                            device.destroy_sampler(s, None);
+                        }
+                        if let Some(p) = descriptor_pool {
+                            device.destroy_descriptor_pool(p, None);
+                        }
                     }
-                    if let Some(p) = descriptor_pool {
-                        device.destroy_descriptor_pool(p, None);
-                    }
+                    drop_rp(device);
+                    return Err(e);
                 }
-                drop_rp(device);
-                return Err(e);
-            }
-        };
+            };
 
         // Build passes, tearing down everything built so far on failure.
         let mut buffers: Vec<GpuPass> = Vec::with_capacity(spec.buffers.len());
@@ -1767,14 +1778,14 @@ impl ShaderRenderer {
 
         let offscreen = offscreen_render_pass.unwrap_or(vk::RenderPass::null());
         for pass in &spec.buffers {
-            let frag_spv =
-                match compile_glsl(&pass.glsl, shaderc::ShaderKind::Fragment, &pass.name) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        fail(device, &mut buffers, None);
-                        return Err(e);
-                    }
-                };
+            let frag_spv = match compile_glsl(&pass.glsl, shaderc::ShaderKind::Fragment, &pass.name)
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    fail(device, &mut buffers, None);
+                    return Err(e);
+                }
+            };
             match Self::build_pass(
                 device,
                 &vert_spv,
@@ -1797,14 +1808,13 @@ impl ShaderRenderer {
         // Image pass: an explicit shader, or the built-in blit of one buffer.
         let image = match &spec.image {
             ImageSpec::Explicit(p) => {
-                let frag_spv =
-                    match compile_glsl(&p.glsl, shaderc::ShaderKind::Fragment, "image") {
-                        Ok(s) => s,
-                        Err(e) => {
-                            fail(device, &mut buffers, None);
-                            return Err(e);
-                        }
-                    };
+                let frag_spv = match compile_glsl(&p.glsl, shaderc::ShaderKind::Fragment, "image") {
+                    Ok(s) => s,
+                    Err(e) => {
+                        fail(device, &mut buffers, None);
+                        return Err(e);
+                    }
+                };
                 Self::build_pass(
                     device,
                     &vert_spv,
@@ -1820,8 +1830,11 @@ impl ShaderRenderer {
             ImageSpec::ImplicitBlit(idx) => {
                 let blit_vert =
                     compile_glsl(BLIT_VERTEX_GLSL, shaderc::ShaderKind::Vertex, "blit.vert");
-                let blit_frag =
-                    compile_glsl(BLIT_FRAGMENT_GLSL, shaderc::ShaderKind::Fragment, "blit.frag");
+                let blit_frag = compile_glsl(
+                    BLIT_FRAGMENT_GLSL,
+                    shaderc::ShaderKind::Fragment,
+                    "blit.frag",
+                );
                 match (blit_vert, blit_frag) {
                     (Ok(v), Ok(f)) => {
                         let channels = [shadergraph::Channel {
@@ -2124,7 +2137,10 @@ impl ShaderRenderer {
             vk::ExternalSemaphoreHandleTypeFlags::empty()
         });
         let semaphore = match unsafe {
-            device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut export), None)
+            device.create_semaphore(
+                &vk::SemaphoreCreateInfo::default().push_next(&mut export),
+                None,
+            )
         } {
             Ok(s) => s,
             Err(e) => {
@@ -2145,7 +2161,14 @@ impl ShaderRenderer {
                     return Err(e);
                 }
             };
-        Ok((fence, semaphore, ubo, ubo_memory, ubo_mapped, descriptor_set))
+        Ok((
+            fence,
+            semaphore,
+            ubo,
+            ubo_memory,
+            ubo_mapped,
+            descriptor_set,
+        ))
     }
 
     /// Create one slot's spectrum UBO: a host-visible, persistently-mapped
@@ -2203,15 +2226,14 @@ impl ShaderRenderer {
             return Err(e).context("binding spectrum UBO memory");
         }
         // SAFETY: memory is host-visible; mapped for the buffer's whole life.
-        let mapped = match unsafe {
-            device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-        } {
-            Ok(p) => p as *mut u8,
-            Err(e) => {
-                cleanup_buffer_memory(memory);
-                return Err(e).context("mapping spectrum UBO");
-            }
-        };
+        let mapped =
+            match unsafe { device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) } {
+                Ok(p) => p as *mut u8,
+                Err(e) => {
+                    cleanup_buffer_memory(memory);
+                    return Err(e).context("mapping spectrum UBO");
+                }
+            };
         // SAFETY: `mapped` is valid for `size` bytes; zero = silence.
         unsafe { std::ptr::write_bytes(mapped, 0, size as usize) };
 
@@ -2514,8 +2536,7 @@ impl ShaderRenderer {
             // Offscreen framebuffers are sized to graph.size; the caller resizes
             // the ring and the buffers together, so this must match the target.
             debug_assert!(
-                self.graph.buffers.is_empty()
-                    || self.graph.size == (target.width, target.height),
+                self.graph.buffers.is_empty() || self.graph.size == (target.width, target.height),
                 "buffer size {:?} != target {}x{}",
                 self.graph.size,
                 target.width,
@@ -2541,7 +2562,13 @@ impl ShaderRenderer {
 
             // Image pass → dmabuf (all buffers count as "earlier", so it reads
             // their current frame).
-            update_pass_channels(device, &self.graph, &self.graph.image, slot, self.graph.buffers.len())?;
+            update_pass_channels(
+                device,
+                &self.graph,
+                &self.graph.image,
+                slot,
+                self.graph.buffers.len(),
+            )?;
             let rp = vk::RenderPassBeginInfo::default()
                 .render_pass(self.render_pass)
                 .framebuffer(framebuffer)
@@ -2670,8 +2697,7 @@ fn import_sync_file_to_dmabuf(dmabuf_fd: RawFd, sync_file: OwnedFd) -> Result<()
         )
     };
     if rc != 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("DMA_BUF_IOCTL_IMPORT_SYNC_FILE");
+        return Err(std::io::Error::last_os_error()).context("DMA_BUF_IOCTL_IMPORT_SYNC_FILE");
     }
     Ok(())
 }
@@ -2694,7 +2720,8 @@ impl Drop for ShaderRenderer {
                 self.device.free_memory(frame.ubo_memory, None);
             }
             // Audio UBO sets are freed with the pool.
-            self.device.destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
             self.device
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             self.graph.destroy(&self.device);
@@ -2769,7 +2796,10 @@ fn resolve_channel_view(
     };
     match channel.source {
         ChannelSource::SelfPrev => {
-            let pp = pass.target.as_ref().context("\"self\" channel on the image pass")?;
+            let pp = pass
+                .target
+                .as_ref()
+                .context("\"self\" channel on the image pass")?;
             view(pp, true)
         }
         ChannelSource::Buffer(j) => {
@@ -2781,7 +2811,10 @@ fn resolve_channel_view(
             view(pp, j >= order_index)
         }
         ChannelSource::Texture(t) => {
-            let tex = graph.textures.get(t).context("texture channel index out of range")?;
+            let tex = graph
+                .textures
+                .get(t)
+                .context("texture channel index out of range")?;
             Ok(tex.view)
         }
     }
@@ -3111,8 +3144,8 @@ void main() {
             ],
             srgb: false,
         };
-        let renderer = ShaderRenderer::new(gpu, &spec, std::slice::from_ref(&tex), 1)
-            .expect("renderer");
+        let renderer =
+            ShaderRenderer::new(gpu, &spec, std::slice::from_ref(&tex), 1).expect("renderer");
         let fb = renderer.create_framebuffer(&rt).expect("framebuffer");
         let uniforms = ShaderUniforms {
             resolution: [rt.width as f32, rt.height as f32],

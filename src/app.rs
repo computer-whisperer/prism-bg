@@ -165,6 +165,11 @@ pub(crate) const DEFAULT_OUTPUT_LUM: OutputLum = OutputLum {
     max: 203.0,
 };
 
+/// In-flight luminances for one output while its preferred description streams
+/// in: `(target_max_cll, target_luminance.max, luminances.reference)`, each
+/// `Some` once the matching info event arrives, read positionally on `Done`.
+pub type PendingLum = (Option<f64>, Option<f64>, Option<f64>);
+
 struct Wallpaper {
     output: wl_output::WlOutput,
     name: String,
@@ -230,9 +235,9 @@ pub struct App {
     /// to master against. Drives both `--tone-map auto` (the `max`) and the
     /// shader `iRefWhite`/`iMaxLum` uniforms.
     pub output_lums: HashMap<String, OutputLum>,
-    /// In-flight info collection per output: (target_max_cll,
-    /// target_luminance.max, luminances.reference).
-    pub pending_targets: HashMap<String, (Option<f64>, Option<f64>, Option<f64>)>,
+    /// In-flight info collection per output, each field filled as its preferred-
+    /// description event arrives and consumed on `Done`. See [`PendingLum`].
+    pub pending_targets: HashMap<String, PendingLum>,
     /// Rotation state per `--image-list` spec group, indexed by
     /// `OutputSpec::playlist`. Advanced by per-playlist timers in `main`.
     pub playlists: Vec<Playlist>,
@@ -308,10 +313,14 @@ impl App {
         // failure here just defers to the real error when the shader is built.
         // Same usage scan as the per-surface detection, so a shader that merely
         // *declares* iMouse to reach a later field (iDate/iFrame) doesn't count.
-        let wants_mouse = args.specs.iter().filter_map(|s| s.shader.as_ref()).any(|p| {
-            std::fs::read_to_string(p)
-                .is_ok_and(|src| crate::shader::usage_scan_source(&src).contains("iMouse"))
-        });
+        let wants_mouse = args
+            .specs
+            .iter()
+            .filter_map(|s| s.shader.as_ref())
+            .any(|p| {
+                std::fs::read_to_string(p)
+                    .is_ok_and(|src| crate::shader::usage_scan_source(&src).contains("iMouse"))
+            });
         if wants_mouse {
             tracing::info!("a shader uses iMouse; binding seat pointer for interactivity");
         }
@@ -988,7 +997,11 @@ impl App {
                 .info(o)
                 .and_then(|i| Some((i.logical_position?, i.logical_size?)))
         };
-        let all: Vec<_> = self.output_state.outputs().filter_map(|o| rect(&o)).collect();
+        let all: Vec<_> = self
+            .output_state
+            .outputs()
+            .filter_map(|o| rect(&o))
+            .collect();
         tiling_from_rects(rect(output), &all, logical)
     }
 

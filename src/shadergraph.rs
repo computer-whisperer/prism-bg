@@ -181,8 +181,8 @@ fn extract_metadata(source: &str) -> Option<String> {
 }
 
 fn parse_multipass(source: &str, meta_json: &str) -> Result<GraphSpec> {
-    let meta: RawMeta = serde_json::from_str(meta_json)
-        .context("parsing /*!prism …*/ metadata as JSON")?;
+    let meta: RawMeta =
+        serde_json::from_str(meta_json).context("parsing /*!prism …*/ metadata as JSON")?;
     let sections = split_sections(source);
     let common = sections.get("common").map(String::as_str).unwrap_or("");
 
@@ -228,9 +228,9 @@ fn parse_multipass(source: &str, meta_json: &str) -> Result<GraphSpec> {
         };
         let mut channels = Vec::with_capacity(routes.len());
         for (idx_str, src) in routes {
-            let index: u32 = idx_str
-                .parse()
-                .with_context(|| format!("channel index {idx_str:?} for pass {pass:?} is not a number"))?;
+            let index: u32 = idx_str.parse().with_context(|| {
+                format!("channel index {idx_str:?} for pass {pass:?} is not a number")
+            })?;
             if index >= MAX_CHANNELS {
                 bail!("pass {pass:?}: channel index {index} out of range 0..{MAX_CHANNELS}");
             }
@@ -273,9 +273,9 @@ fn parse_multipass(source: &str, meta_json: &str) -> Result<GraphSpec> {
 
     let mut buffers = Vec::with_capacity(meta.buffers.len());
     for name in &meta.buffers {
-        let body = sections
-            .get(name)
-            .with_context(|| format!("metadata lists buffer {name:?} but there is no //!pass {name} section"))?;
+        let body = sections.get(name).with_context(|| {
+            format!("metadata lists buffer {name:?} but there is no //!pass {name} section")
+        })?;
         buffers.push(PassSpec {
             name: name.clone(),
             glsl: concat_glsl(common, body),
@@ -307,7 +307,10 @@ fn concat_glsl(common: &str, body: &str) -> String {
     }
     // The `#version` directive must be the first non-comment token, so splice
     // common in right after it.
-    if let Some(version_end) = body.find('\n').filter(|_| body.trim_start().starts_with("#version")) {
+    if let Some(version_end) = body
+        .find('\n')
+        .filter(|_| body.trim_start().starts_with("#version"))
+    {
         let (head, rest) = body.split_at(version_end + 1);
         format!("{head}{common}\n{rest}")
     } else {
@@ -357,7 +360,10 @@ mod tests {
 
     #[test]
     fn iprevframe_becomes_one_buffer_with_blit() {
-        let g = parse("#version 450\nlayout(set=1,binding=0) uniform sampler2D iPrevFrame;\nvoid main(){}").unwrap();
+        let g = parse(
+            "#version 450\nlayout(set=1,binding=0) uniform sampler2D iPrevFrame;\nvoid main(){}",
+        )
+        .unwrap();
         assert_eq!(g.buffers.len(), 1);
         assert_eq!(g.buffers[0].channels.len(), 1);
         assert_eq!(g.buffers[0].channels[0].source, ChannelSource::SelfPrev);
@@ -393,9 +399,12 @@ void main(){}
         assert_eq!(v[0].index, 0);
         assert_eq!(v[0].source, ChannelSource::Buffer(0)); // "velocity" resolves to itself
         assert_eq!(v[1].source, ChannelSource::Buffer(1)); // "dye"
-        // common code is prepended after #version.
+                                                           // common code is prepended after #version.
         assert!(g.buffers[0].glsl.contains("helper"));
-        assert!(g.buffers[0].glsl.starts_with("#version") || g.buffers[0].glsl.trim_start().starts_with("#version"));
+        assert!(
+            g.buffers[0].glsl.starts_with("#version")
+                || g.buffers[0].glsl.trim_start().starts_with("#version")
+        );
         match &g.image {
             ImageSpec::Explicit(p) => {
                 assert_eq!(p.channels.len(), 1);

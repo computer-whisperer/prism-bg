@@ -498,7 +498,13 @@ mod tests {
         // No shader → rejected.
         assert!(parse(["--fps", "30"].iter().map(|s| s.to_string())).is_err());
         // Out of range / non-numeric → rejected.
-        let bad = |v: &str| parse(["--shader", "s.frag", "--fps", v].iter().map(|s| s.to_string()));
+        let bad = |v: &str| {
+            parse(
+                ["--shader", "s.frag", "--fps", v]
+                    .iter()
+                    .map(|s| s.to_string()),
+            )
+        };
         assert!(bad("0").is_err());
         assert!(bad("1001").is_err());
         assert!(bad("x").is_err());

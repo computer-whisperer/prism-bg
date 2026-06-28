@@ -330,13 +330,19 @@ fn local_date() -> [f32; 4] {
 /// the shader, while `SRGB` linearizes on read for color images. HDR/wide-gamut
 /// sources are flattened to 8-bit sRGB (texture color management is a later
 /// refinement; authors handle HDR in-shader for now).
-fn load_texture(base_dir: &std::path::Path, tex: &crate::shadergraph::TextureSpec) -> Result<TextureData> {
+fn load_texture(
+    base_dir: &std::path::Path,
+    tex: &crate::shadergraph::TextureSpec,
+) -> Result<TextureData> {
     let path = base_dir.join(&tex.path);
     let decoded = crate::decode::load(&path)
         .with_context(|| format!("loading texture {:?} ({})", tex.name, path.display()))?;
     let img8 = decoded.quantized_to_8bit(crate::color::Tf::Srgb);
     let crate::decode::Pixels::Rgba8(rgba) = img8.pixels else {
-        bail!("texture {:?}: expected 8-bit pixels after quantization", tex.name);
+        bail!(
+            "texture {:?}: expected 8-bit pixels after quantization",
+            tex.name
+        );
     };
     Ok(TextureData {
         width: img8.width,
@@ -978,8 +984,14 @@ mod tests {
             void main() { vec2 m = pc.iMouse.xy; }
         "#;
         let scan = usage_scan_source(src);
-        assert!(!scan.contains("iTime"), "declaration-only iTime must not scan as a use");
-        assert!(scan.contains("iMouse"), "pc.iMouse access must scan as a use");
+        assert!(
+            !scan.contains("iTime"),
+            "declaration-only iTime must not scan as a use"
+        );
+        assert!(
+            scan.contains("iMouse"),
+            "pc.iMouse access must scan as a use"
+        );
     }
 
     #[test]
@@ -992,7 +1004,10 @@ mod tests {
     fn block_comment_mention_is_not_a_use() {
         let src = "/* an iDate clock idea */ void main() { int f = pc.iFrame; }";
         let scan = usage_scan_source(src);
-        assert!(!scan.contains("iDate"), "iDate only in a comment must not scan");
+        assert!(
+            !scan.contains("iDate"),
+            "iDate only in a comment must not scan"
+        );
         assert!(scan.contains("iFrame"), "pc.iFrame access must scan");
     }
 
@@ -1028,7 +1043,8 @@ mod tests {
             "layout(std430, push_constant)",
             "layout( push_constant )",
         ] {
-            let src = format!("{layout} uniform P {{ float iTime; vec4 iMouse; }} pc; void main() {{}}");
+            let src =
+                format!("{layout} uniform P {{ float iTime; vec4 iMouse; }} pc; void main() {{}}");
             let scan = usage_scan_source(&src);
             assert!(!scan.contains("iTime"), "{layout}: declaration leaked");
             assert!(!scan.contains("iMouse"), "{layout}: declaration leaked");
