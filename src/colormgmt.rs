@@ -173,14 +173,32 @@ impl ColorState {
         desc: &DescriptionHandle,
         intent: Intent,
     ) -> WpColorManagementSurfaceV1 {
-        let intent = match intent {
-            Intent::Perceptual => RenderIntent::Perceptual,
-            Intent::Relative => RenderIntent::Relative,
-            Intent::Absolute => RenderIntent::Absolute,
-        };
         let cm = self.manager.get_surface(surface, qh, ());
-        cm.set_image_description(&desc.object, intent);
+        cm.set_image_description(&desc.object, render_intent(intent));
         cm
+    }
+
+    /// Re-point an already-tagged surface at a new image description, reusing
+    /// its color-management surface object. Unlike destroying `cm` and calling
+    /// [`Self::tag_surface`] again, this never leaves the surface untagged —
+    /// avoiding the brightness/colour flash that an untagged extended-linear
+    /// buffer gets (the compositor would fall back to its default transform)
+    /// during the few frames a fresh description takes to become `Ready`.
+    pub fn retag_surface(
+        &self,
+        cm: &WpColorManagementSurfaceV1,
+        desc: &DescriptionHandle,
+        intent: Intent,
+    ) {
+        cm.set_image_description(&desc.object, render_intent(intent));
+    }
+}
+
+fn render_intent(intent: Intent) -> RenderIntent {
+    match intent {
+        Intent::Perceptual => RenderIntent::Perceptual,
+        Intent::Relative => RenderIntent::Relative,
+        Intent::Absolute => RenderIntent::Absolute,
     }
 }
 

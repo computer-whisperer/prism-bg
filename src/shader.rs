@@ -184,13 +184,20 @@ struct RingTarget {
 
 /// An in-progress cross-blur-dissolve between the previous source (`outgoing`)
 /// and the current one (`DeviceState::renderer`, the incoming). Each frame both
-/// render offscreen via `blend`, which composites them into the dmabuf by
-/// `progress`. Dropped once `progress` reaches 1 (the incoming becomes the sole
-/// source). The outgoing keeps its own animation clock so a departing animated
-/// shader continues from where it was rather than restarting.
+/// render offscreen via the surface's persistent `DeviceState::blend`, which
+/// composites them into the dmabuf by `progress`. Ends once `progress` reaches 1
+/// (the incoming becomes the sole source). The outgoing keeps its own animation
+/// clock so a departing animated shader continues from where it was rather than
+/// restarting.
+///
+/// The blend machinery lives in [`DeviceState::blend`] (persistent across
+/// rotations), not here — only the per-dissolve state does. Before this struct
+/// is dropped, the caller must `DeviceState::blend.wait_frames()`: the blend's
+/// last submit *waits on* `outgoing`'s frame semaphore, and dropping `outgoing`
+/// while that submit is still queued would destroy a semaphore in use
+/// (VUID-vkDestroySemaphore-05149). See `ShaderSurface::end_transition`.
 struct ActiveTransition {
     outgoing: ShaderRenderer,
-    blend: Transition,
     /// Wall-clock start of the dissolve, and its total duration.
     started: Instant,
     duration: Duration,
@@ -213,7 +220,12 @@ struct DeviceState {
     ring: Vec<RingTarget>,
     /// Device-pixel size of the targets.
     size: (u32, u32),
-    /// Active blur-dissolve transition, if one is running.
+    /// Persistent blur-dissolve compositor, built once with the ring (and
+    /// resized with it) and reused by every rotation — so a source swap costs no
+    /// pipeline/target rebuild or `device_wait_idle`. `None` only before the
+    /// first ring build.
+    blend: Option<Transition>,
+    /// Active blur-dissolve transition, if one is running. Drives `blend`.
     transition: Option<ActiveTransition>,
 }
 
@@ -484,6 +496,14 @@ pub struct ShaderSurface {
     /// Extended-linear description for the surface; `None` without CM.
     description: Option<DescriptionHandle>,
     cm: Option<WpColorManagementSurfaceV1>,
+    /// The working-space encoding `description` represents (applied or pending).
+    /// A source swap rebuilds the tag only when this changes — an unchanged
+    /// encoding (every shader→shader swap; image→same treatment) keeps the live
+    /// tag, so the surface is never momentarily untagged. `None` without CM.
+    desired_encoding: Option<ColorEncoding>,
+    /// True once `description` is applied to the surface (or there's nothing to
+    /// tag). Cleared when a swap targets a new encoding; the *previous* tag stays
+    /// applied until the new description reaches `Ready` and replaces it.
     tagged: bool,
     /// Per-surface dmabuf feedback (kept alive) + its accumulator + result.
     feedback: Option<ZwpLinuxDmabufFeedbackV1>,
@@ -654,6 +674,7 @@ impl ShaderSurface {
         color: Option<&ColorState>,
     ) -> ShaderSurface {
         let description = make_description(qh, color, &src.encoding);
+        let desired_encoding = description.as_ref().map(|_| src.encoding);
         ShaderSurface {
             spec: src.graph,
             textures: src.textures,
@@ -668,6 +689,7 @@ impl ShaderSurface {
             last_render: None,
             description,
             cm: None,
+            desired_encoding,
             tagged: false,
             feedback: None,
             accum: FeedbackAccum::default(),
@@ -707,12 +729,22 @@ impl ShaderSurface {
         self.uses_mouse = src.uses_mouse;
         self.min_interval = src.min_interval;
         self.source_dirty = true;
-        // Re-tag with the new source's working space.
-        if let Some(cm) = self.cm.take() {
-            cm.destroy();
+        // Re-tag only when the new source's working-space encoding differs from
+        // the one already applied/pending. Every shader→shader swap (and any
+        // image→same-treatment swap) keeps the same extended-linear encoding, so
+        // we leave the live tag in place. Critically, even when it *does* differ
+        // we don't drop the old tag here: the previous description stays applied
+        // until the new one reaches `Ready` (see `tag_if_ready`). Destroying it
+        // now would leave the surface untagged for the few frames the new
+        // description takes to resolve, flashing the dissolve's first frames with
+        // the compositor's default (non-linear) transform.
+        if self.desired_encoding != Some(src.encoding) {
+            if let Some(desc) = make_description(qh, color, &src.encoding) {
+                self.description = Some(desc);
+                self.desired_encoding = Some(src.encoding);
+                self.tagged = false;
+            }
         }
-        self.description = make_description(qh, color, &src.encoding);
-        self.tagged = false;
         // The incoming source renders one frame from t = 0, unthrottled (so the
         // dissolve's first frame isn't gated by the outgoing source's --fps).
         self.started = None;
@@ -861,47 +893,40 @@ impl ShaderSurface {
                 renderer: ShaderRenderer::new(gpu, &self.spec, &self.textures, RING)?,
                 ring: Vec::new(),
                 size: (0, 0),
+                blend: None,
                 transition: None,
             });
         }
-        // Source swapped (rotation): build the incoming renderer and recreate
-        // the ring framebuffers against its render pass (the dmabuf ring itself
-        // is kept). With a pending fade the *old* renderer is retained as the
-        // outgoing half of a blur-dissolve (see [`ActiveTransition`]); otherwise
+        // Source swapped (rotation): build the incoming renderer. The dmabuf
+        // ring and its framebuffers are kept as-is — every renderer targets the
+        // device's shared present pass ([`Gpu::present_pass`]), so framebuffers
+        // built for the old renderer stay valid for the new one; no
+        // `device_wait_idle` + recreate. With a pending fade the *old* renderer
+        // is retained as the outgoing half of a blur-dissolve (see
+        // [`ActiveTransition`]), driven by the persistent `st.blend`; otherwise
         // it's dropped for a flash-free hard cut. Skipped when there's no ring
         // yet (the GPU-change branch above already built the new spec).
         if self.source_dirty {
             if let Some(st) = self.state.as_mut() {
                 if !st.ring.is_empty() {
                     let mut incoming = ShaderRenderer::new(gpu, &self.spec, &self.textures, RING)?;
-                    // SAFETY: drain in-flight work before swapping framebuffers.
-                    unsafe {
-                        let _ = st.device.device_wait_idle();
-                        for t in &st.ring {
-                            st.device.destroy_framebuffer(t.framebuffer, None);
-                        }
-                    }
-                    let mut fbs = Vec::with_capacity(st.ring.len());
-                    for t in &st.ring {
-                        fbs.push(incoming.create_framebuffer(&t.target)?);
-                    }
-                    for (t, fb) in st.ring.iter_mut().zip(fbs) {
-                        t.framebuffer = fb;
-                    }
                     incoming.resize(gpu, st.size.0, st.size.1)?;
                     // Supersede any still-running transition: its incoming (the
                     // current `st.renderer`) becomes this dissolve's outgoing.
-                    st.transition = None;
+                    // Drain the persistent blend first so the previous outgoing
+                    // isn't dropped while a blend submit still references it.
+                    Self::end_transition(st);
                     match self.pending_fade.take() {
-                        Some(duration) => {
-                            let mut blend = Transition::new(gpu, RING)?;
-                            blend.resize(gpu, st.size.0, st.size.1)?;
+                        Some(duration) if st.blend.is_some() => {
                             let (out_started, out_last_time, out_frame_count) =
                                 self.outgoing_timing.take().unwrap_or((None, None, 0));
                             let outgoing = std::mem::replace(&mut st.renderer, incoming);
+                            tracing::info!(
+                                duration_ms = duration.as_millis(),
+                                "blur-dissolve started"
+                            );
                             st.transition = Some(ActiveTransition {
                                 outgoing,
-                                blend,
                                 started: Instant::now(),
                                 duration,
                                 out_started,
@@ -909,7 +934,7 @@ impl ShaderSurface {
                                 out_frame_count,
                             });
                         }
-                        None => {
+                        _ => {
                             self.outgoing_timing = None;
                             st.renderer = incoming; // old renderer dropped here
                         }
@@ -934,7 +959,7 @@ impl ShaderSurface {
             // A resize mid-dissolve abandons it (the outgoing/blend targets are
             // the old size): snap to the incoming, which build_ring resizes.
             if let Some(st) = self.state.as_mut() {
-                st.transition = None;
+                Self::end_transition(st);
             }
             self.build_ring(gpu, dmabuf, qh, size, &candidates)?;
         }
@@ -948,7 +973,7 @@ impl ShaderSurface {
             .iter()
             .position(|t| t.available.load(Ordering::Acquire))
         else {
-            tracing::trace!("no free shader target this frame; skipping");
+            tracing::debug!("no free shader target this frame; skipping");
             return Ok(self.animated);
         };
         let time = match self.started {
@@ -978,20 +1003,21 @@ impl ShaderSurface {
             time_delta,
             frame: self.frame_count,
         };
-        // Disjoint borrows of the renderer, ring, and transition so a blend can
-        // sample the incoming renderer (`renderer`) while mutating the
-        // transition state.
+        // Disjoint borrows of the renderer, ring, blend, and transition so the
+        // persistent blend can sample the incoming renderer (`renderer`) and the
+        // outgoing one (`transition`) while mutating the per-dissolve state.
         let DeviceState {
             renderer,
             ring,
+            blend,
             transition,
             ..
         } = st;
         let rt = &ring[idx];
         let mut transition_done = false;
         let keep;
-        match transition.as_mut() {
-            Some(tr) => {
+        match (transition.as_mut(), blend.as_mut()) {
+            (Some(tr), Some(blend)) => {
                 // Dissolve progress, clamped; the final frame lands exactly at 1.
                 let dur = tr.duration.as_secs_f32().max(1e-3);
                 let progress = (tr.started.elapsed().as_secs_f32() / dur).clamp(0.0, 1.0);
@@ -1004,13 +1030,13 @@ impl ShaderSurface {
                     frame: tr.out_frame_count,
                     ..uniforms
                 };
-                tr.blend
+                blend
                     .render_source(0, &tr.outgoing, idx, &out_uniforms, audio)
                     .context("rendering outgoing source")?;
-                tr.blend
+                blend
                     .render_source(1, renderer, idx, &uniforms, audio)
                     .context("rendering incoming source")?;
-                tr.blend
+                blend
                     .blend(
                         idx,
                         &rt.target,
@@ -1027,7 +1053,7 @@ impl ShaderSurface {
                 // incoming is itself animated.
                 keep = !transition_done || self.animated;
             }
-            None => {
+            _ => {
                 renderer
                     .render(idx, &rt.target, rt.framebuffer, &uniforms, audio)
                     .context("rendering shader frame")?;
@@ -1049,9 +1075,16 @@ impl ShaderSurface {
             surface.frame(qh, surface.clone());
         }
         surface.commit();
-        // A finished dissolve drops here, leaving the incoming as the sole source.
+        // A finished dissolve ends here, leaving the incoming as the sole source.
+        // Drain the persistent blend first: its final submit (just queued above)
+        // waits on the outgoing's frame semaphore, so the outgoing renderer must
+        // not drop until that submit completes (VUID-vkDestroySemaphore-05149).
         if transition_done {
+            if let Some(blend) = blend.as_ref() {
+                blend.wait_frames();
+            }
             *transition = None;
+            tracing::info!("blur-dissolve complete");
         }
         Ok(self.animated)
     }
@@ -1093,6 +1126,18 @@ impl ShaderSurface {
         // textures at the new size. No-op for a plain single-pass renderer.
         st.renderer.resize(gpu, size.0, size.1)?;
         st.size = size;
+        // Build (once) and size the persistent blur-dissolve compositor to the
+        // ring. Doing it here — on the ring-(re)build path, not per rotation —
+        // keeps the heavy work (pipeline, two surface-sized targets, the
+        // `device_wait_idle` inside `Transition::resize`) off the fade critical
+        // path; a source swap then reuses it with no rebuild. `resize` no-ops
+        // when the size is unchanged.
+        if st.blend.is_none() {
+            st.blend = Some(Transition::new(gpu, RING)?);
+        }
+        if let Some(blend) = st.blend.as_mut() {
+            blend.resize(gpu, size.0, size.1)?;
+        }
         tracing::info!(
             width = size.0,
             height = size.1,
@@ -1100,6 +1145,19 @@ impl ShaderSurface {
             "shader targets (re)created"
         );
         Ok(())
+    }
+
+    /// End any active dissolve safely: drain the persistent blend so its last
+    /// submit (which waits on the outgoing's frame semaphore) has completed
+    /// before the outgoing renderer drops (VUID-vkDestroySemaphore-05149), then
+    /// clear the per-dissolve state. No-op if no transition is active.
+    fn end_transition(st: &mut DeviceState) {
+        if st.transition.is_some() {
+            if let Some(blend) = st.blend.as_ref() {
+                blend.wait_frames();
+            }
+            st.transition = None;
+        }
     }
 
     fn tag_if_ready(
@@ -1118,11 +1176,15 @@ impl ShaderSurface {
         };
         match desc.status() {
             Status::Ready => {
-                self.cm = Some(color.tag_surface(qh, surface, desc, intent));
+                match &self.cm {
+                    // Re-point the existing tag — the surface is never untagged.
+                    Some(cm) => color.retag_surface(cm, desc, intent),
+                    None => self.cm = Some(color.tag_surface(qh, surface, desc, intent)),
+                }
                 self.tagged = true;
                 tracing::info!("shader surface tagged (extended-linear)");
             }
-            Status::Pending => {} // try again next frame
+            Status::Pending => {} // try again next frame; the old tag stays applied
             Status::Failed(ref msg) => {
                 tracing::error!("shader color description failed: {msg}; leaving untagged");
                 self.tagged = true;

@@ -5,10 +5,12 @@
 //! Solid-color wallpapers use a 1×1 viewport-stretched shm buffer.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use half::f16;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region, SurfaceData},
     delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
@@ -46,8 +48,11 @@ use wayland_protocols::wp::viewporter::client::{
 
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 
+use smithay_client_toolkit::reexports::calloop;
+
 use crate::audio::AudioCapture;
 use crate::cli::{Args, Color, Intent, Mode, OutputSpec};
+use crate::color::{ColorEncoding, LuminanceControl};
 use crate::colormgmt::ColorState;
 use crate::decode::DecodedImage;
 use crate::gpu::GpuPool;
@@ -58,6 +63,86 @@ use crate::shader::{DmabufState, ShaderSurface, Tiling};
 /// (the same file treated differently for different outputs is different
 /// pixels).
 pub type ImageKey = (PathBuf, Option<(u64, u64, u64)>);
+
+/// A decoded + treated image in the unified working space (extended-linear,
+/// sRGB primaries), ready for GPU upload. This is the product of the expensive,
+/// unbounded-latency CPU work — file decode + luminance shaping + colour-space
+/// conversion — which the prep worker does off the event-loop thread.
+pub struct PreparedImage {
+    pixels: Vec<f16>,
+    encoding: ColorEncoding,
+    w: u32,
+    h: u32,
+}
+
+/// Convert an already-decoded image to a [`PreparedImage`]. Pure CPU, no I/O —
+/// shared by the worker (after it decodes) and the synchronous startup path
+/// (which already holds the decoded raw).
+fn prepare_from_raw(raw: &DecodedImage, treatment: Option<LuminanceControl>) -> PreparedImage {
+    let (pixels, encoding, w, h) = match treatment {
+        Some(ctrl) => {
+            let t = raw.luminance_controlled(ctrl);
+            let (p, e) = t.to_working_space();
+            (p, e, t.width, t.height)
+        }
+        None => {
+            let (p, e) = raw.to_working_space();
+            (p, e, raw.width, raw.height)
+        }
+    };
+    PreparedImage {
+        pixels,
+        encoding,
+        w,
+        h,
+    }
+}
+
+/// A request to the prep worker: decode + treat `path` into a [`PreparedImage`]
+/// identified by `key`. Opaque to `main`, which only shuttles the channels.
+pub struct PrepJob {
+    key: ImageKey,
+    path: PathBuf,
+    treatment: Option<LuminanceControl>,
+}
+
+/// The worker's reply for one [`PrepJob`]: the prepared image, or the decode
+/// error (a broken/missing file must not stall the daemon).
+pub struct PrepResult {
+    key: ImageKey,
+    result: Result<PreparedImage>,
+}
+
+/// Spawn the background image-prep worker. Returns the job sender (held by
+/// [`App`]) and the result channel (inserted into the event loop by `main`, so a
+/// finished prep wakes the loop and drives [`App::on_image_prepared`]). The
+/// worker exits when the job sender drops (App teardown).
+pub fn spawn_prep_worker() -> (mpsc::Sender<PrepJob>, calloop::channel::Channel<PrepResult>) {
+    let (job_tx, job_rx) = mpsc::channel::<PrepJob>();
+    let (res_tx, res_rx) = calloop::channel::channel::<PrepResult>();
+    std::thread::Builder::new()
+        .name("prism-bg-imgprep".into())
+        .spawn(move || {
+            // Blocks on each job; ends when the job sender (App) drops.
+            for job in job_rx {
+                let result = crate::decode::load(&job.path).map(|raw| {
+                    tracing::info!(path = %job.path.display(), "image loaded (background)");
+                    prepare_from_raw(&raw, job.treatment)
+                });
+                if res_tx
+                    .send(PrepResult {
+                        key: job.key,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break; // event loop gone
+                }
+            }
+        })
+        .expect("spawning image-prep thread");
+    (job_tx, res_rx)
+}
 
 /// The effective treatment for a spec once `--tone-map auto` has been
 /// resolved to concrete nits (or `None` when not requested / unavailable).
@@ -150,8 +235,19 @@ pub struct App {
     pub intent: Intent,
     pub specs: Vec<OutputSpec>,
     /// Raw decoded images by path, kept for deriving treated variants
-    /// (per-output tone targets, hotplug).
+    /// (per-output tone targets, hotplug). Populated synchronously at startup
+    /// (fail-fast); rotation images decode off-thread and never land here.
     pub raw_images: HashMap<PathBuf, Arc<DecodedImage>>,
+    /// Working-space images ready for upload, keyed by [`ImageKey`]. Filled by
+    /// the prep worker (rotation) or synchronously from `raw_images` (startup);
+    /// one entry feeds every output that shares the key. Pruned by liveness in
+    /// [`Self::evict_unused_images`].
+    prepared: HashMap<ImageKey, Arc<PreparedImage>>,
+    /// Keys with a prep job in flight, so concurrent outputs (and re-`service`
+    /// passes) don't enqueue the same decode twice.
+    prep_in_flight: HashSet<ImageKey>,
+    /// Job channel to the background prep worker. Dropping it stops the worker.
+    prep_jobs: mpsc::Sender<PrepJob>,
     /// Resolved per-output advertised luminance, from the preferred image
     /// description: the reference white (shader `1.0` maps here) and the peak
     /// to master against. Drives both `--tone-map auto` (the `max`) and the
@@ -186,6 +282,7 @@ impl App {
         args: &Args,
         raw_images: HashMap<PathBuf, Arc<DecodedImage>>,
         playlists: Vec<Playlist>,
+        prep_jobs: mpsc::Sender<PrepJob>,
     ) -> Result<App> {
         let compositor =
             CompositorState::bind(globals, qh).context("wl_compositor not available")?;
@@ -264,6 +361,9 @@ impl App {
             intent: args.intent,
             specs: args.specs.clone(),
             raw_images,
+            prepared: HashMap::new(),
+            prep_in_flight: HashSet::new(),
+            prep_jobs,
             output_lums: HashMap::new(),
             pending_targets: HashMap::new(),
             playlists,
@@ -509,55 +609,116 @@ impl App {
             };
 
             let treatment = resolve_treatment(&self.wallpapers[i].spec, tone);
-            let key: ImageKey = (path, treatment.map(|t| t.key()));
+            let key: ImageKey = (path.clone(), treatment.map(|t| t.key()));
             if self.wallpapers[i].loaded.as_ref() == Some(&key) {
                 continue; // already showing it
             }
-            if let Err(e) = self.show_image(qh, i, &key, treatment) {
+            // Resolve the prepared image. Already cached → show it now. Else, if
+            // the raw decode is in hand (startup / static `-i`, decoded fail-fast
+            // in main) prepare it synchronously; otherwise (rotation) hand it to
+            // the background worker and keep the current wallpaper up until the
+            // result arrives — never decode an arbitrary 4K file on this thread.
+            let prep = match self.prepared.get(&key) {
+                Some(p) => p.clone(),
+                None => match self.raw_images.get(&path) {
+                    Some(raw) => {
+                        let p = Arc::new(prepare_from_raw(raw, treatment));
+                        self.prepared.insert(key.clone(), p.clone());
+                        p
+                    }
+                    None => {
+                        self.enqueue_prep(&key, treatment);
+                        continue;
+                    }
+                },
+            };
+            if let Err(e) = self.show_image(qh, i, &key, &prep) {
                 tracing::error!(output = name, "preparing image failed: {e:#}");
                 self.wallpapers[i].broken = true;
             }
         }
     }
 
-    /// Build (or swap in place) the GPU surface that renders wallpaper `i`'s
-    /// current image: convert the raw decode to working-space fp16 (applying
-    /// `treatment` first, so `--tone-map`/`--scale`/`--cap` remastering is
-    /// preserved), wrap it in an [`crate::gpu::image_graph`], and create the
-    /// surface (first load) or [`ShaderSurface::set_source`] it (rotation).
+    /// Queue a background decode+prep for `key` unless it's already prepared or
+    /// in flight. The current wallpaper keeps displaying until the result lands
+    /// in [`Self::on_image_prepared`].
+    fn enqueue_prep(&mut self, key: &ImageKey, treatment: Option<LuminanceControl>) {
+        if self.prepared.contains_key(key) || !self.prep_in_flight.insert(key.clone()) {
+            return;
+        }
+        let job = PrepJob {
+            key: key.clone(),
+            path: key.0.clone(),
+            treatment,
+        };
+        if self.prep_jobs.send(job).is_err() {
+            tracing::error!(path = %key.0.display(), "image-prep worker gone; cannot prepare");
+            self.prep_in_flight.remove(key);
+        }
+    }
+
+    /// A background prep finished: cache it and re-`service` so every output
+    /// waiting on this key swaps to it (dissolving if `--fade`). A decode
+    /// failure marks the outputs targeting that file broken — the current
+    /// wallpaper stays up, and the next rotation tick advances past it.
+    pub fn on_image_prepared(&mut self, res: PrepResult, qh: &QueueHandle<App>) {
+        self.prep_in_flight.remove(&res.key);
+        match res.result {
+            Ok(prep) => {
+                self.prepared.insert(res.key, Arc::new(prep));
+                self.service(qh);
+            }
+            Err(e) => {
+                tracing::warn!(path = %res.key.0.display(), "image prep failed: {e:#}");
+                self.mark_path_broken(&res.key.0);
+            }
+        }
+    }
+
+    /// Mark every wallpaper whose desired image is `path` as broken, so
+    /// `service` stops re-enqueuing a file that won't decode (reset on the next
+    /// rotation, which advances to the following entry).
+    fn mark_path_broken(&mut self, path: &Path) {
+        let stale: Vec<usize> = self
+            .wallpapers
+            .iter()
+            .enumerate()
+            .filter(|(_, wp)| {
+                let cur = match wp.spec.playlist {
+                    Some(p) => Some(self.playlists[p].current().path()),
+                    None => wp.spec.image.as_deref(),
+                };
+                cur == Some(path)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for i in stale {
+            self.wallpapers[i].broken = true;
+        }
+    }
+
+    /// Build (or swap in place) the GPU surface that renders wallpaper `i` from
+    /// an already-[`PreparedImage`] (decode + treatment + working-space
+    /// conversion done up front, off-thread for rotations): wrap it in an
+    /// [`crate::gpu::image_graph`] and create the surface (first load) or
+    /// [`ShaderSurface::set_source`] it (rotation).
     fn show_image(
         &mut self,
         qh: &QueueHandle<App>,
         i: usize,
         key: &ImageKey,
-        treatment: Option<crate::color::LuminanceControl>,
+        prep: &PreparedImage,
     ) -> Result<()> {
         use crate::color::Tf;
 
-        let raw = self
-            .raw_images
-            .get(&key.0)
-            .context("raw image missing (bug)")?
-            .clone();
-        // Apply luminance shaping (if any), then convert to the unified
-        // working space (extended-linear, sRGB primaries) for the GPU.
-        let (pixels, encoding, w, h) = match treatment {
-            Some(ctrl) => {
-                let t = raw.luminance_controlled(ctrl);
-                tracing::info!(path = %key.0.display(), ?ctrl, "luminance treatment applied");
-                let (p, e) = t.to_working_space();
-                (p, e, t.width, t.height)
-            }
-            None => {
-                let (p, e) = raw.to_working_space();
-                (p, e, raw.width, raw.height)
-            }
-        };
+        let (w, h) = (prep.w, prep.h);
         let texture = crate::gpu::TextureData {
             width: w,
             height: h,
-            pixels: crate::gpu::TexturePixels::LinearF16(pixels),
+            // The upload copies the pixels; clone keeps the cache entry shared.
+            pixels: crate::gpu::TexturePixels::LinearF16(prep.pixels.clone()),
         };
+        let encoding = prep.encoding;
         let mode = self.wallpapers[i].spec.effective_mode();
         let c = self.wallpapers[i].color;
         // The letterbox/background color, converted to working-space linear.
@@ -801,42 +962,29 @@ impl App {
     }
 
     /// Advance playlist `idx` and re-attach every wallpaper showing it.
-    /// Called from the per-playlist rotation timer. Decoding is
-    /// synchronous — a slow decode stalls the event loop briefly, which
-    /// is fine at rotation cadence.
+    /// Called from the per-playlist rotation timer. Images are *not* decoded
+    /// here — that happens on the background prep worker (an arbitrary 4K file
+    /// from anywhere has unbounded decode latency and must never block the event
+    /// loop); the current wallpaper stays up until the prep lands. Shaders are
+    /// still validated synchronously (a cheap parse) so a broken shader entry is
+    /// skipped immediately.
     pub fn rotate(&mut self, qh: &QueueHandle<App>, idx: usize) {
         let previous = self.playlists[idx].current().path().to_path_buf();
 
-        // Find the next usable entry, skipping (with a warning) files that fail
-        // — a deleted or corrupt entry must not kill the daemon. Images are
-        // pre-decoded into the cache; shaders are validated (parse only — the
-        // full prep, including textures, happens at display time).
+        // Advance to the next entry. Shaders are parse-validated so a broken one
+        // is skipped now; images are accepted optimistically — the worker
+        // validates by decoding, and a failed result skips on the next tick.
         let mut next = None;
         for _ in 0..self.playlists[idx].len() {
             self.playlists[idx].advance();
             let src = self.playlists[idx].current();
-            let is_shader = src.is_shader();
             let path = src.path().to_path_buf();
-            if is_shader {
-                match crate::shader::validate_shader_file(&path) {
-                    Ok(()) => {
-                        next = Some(path);
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!(path = %path.display(), "skipping playlist entry: {e:#}")
-                    }
-                }
-                continue;
-            }
-            if self.raw_images.contains_key(&path) {
+            if !src.is_shader() {
                 next = Some(path);
                 break;
             }
-            match crate::decode::load(&path) {
-                Ok(img) => {
-                    tracing::info!(path = %path.display(), "image loaded");
-                    self.raw_images.insert(path.clone(), Arc::new(img));
+            match crate::shader::validate_shader_file(&path) {
+                Ok(()) => {
                     next = Some(path);
                     break;
                 }
@@ -866,9 +1014,11 @@ impl App {
         self.service(qh);
     }
 
-    /// Drop cached raw/treated images not reachable from any static spec
-    /// or current playlist position — keeps long-running rotation
-    /// memory-flat.
+    /// Drop cached raw and prepared images not reachable from any static spec
+    /// or current playlist position — keeps long-running rotation memory-flat.
+    /// A just-rotated entry is the playlist's *current* path, so its prep
+    /// survives; the outgoing one is freed (its pixels already live in the GPU
+    /// surface, so a dissolve still finishes).
     fn evict_unused_images(&mut self) {
         let mut live: HashSet<PathBuf> =
             self.specs.iter().filter_map(|s| s.image.clone()).collect();
@@ -878,6 +1028,7 @@ impl App {
                 .map(|p| p.current().path().to_path_buf()),
         );
         self.raw_images.retain(|path, _| live.contains(path));
+        self.prepared.retain(|key, _| live.contains(&key.0));
     }
 
     fn remove_output(&mut self, output: &wl_output::WlOutput) {

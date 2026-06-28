@@ -25,6 +25,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context, Result};
 use smithay_client_toolkit::reexports::{
     calloop::{
+        channel::Event as ChannelEvent,
         timer::{TimeoutAction, Timer},
         EventLoop,
     },
@@ -144,7 +145,11 @@ fn main() -> Result<()> {
     // Created before App: fades insert their ticker via the loop handle.
     let mut event_loop: EventLoop<App> = EventLoop::try_new().context("creating event loop")?;
 
-    let mut app = App::new(&globals, &qh, &args, raw_images, playlists)?;
+    // Background image-prep worker: decode + colour-space conversion of rotation
+    // images happens off the event-loop thread; finished preps wake the loop via
+    // `prep_results` and drive `App::on_image_prepared`.
+    let (prep_jobs, prep_results) = app::spawn_prep_worker();
+    let mut app = App::new(&globals, &qh, &args, raw_images, playlists, prep_jobs)?;
 
     // Setup roundtrips: output enumeration, wl_shm formats, and the color
     // manager's supported_* events (terminated by done). Image treatment
@@ -171,6 +176,19 @@ fn main() -> Result<()> {
     WaylandSource::new(conn, queue)
         .insert(event_loop.handle())
         .map_err(|e| anyhow!("inserting wayland source: {e}"))?;
+    // Finished background image preps: cache the result and re-service so the
+    // waiting outputs swap (dissolving) to it.
+    {
+        let qh = qh.clone();
+        event_loop
+            .handle()
+            .insert_source(prep_results, move |event, _, app: &mut App| {
+                if let ChannelEvent::Msg(res) = event {
+                    app.on_image_prepared(res, &qh);
+                }
+            })
+            .map_err(|e| anyhow!("inserting image-prep result channel: {e}"))?;
+    }
     for idx in 0..app.playlists.len() {
         let period = app.playlists[idx].period;
         let qh = qh.clone();

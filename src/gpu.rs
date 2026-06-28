@@ -272,6 +272,13 @@ pub struct Gpu {
     pub queue_family: u32,
     pub queue: vk::Queue,
     pub command_pool: vk::CommandPool,
+    /// The present render pass writing an fp16 dmabuf, shared by every
+    /// [`ShaderRenderer`] and [`Transition`] on this device. One handle for the
+    /// device's whole lifetime: all are byte-identical (same format, same
+    /// GENERAL final layout), so framebuffers built against it stay valid across
+    /// source swaps — letting a rotation reuse the ring's framebuffers without a
+    /// `device_wait_idle` + recreate. Destroyed in [`Drop`].
+    pub present_pass: vk::RenderPass,
     /// Cached memory properties for [`Self::find_memory_type`].
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// Loader for `VK_EXT_image_drm_format_modifier` device functions.
@@ -315,6 +322,19 @@ impl Gpu {
         let command_pool = unsafe { device.create_command_pool(&pool_info, None) }
             .context("creating command pool")?;
 
+        // One present render pass for the device's lifetime (see field doc).
+        let present_pass = match create_present_render_pass(&device) {
+            Ok(rp) => rp,
+            Err(e) => {
+                // SAFETY: pool + device created just above; nothing in flight.
+                unsafe {
+                    device.destroy_command_pool(command_pool, None);
+                    device.destroy_device(None);
+                }
+                return Err(e);
+            }
+        };
+
         // SAFETY: physical_device came from this instance.
         let memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
@@ -331,6 +351,7 @@ impl Gpu {
             queue_family,
             queue,
             command_pool,
+            present_pass,
             memory_properties,
             drm_modifier_fn,
             external_memory_fd_fn,
@@ -401,6 +422,7 @@ impl Drop for Gpu {
         // outlives every Gpu (the pool destroys devices before the instance).
         unsafe {
             let _ = self.device.device_wait_idle();
+            self.device.destroy_render_pass(self.present_pass, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
         }
@@ -1540,11 +1562,29 @@ pub fn validate_graph(spec: &GraphSpec) -> Result<()> {
 /// Compile GLSL to SPIR-V at load time. Returns the validator's error
 /// messages on failure so a bad user shader gets a useful diagnostic.
 fn compile_glsl(source: &str, kind: shaderc::ShaderKind, name: &str) -> Result<Vec<u32>> {
+    // Memoize by (source, kind): GLSL→SPIR-V is deterministic and
+    // device-independent, so identical source yields identical SPIR-V. This
+    // collapses the compiles that would otherwise block the event loop on every
+    // transition — the fixed blend shader (compiled once ever) and a playlist
+    // shader shown on N outputs / re-shown on rotation (compiled once, not once
+    // per surface). Compiling is by far the heaviest part of building a renderer
+    // (it also spins up a fresh shaderc compiler each miss), so a daemon driving
+    // several 4K outputs stalls visibly without this.
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<(String, i32), Vec<u32>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (source.to_string(), kind as i32);
+    if let Some(spv) = cache.lock().unwrap().get(&key) {
+        return Ok(spv.clone());
+    }
     let compiler = shaderc::Compiler::new().context("initializing shaderc")?;
     let artifact = compiler
         .compile_into_spirv(source, kind, name, "main", None)
         .with_context(|| format!("compiling {name}"))?;
-    Ok(artifact.as_binary().to_vec())
+    let spv = artifact.as_binary().to_vec();
+    cache.lock().unwrap().insert(key, spv.clone());
+    Ok(spv)
 }
 
 /// Per-ring-slot command resources. One set per [`RenderTarget`] in the ring
@@ -1669,7 +1709,8 @@ pub struct ShaderRenderer {
     device: ash::Device,
     queue: vk::Queue,
     queue_family: u32,
-    /// The dmabuf (present) render pass; the image pass targets it.
+    /// The dmabuf (present) render pass the image pass targets. Borrowed from
+    /// [`Gpu::present_pass`] (shared across renderers) — never destroyed here.
     render_pass: vk::RenderPass,
     /// Spectrum-UBO descriptor layout (set 0, binding 0) and the pool the
     /// per-slot sets are allocated from. Bound as set 0 of every pass; a shader
@@ -1699,15 +1740,9 @@ impl ShaderRenderer {
         frames: usize,
     ) -> Result<ShaderRenderer> {
         let device = gpu.device.clone();
-        let render_pass = Self::create_render_pass(&device)?;
-        match Self::build(gpu, device.clone(), render_pass, spec, textures, frames) {
-            Ok(r) => Ok(r),
-            Err(e) => {
-                // SAFETY: render_pass created just above, nothing else owns it.
-                unsafe { device.destroy_render_pass(render_pass, None) };
-                Err(e)
-            }
-        }
+        // Borrow the device's shared present pass (not owned — never destroyed
+        // here): see `Gpu::present_pass`.
+        Self::build(gpu, device, gpu.present_pass, spec, textures, frames)
     }
 
     /// Whether `gpu` can export a binary semaphore as a SYNC_FD sync_file —
@@ -1729,10 +1764,6 @@ impl ShaderRenderer {
         props
             .external_semaphore_features
             .contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE)
-    }
-
-    fn create_render_pass(device: &ash::Device) -> Result<vk::RenderPass> {
-        create_present_render_pass(device)
     }
 
     fn build(
@@ -2964,7 +2995,7 @@ impl Drop for ShaderRenderer {
             self.device
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             self.graph.destroy(&self.device);
-            self.device.destroy_render_pass(self.render_pass, None);
+            // render_pass is borrowed from Gpu::present_pass — not destroyed here.
         }
     }
 }
@@ -3044,7 +3075,8 @@ pub struct Transition {
     device: ash::Device,
     queue: vk::Queue,
     queue_family: u32,
-    /// Present render pass writing the dmabuf (shared shape with [`ShaderRenderer`]).
+    /// Present render pass writing the dmabuf. Borrowed from [`Gpu::present_pass`]
+    /// (shared with every [`ShaderRenderer`]) — never destroyed here.
     present_pass: vk::RenderPass,
     /// CLEAR → SHADER_READ render pass for the two source targets.
     source_pass: vk::RenderPass,
@@ -3074,15 +3106,9 @@ impl Transition {
     /// depth (one blend command buffer per slot).
     pub fn new(gpu: &Gpu, frames: usize) -> Result<Transition> {
         let device = gpu.device.clone();
-        let present_pass = create_present_render_pass(&device)?;
-        match Self::build(gpu, device.clone(), present_pass, frames) {
-            Ok(t) => Ok(t),
-            Err(e) => {
-                // SAFETY: present_pass created just above, nothing else owns it.
-                unsafe { device.destroy_render_pass(present_pass, None) };
-                Err(e)
-            }
-        }
+        // Borrow the device's shared present pass (see `Gpu::present_pass`); the
+        // source pass below is this transition's own and is destroyed in `Drop`.
+        Self::build(gpu, device, gpu.present_pass, frames)
     }
 
     fn build(
@@ -3113,22 +3139,25 @@ impl Transition {
                 .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
                 .color_attachments(&color_refs);
             let subpasses = [subpass];
-            let deps = [
-                vk::SubpassDependency::default()
-                    .src_subpass(vk::SUBPASS_EXTERNAL)
-                    .dst_subpass(0)
-                    .src_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
-                    .src_access_mask(vk::AccessFlags::SHADER_READ)
-                    .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
-                vk::SubpassDependency::default()
-                    .src_subpass(0)
-                    .dst_subpass(vk::SUBPASS_EXTERNAL)
-                    .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ),
-            ];
+            // This pass must be render-pass-*compatible* with the present pass:
+            // the source image pass reuses a pipeline built against the present
+            // pass, and a draw whose bound pipeline's render pass differs in
+            // dependency count OR contents trips VUID-vkCmdDraw-renderPass-02684
+            // (→ GPU fault on RADV). Compatibility allows only `finalLayout` to
+            // differ, so this dependency is byte-identical to the present pass's.
+            // It does no hazard work for us: the source→blend RAW is carried by
+            // the source render's completion semaphore (which the blend waits
+            // on) + the implicit subpass→EXTERNAL layout transition, and the
+            // cross-frame WAR (this overwrite vs the previous blend's sample of
+            // the shared target) is handled by an explicit barrier the blend
+            // records at the end of its command buffer (see `Transition::blend`).
+            let deps = [vk::SubpassDependency::default()
+                .src_subpass(vk::SUBPASS_EXTERNAL)
+                .dst_subpass(0)
+                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
             let info = vk::RenderPassCreateInfo::default()
                 .attachments(&attachments)
                 .subpasses(&subpasses)
@@ -3397,6 +3426,19 @@ impl Transition {
         })
     }
 
+    /// Block until every in-flight blend submission has completed (a narrow
+    /// wait on just this transition's per-slot fences — not a device drain).
+    /// Callers must do this before dropping a source renderer the blend may
+    /// still be waiting on (its frame semaphore), else
+    /// VUID-vkDestroySemaphore-05149.
+    pub fn wait_frames(&self) {
+        let fences: Vec<vk::Fence> = self.frames.iter().map(|f| f.fence).collect();
+        if !fences.is_empty() {
+            // SAFETY: fences are this transition's; signaled or in-flight.
+            unsafe { self.device.wait_for_fences(&fences, true, u64::MAX) }.ok();
+        }
+    }
+
     /// (Re)allocate the two source targets at `w`×`h` and re-point the blend
     /// descriptor set at them. No-op if already built at this size.
     pub fn resize(&mut self, gpu: &Gpu, w: u32, h: u32) -> Result<()> {
@@ -3605,6 +3647,23 @@ impl Transition {
             device.cmd_draw(cb, 3, 1, 0, 0);
             device.cmd_end_render_pass(cb);
 
+            // WAR: the two source targets are shared across ring slots, so the
+            // next frame's source render overwrites the textures this blend just
+            // sampled. A pipeline barrier's scopes span queue submissions, so
+            // this orders that later color write after this fragment read.
+            let war = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+            device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[war],
+                &[],
+                &[],
+            );
+
             // Release the dmabuf to the compositor's (foreign) queue.
             let barrier = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
@@ -3711,7 +3770,7 @@ impl Drop for Transition {
                 .destroy_descriptor_set_layout(self.set_layout, None);
             self.device.destroy_sampler(self.sampler, None);
             self.device.destroy_render_pass(self.source_pass, None);
-            self.device.destroy_render_pass(self.present_pass, None);
+            // present_pass is borrowed from Gpu::present_pass — not destroyed here.
         }
     }
 }
