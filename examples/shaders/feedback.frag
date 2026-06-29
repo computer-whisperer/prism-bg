@@ -1,6 +1,9 @@
-// Glowing trails: a wandering emitter painted over a slowly decaying, gently
+//!luminance dark
+// Glowing trails: a wandering icy comet painted over a slowly decaying, gently
 // diffusing copy of the previous frame. A feedback shader — it samples its own
-// last output via iPrevFrame, so motion leaves comet-like tails.
+// last output via iPrevFrame, so motion leaves comet-like tails. The emitter
+// roams the whole desktop in cluster space, so one comet crosses between
+// monitors rather than every output cloning its own.
 //
 //   prism-bg --shader examples/shaders/feedback.frag
 //
@@ -33,10 +36,6 @@ float headroom() { return max(pc.iMaxLum / max(pc.iRefWhite, 1.0), 1.0); }
 layout(set = 1, binding = 0) uniform sampler2D iPrevFrame;
 vec3 prev(vec2 uv) { return texture(iPrevFrame, vec2(uv.x, 1.0 - uv.y)).rgb; }
 
-vec3 palette(float t) {
-    return 0.5 + 0.5 * cos(6.28318 * (t + vec3(0.0, 0.33, 0.67)));
-}
-
 void main() {
     vec2 uv = fragCoord / pc.iResolution;
     vec2 px = 1.0 / pc.iResolution;
@@ -50,13 +49,25 @@ void main() {
     acc += prev(uv - vec2(0.0, px.y));
     vec3 col = acc / 8.0 * 0.985;
 
-    // A wandering emitter (a couple of incommensurate sinusoids → a Lissajous
-    // path that doesn't obviously repeat). The emitter core is driven toward the
-    // display peak so the trails glow in HDR; on SDR (headroom 1.0) it tops out
-    // at white.
-    vec2 p = vec2(0.5 + 0.36 * cos(pc.iTime * 0.7), 0.5 + 0.30 * sin(pc.iTime * 1.1));
-    float d = distance(uv, p);
-    col += palette(pc.iTime * 0.05) * smoothstep(0.025, 0.0, d) * headroom();
+    // The emitter roams the whole desktop in aspect-correct global coords, so a
+    // single comet crosses between monitors (each output accumulates its own
+    // slice of the trail) rather than every output cloning its own comet.
+    vec2 gv = (pc.iOutputOffset + uv * pc.iOutputSize) / max(pc.iGlobalResolution, vec2(1.0));
+    float aspect = pc.iGlobalResolution.x / max(pc.iGlobalResolution.y, 1.0);
+    vec2 gp = gv * vec2(aspect, 1.0);
+
+    // A couple of incommensurate sinusoids → a Lissajous path that doesn't
+    // obviously repeat, sweeping most of the desktop.
+    vec2 e = vec2(aspect * (0.5 + 0.40 * cos(pc.iTime * 0.40)),
+                            0.5 + 0.40 * sin(pc.iTime * 0.55));
+    float d = distance(gp, e);
+
+    // Icy comet: a hot white core with a cool cyan halo, driven into HDR so the
+    // trails glow. The trails inherit this colour through the feedback decay.
+    float core = smoothstep(0.022, 0.0, d);
+    float halo = smoothstep(0.070, 0.0, d);
+    col += vec3(1.0) * core * headroom();
+    col += vec3(0.30, 0.65, 1.0) * (halo - core) * 0.6 * headroom();
 
     // Clamp the accumulator to the peak so additive trails can't creep past the
     // master target over many frames.
