@@ -146,14 +146,14 @@ Extras beyond swaybg (also per-output-group):
   encoding whether the button is currently down and `sign(iMouse.w)` whether the
   press happened this frame. All four are zero until the first click. Only
   shaders that reference `iMouse` receive input; every other wallpaper stays
-  click-through. See `examples/shaders/pointer.frag`.
+  click-through. See `examples/shaders/feature_demos/pointer.frag`.
 
   **Timing and date (`iTimeDelta` / `iFrame` / `iDate`).** `iTimeDelta` is the
   wall-clock seconds since the previous rendered frame (for frame-rate-independent
   integration), `iFrame` the frame counter since start, and `iDate` the local
   wall clock as `(year, month 0-11, day, seconds-since-midnight)` with a
   fractional seconds component — enough for a clock wallpaper. See
-  `examples/shaders/clock.frag`.
+  `examples/shaders/feature_demos/clock.frag`.
 
   A shader can also be **audio-reactive**: reference any of the audio uniforms
   and prism-bg captures the default sink's output over PipeWire, runs an FFT,
@@ -172,7 +172,7 @@ Extras beyond swaybg (also per-output-group):
   // read bin i (0..31): au.iAudioBins[i >> 2][i & 3]
   ```
 
-  See `examples/shaders/spectrum.frag` for a worked example. With no PipeWire
+  See `examples/shaders/feature_demos/spectrum.frag` for a worked example. With no PipeWire
   (or no audio playing) the values are zero and the shader just renders silence.
 
   A shader can also use **feedback** — sampling its own previous frame — for

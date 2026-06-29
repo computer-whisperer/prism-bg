@@ -1530,9 +1530,8 @@ fn image_pass_glsl(img_w: u32, img_h: u32, mode: crate::cli::Mode, bg: [f32; 3])
     )
 }
 
-/// Animated gradient used as the render test subject (kept in sync with
-/// `examples/shaders/gradient.frag`). Outputs extended-linear values; the
-/// surface is tagged linear / sRGB-primaries.
+/// Animated gradient used as the render test subject. Outputs extended-linear
+/// values; the surface is tagged linear / sRGB-primaries.
 #[cfg(test)]
 pub const DEFAULT_FRAGMENT_GLSL: &str = r#"#version 450
 layout(location = 0) in vec2 fragCoord;
@@ -3936,11 +3935,20 @@ mod tests {
     #[test]
     fn example_shaders_compile() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/shaders");
-        let mut paths: Vec<_> = std::fs::read_dir(&dir)
-            .expect("read examples/shaders")
-            .map(|entry| entry.expect("example entry").path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "frag"))
-            .collect();
+        // Walk recursively so shaders in subdirectories (e.g. feature_demos/)
+        // stay covered.
+        fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read examples/shaders") {
+                let path = entry.expect("example entry").path();
+                if path.is_dir() {
+                    collect(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "frag") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        collect(&dir, &mut paths);
         paths.sort();
 
         for path in paths {
