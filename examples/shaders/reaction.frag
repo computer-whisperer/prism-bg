@@ -120,16 +120,40 @@ void main() {
     // Gradient of V → a surface normal, for shading the ridges.
     float gx = vAt(uv + vec2(px.x, 0.0)) - vAt(uv - vec2(px.x, 0.0));
     float gy = vAt(uv + vec2(0.0, px.y)) - vAt(uv - vec2(0.0, px.y));
-    vec3 n = normalize(vec3(-gx * 6.0, -gy * 6.0, 1.0));
+    vec3 n = normalize(vec3(-gx * 7.0, -gy * 7.0, 1.0));
 
-    vec3 lightDir = normalize(vec3(0.5, 0.7, 0.6));
-    float diff = max(dot(n, lightDir), 0.0);
-    float spec = pow(max(dot(n, normalize(lightDir + vec3(0.0, 0.0, 1.0))), 0.0), 24.0);
+    // Curvature-based ambient occlusion: compare V to a wider-radius average.
+    // Concave grooves and ring interiors (centre below their surroundings)
+    // recess and darken; convex crests (centre above) round outward and catch
+    // more light. This is what turns flat "cheerio" rings into raised tubes.
+    vec2 aoR = 4.0 * px;
+    float wide = 0.25 * (vAt(uv + vec2(aoR.x, 0.0)) + vAt(uv - vec2(aoR.x, 0.0))
+                       + vAt(uv + vec2(0.0, aoR.y)) + vAt(uv - vec2(0.0, aoR.y)));
+    float curv = v - wide;
+    float occ   = smoothstep(0.0, -0.12, curv);   // 1 deep in a groove
+    float crest = smoothstep(0.0,  0.12, curv);    // 1 on a ridge top
+    float ao = mix(1.0, 0.30, occ);
+
+    // Raking key light for relief + a soft hemispheric fill so valleys aren't
+    // black. The grazing angle throws directional shading across the ridges.
+    vec3 keyDir = normalize(vec3(0.82, 0.42, 0.30));
+    float key  = max(dot(n, keyDir), 0.0);
+    float fill = 0.5 + 0.5 * n.z;                  // ambient from above
+    float spec = pow(max(dot(n, normalize(keyDir + vec3(0.0, 0.0, 1.0))), 0.0), 32.0);
+
+    // Fresnel rim: steep ridge walls (normal tilted away from the viewer) catch
+    // a wet glint that separates the tubes from the substrate.
+    float rim = pow(1.0 - clamp(n.z, 0.0, 1.0), 3.0) * smoothstep(0.10, 0.30, v);
 
     // Deep substrate where V≈0, warm crests where V is high; drift the palette
     // slowly so the colour scheme breathes.
-    vec3 base = mix(vec3(0.02, 0.03, 0.06), palette(0.55 + v * 1.4 + pc.iTime * 0.01), smoothstep(0.05, 0.35, v));
-    vec3 col = base * (0.25 + 0.85 * diff) + vec3(1.0, 0.95, 0.85) * spec * smoothstep(0.2, 0.45, v) * headroom();
+    vec3 mem = palette(0.55 + v * 1.4 + pc.iTime * 0.01);
+    vec3 base = mix(vec3(0.02, 0.03, 0.06), mem, smoothstep(0.05, 0.35, v));
+
+    vec3 col = base * (0.18 * fill + 0.90 * key) * ao;
+    col += base * crest * 0.25;                                       // convex crests read brighter
+    col += vec3(0.8, 0.9, 1.0) * rim * 0.35 * headroom();             // cool wet rim
+    col += vec3(1.0, 0.95, 0.85) * spec * smoothstep(0.2, 0.45, v) * ao * headroom();
 
     outColor = vec4(min(col, vec3(headroom())), 1.0);
 }
