@@ -1,12 +1,16 @@
-// Organic cellular pattern with glowing edges — animated Voronoi. The cells
-// breathe as their feature points drift on sine orbits. Uses iTime → animated.
-// Moderately heavy: two neighborhood passes per pixel (nearest cell, then the
-// distance to its borders), the classic two-pass Voronoi-edge approach.
+//!luminance bright
+// Molten cellular glass with glowing edges — animated Voronoi. Warm ember /
+// copper / gold cells breathe as their feature points drift on sine orbits,
+// with hot gold borders. Uses iTime → animated. Moderately heavy: two
+// neighborhood passes per pixel (nearest cell, then the distance to its
+// borders), the classic two-pass Voronoi-edge approach.
 //
 //   prism-bg --shader examples/shaders/voronoi.frag
 //
 // Original implementation of a well-known technique (Inigo Quilez's Voronoi
-// distance). Output is extended-linear with sRGB primaries (1.0 = white).
+// distance), shaded in shared cluster space so the cells tile continuously
+// across a multi-monitor desktop instead of cloning per output. Output is
+// extended-linear with sRGB primaries (1.0 = white).
 #version 450
 layout(location = 0) in vec2 fragCoord;
 layout(location = 0) out vec4 outColor;
@@ -24,24 +28,42 @@ layout(push_constant) uniform Push {
 // Highlight headroom above diffuse white (>= 1.0; 1.0 on SDR).
 float headroom() { return max(pc.iMaxLum / max(pc.iRefWhite, 1.0), 1.0); }
 
+// PCG bit-hash (full period). The cells are shaded in global cluster space, so
+// cell ids range over the whole desktop; the usual fract(sin(p)) hash bands at
+// those magnitudes, while pcg stays well-distributed.
+const float U32 = 2.3283064e-10;  // 1 / 2^32
+uint pcg(uint v) {
+    v = v * 747796405u + 2891336453u;
+    uint s = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
+    return (s >> 22u) ^ s;
+}
 vec2 hash22(vec2 p) {
-    p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
-    return fract(sin(p) * 43758.5453123);
+    uvec2 q = uvec2(ivec2(p));
+    uint h = pcg(q.x ^ pcg(q.y));
+    return vec2(pcg(h), pcg(h ^ 0x9e3779b9u)) * U32;
 }
 
-// IQ cosine palette: smooth, loopable color ramp.
-vec3 palette(float t) {
-    vec3 a = vec3(0.45, 0.40, 0.55);
-    vec3 b = vec3(0.30, 0.30, 0.35);
-    vec3 c = vec3(1.0, 1.0, 1.0);
-    vec3 d = vec3(0.0, 0.15, 0.35);
-    return a + b * cos(6.28318 * (c * t + d));
+// Molten ramp: ember -> copper -> gold, confined to warm hues (no full-spectrum
+// hue walk). s in [0,1].
+vec3 warmRamp(float s) {
+    s = clamp(s, 0.0, 1.0);
+    vec3 ember  = vec3(0.16, 0.055, 0.025);
+    vec3 copper = vec3(0.43, 0.180, 0.070);
+    vec3 gold   = vec3(0.85, 0.520, 0.180);
+    return s < 0.5 ? mix(ember, copper, s * 2.0)
+                   : mix(copper, gold, (s - 0.5) * 2.0);
 }
 
 void main() {
-    vec2 uv = (fragCoord - 0.5 * pc.iResolution) / pc.iResolution.y;
+    // Global cluster space: the cells tile continuously across a multi-monitor
+    // desktop at constant per-monitor density instead of cloning per output.
+    vec2 local = fragCoord / pc.iResolution;
+    vec2 g0 = pc.iOutputOffset + local * pc.iOutputSize;
+    vec2 gv = g0 / max(pc.iGlobalResolution, vec2(1.0));
+    float aspect = pc.iGlobalResolution.x / max(pc.iGlobalResolution.y, 1.0);
+    vec2 uv = (gv - 0.5) * vec2(aspect, 1.0);   // centred, aspect-correct, continuous
     vec2 p = uv * 5.0;
-    float t = pc.iTime * 0.5;
+    float t = pc.iTime * 0.18;
 
     vec2 ip = floor(p), fp = fract(p);
 
@@ -71,14 +93,18 @@ void main() {
             me = min(me, dot(0.5 * (mr + r), normalize(r - mr)));
     }
 
-    // Cell fill: dark, tinted by the cell's hashed id.
+    // Cell fill: a warm molten tint, each cell on its own slow phase through the
+    // ember->copper->gold ramp (a smooth oscillation, so no hue-wrap pop).
     vec2 cellId = ip + mg;
-    vec3 col = palette(dot(cellId, vec2(0.11, 0.07)) + t * 0.1) * 0.18;
-    col *= 0.6 + 0.4 * smoothstep(0.0, 0.6, sqrt(md));
+    float ph = hash22(cellId).x;
+    float cellVar = 0.5 + 0.5 * sin(t * 0.8 + 6.28318 * ph);
+    vec3 col = warmRamp(0.12 + 0.65 * cellVar);
+    // Brighten toward each cell's feature point, dim toward its borders.
+    col *= 0.30 + 0.45 * smoothstep(0.0, 0.6, sqrt(md));
 
-    // Glowing borders.
+    // Glowing molten borders, pushed into HDR headroom so they read as hot.
     float edge = smoothstep(0.04, 0.0, me);
-    col += palette(0.6 + 0.05 * sin(t)) * edge * 0.5 * headroom();
+    col += vec3(1.0, 0.62, 0.22) * edge * 0.7 * headroom();
 
     outColor = vec4(min(col, vec3(headroom())), 1.0);
 }
