@@ -1,3 +1,4 @@
+//!luminance dark
 // Spiral galaxy spanning the whole desktop — ONE continuous scene across every
 // monitor, not a copy per output. Slowly winding log-spiral arms, a blown-out
 // HDR core, dust lanes and a continuous star field; the galaxy's centre sits at
@@ -43,6 +44,26 @@ float hash21(vec2 p) {
     return fract(p.x * p.y);
 }
 
+// PCG bit-hash (full period) for the star field. hash21 above is fine for the
+// interpolated nebula/dust noise, but the stars are sparse points gated on a
+// marching integer cell id, where the short period of fract(p*k) makes the
+// constellation repeat across the desktop (the seam-free cluster coords don't
+// help — it's the hash that repeats). pcg4d gives four decorrelated randoms
+// per cell in one pass: brightness, twinkle rate, twinkle phase, tint.
+const float U32 = 2.3283064e-10;  // 1 / 2^32
+uvec4 pcg4d(uvec4 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.w; v.y += v.z * v.x; v.z += v.x * v.y; v.w += v.y * v.z;
+    v ^= v >> 16u;
+    v.x += v.y * v.w; v.y += v.z * v.x; v.z += v.x * v.y; v.w += v.y * v.z;
+    return v;
+}
+vec4 cellRand4(vec2 cell, uint layer) {
+    uvec2 q = uvec2(ivec2(cell));
+    uvec4 s = uvec4(q.x, q.y, q.x ^ (layer * 0x9e3779b9u), q.y ^ (layer + 0x85ebca6bu));
+    return vec4(pcg4d(s)) * U32;
+}
+
 float vnoise(vec2 p) {
     vec2 i = floor(p), f = fract(p);
     f = f * f * (3.0 - 2.0 * f);
@@ -85,13 +106,12 @@ void main() {
     //     or jumps at a monitor seam). Two layers for a little depth. ---
     for (int L = 0; L < 2; L++) {
         float cell = (L == 0) ? 7.0 : 13.0;
-        vec2 sc = g / cell;
-        vec2 id = floor(sc);
-        float h = hash21(id + float(L) * 41.0);
-        float star = pow(h, 240.0);                          // very sparse
-        // Twinkle, each star on its own phase.
-        float tw = 0.6 + 0.4 * sin(t * (1.0 + 3.0 * hash21(id + 7.0)) + h * TAU);
-        vec3 sc3 = mix(vec3(0.7, 0.8, 1.0), vec3(1.0, 0.9, 0.8), hash21(id + 2.0));
+        vec2 id = floor(g / cell);
+        vec4 r = cellRand4(id, uint(L));
+        float star = pow(r.x, 240.0);                        // very sparse
+        // Twinkle, each star on its own rate and phase.
+        float tw = 0.6 + 0.4 * sin(t * (1.0 + 3.0 * r.y) + r.z * TAU);
+        vec3 sc3 = mix(vec3(0.7, 0.8, 1.0), vec3(1.0, 0.9, 0.8), r.w);
         col += sc3 * star * tw * (L == 0 ? 0.9 : 0.5);
     }
 
