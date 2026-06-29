@@ -1,13 +1,13 @@
-//!luminance dark
-// Topographic glow (dark): contour lines slide over a living height field, with
-// subtle color shifts and survey marks. Uses iTime -> animated.
+//!luminance bright
+// Topographic glow (bright): contour lines slide over a living height field,
+// with subtle color shifts and bright survey marks. Uses iTime -> animated.
 //
-// The dark counterpart to topographic-glow-bright.frag: a near-black contour
-// field with soft, low-contrast lines for a dark room. The bright variant keeps
-// the same map but punches up floor and accents for daytime. Pair them in a
-// --list with --dark-hours to swap by time of day.
+// The bright daytime counterpart to topographic-glow.frag: a near-black field
+// crossed by punchy, high-contrast survey lines and marks. topographic-glow.frag
+// drives the same map much darker — a quiet near-black contour field for a dark
+// room. Pair them in a --list with --dark-hours to swap by time of day.
 //
-//   prism-bg --shader examples/shaders/topographic-glow.frag
+//   prism-bg --shader examples/shaders/topographic-glow-bright.frag
 //
 // Coordinates are in global cluster space so the map is continuous across
 // outputs and keeps the same apparent scale regardless of per-monitor DPI.
@@ -86,8 +86,8 @@ void main() {
     float line = smoothstep(0.075, 0.018, contour);
     float majorLine = smoothstep(0.060, 0.012, major);
 
-    vec3 low = vec3(0.006, 0.010, 0.016);
-    vec3 high = vec3(0.014, 0.013, 0.020);
+    vec3 low = vec3(0.020, 0.028, 0.035);
+    vec3 high = vec3(0.055, 0.038, 0.045);
     vec3 col = mix(low, high, local.y + h * 0.25);
 
     vec3 cyan = vec3(0.08, 0.75, 0.72);
@@ -96,8 +96,8 @@ void main() {
     vec3 tint = mix(cyan, amber, smoothstep(0.2, 1.2, h));
     tint = mix(tint, magenta, 0.25 + 0.25 * sin(p.x * 0.7 + pc.iTime * 0.2));
 
-    col += tint * line * 0.10 * headroom();
-    col += vec3(1.0, 0.88, 0.58) * majorLine * 0.11 * headroom();
+    col += tint * line * 0.22 * headroom();
+    col += vec3(1.0, 0.88, 0.58) * majorLine * 0.24 * headroom();
 
     // Survey marks at deterministic cell centers, pulsing as contour bands pass.
     vec2 cell = floor(p * 0.7);
@@ -106,7 +106,7 @@ void main() {
     float gate = step(0.88, rnd.x);
     float mark = smoothstep(0.055, 0.0, abs(length(f) - 0.16));
     mark *= gate * (0.45 + 0.55 * sin(pc.iTime * 0.8 + rnd.y * 6.28318));
-    col += vec3(0.7, 0.95, 1.0) * mark * 0.13 * headroom();
+    col += vec3(0.7, 0.95, 1.0) * mark * 0.35 * headroom();
 
     outColor = vec4(min(col, vec3(headroom())), 1.0);
 }
