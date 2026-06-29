@@ -182,6 +182,14 @@ impl Playlist {
         desired.map_or(true, |d| eligible(self.current_class(), d))
     }
 
+    /// Whether *any* entry could satisfy `desired` — one already known to match,
+    /// or one still unclassified (which might, once decoded). Guards the re-roll
+    /// in [`crate::app::App::on_image_prepared`]: with no eligible alternative we
+    /// accept a violating wallpaper rather than spin forever looking for one.
+    pub fn has_eligible(&self, desired: Luminance) -> bool {
+        self.classes.iter().any(|&c| eligible(c, desired))
+    }
+
     /// Step to the next entry, wrapping. A randomized list reshuffles each
     /// pass, avoiding an immediate repeat of the last shown image.
     pub fn advance(&mut self) {
@@ -264,7 +272,24 @@ mod tests {
         assert!(pl.current_eligible(Some(Luminance::Dark)));
         // No filter → every entry is eligible.
         assert!(pl.current_eligible(None));
+        // An unclassified entry (the image) keeps both classes "available".
+        assert!(pl.has_eligible(Luminance::Dark));
+        assert!(pl.has_eligible(Luminance::Bright));
         for f in [&dark, &bright, &plain, &list] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
+    #[test]
+    fn has_eligible_false_only_when_all_known_other_class() {
+        let bright = write_list("brt.frag", "//!luminance bright\nvoid main(){}");
+        let list = write_list("allbright.txt", &format!("{0}\n{0}\n", bright.display()));
+        let pl = Playlist::load(&list, Duration::from_secs(60), false).unwrap();
+        // Every entry is known-bright → nothing eligible for a dark preference,
+        // so the re-roll guard yields to the fallback instead of looping.
+        assert!(!pl.has_eligible(Luminance::Dark));
+        assert!(pl.has_eligible(Luminance::Bright));
+        for f in [&bright, &list] {
             let _ = std::fs::remove_file(f);
         }
     }

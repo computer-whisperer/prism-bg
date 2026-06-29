@@ -401,6 +401,19 @@ impl App {
                 pl.set_class(path, class);
             }
         }
+        // The startup entry is displayed synchronously (not via the worker), so
+        // it never reaches on_image_prepared's re-roll. Now that it's classified,
+        // seek off it if it violates the current preference and an eligible
+        // alternative exists — that alternative loads lazily and, if it too
+        // violates, the worker re-roll takes over from there.
+        let desired = args
+            .dark_hours
+            .map(|dh| dh.preference(crate::shader::local_minute_of_day()));
+        for pl in &mut playlists {
+            if !pl.current_eligible(desired) {
+                pl.seek_eligible(desired);
+            }
+        }
 
         Ok(App {
             registry_state: RegistryState::new(globals),
@@ -729,6 +742,32 @@ impl App {
                 if let Some(c) = res.class {
                     for pl in &mut self.playlists {
                         pl.set_class(&res.key.0, c);
+                    }
+                }
+                // Abort + re-roll: if the image we just decoded violates the
+                // current time-of-day preference, don't show it — advance the
+                // playlist(s) waiting on it to an eligible entry instead (the
+                // current wallpaper stays up until a valid one loads). Only when
+                // an eligible alternative exists, else we accept it as the
+                // fallback rather than spinning. This catches the case the
+                // up-front filter can't: an image whose class is only known now.
+                if let Some(d) = self.desired_luminance() {
+                    let violates = res.class.is_some_and(|c| c != d);
+                    let reroll: Vec<usize> = (0..self.playlists.len())
+                        .filter(|&i| {
+                            self.playlists[i].current().path() == res.key.0
+                                && self.playlists[i].has_eligible(d)
+                        })
+                        .collect();
+                    if violates && !reroll.is_empty() {
+                        tracing::info!(
+                            path = %res.key.0.display(),
+                            "wallpaper violates --dark-hours preference; re-rolling"
+                        );
+                        for i in reroll {
+                            self.rotate(qh, i);
+                        }
+                        return; // drop the violating prep, keep the current wallpaper
                     }
                 }
                 self.prepared.insert(res.key, Arc::new(prep));
