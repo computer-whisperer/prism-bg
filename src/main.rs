@@ -103,6 +103,16 @@ fn main() -> Result<()> {
     for path in args.specs.iter().filter_map(|s| s.image.clone()) {
         load_raw(&mut raw_images, &path)?;
     }
+    // With --dark-hours, start each list on an entry that suits the current
+    // time of day (the decodable-seek below proceeds from there); rotation
+    // keeps it adapted as the clock advances.
+    let desired = args
+        .dark_hours
+        .map(|dh| dh.preference(shader::local_minute_of_day()));
+    for pl in &mut playlists {
+        pl.seek_eligible(desired);
+    }
+
     // Playlists tolerate broken entries (a deleted file must not kill the
     // daemon — rotation skips them too): seek each list to its first
     // decodable entry, failing only if none decodes.

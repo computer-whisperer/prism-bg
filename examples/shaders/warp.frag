@@ -1,3 +1,4 @@
+//!luminance dark
 // Domain-warped fbm flow — slow, organic ribbons of color folding through
 // one another. Uses iTime → animated. The priciest of the demos (fbm called
 // several times per pixel for the warp), but still trivial at wallpaper rates.

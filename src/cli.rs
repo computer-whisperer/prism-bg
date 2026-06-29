@@ -163,6 +163,45 @@ impl ProfileMode {
     }
 }
 
+/// A wallpaper's rough average-luminance class, for time-of-day filtering.
+/// Shaders self-declare it (`//!luminance dark|bright`); images are classified
+/// from their mean luminance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Luminance {
+    Dark,
+    Bright,
+}
+
+/// Local-clock window during which playlists prefer dark wallpapers (and,
+/// outside it, bright ones). Times are minutes since local midnight; a window
+/// that wraps past midnight (start > end, e.g. 19:00–07:00) is supported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DarkHours {
+    start_min: u32,
+    end_min: u32,
+}
+
+impl DarkHours {
+    /// Whether `minute` (0..1440, minutes since local midnight) is in the window.
+    pub fn contains(self, minute: u32) -> bool {
+        if self.start_min <= self.end_min {
+            (self.start_min..self.end_min).contains(&minute)
+        } else {
+            minute >= self.start_min || minute < self.end_min
+        }
+    }
+
+    /// The luminance class to prefer at `minute`: dark inside the window, bright
+    /// outside.
+    pub fn preference(self, minute: u32) -> Luminance {
+        if self.contains(minute) {
+            Luminance::Dark
+        } else {
+            Luminance::Bright
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Args {
     pub specs: Vec<OutputSpec>,
@@ -172,6 +211,9 @@ pub struct Args {
     pub no_color_management: bool,
     /// GPU render-time profiling mode (global, not per-output).
     pub profile: ProfileMode,
+    /// When set, playlists prefer dark wallpapers inside this local-clock window
+    /// and bright ones outside it. `None` disables time-of-day filtering.
+    pub dark_hours: Option<DarkHours>,
 }
 
 const USAGE: &str = "\
@@ -229,6 +271,12 @@ Usage: prism-bg <options...>
       --profile-gpu-every <duration>
                          Instead, report continuously every <duration>
                          (e.g. 30s, 5m). Implies --profile-gpu.
+      --dark-hours <HH:MM-HH:MM>
+                         Prefer dark wallpapers within this local-clock window
+                         and bright ones outside it (e.g. 19:00-07:00).
+                         Filters --image-list playlists; shaders self-declare
+                         via `//!luminance dark|bright`, images by mean
+                         luminance.
   -h, --help             Show help message and quit.
   -v, --version          Show the version number and quit.
 
@@ -241,6 +289,7 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
     let mut intent = Intent::Perceptual;
     let mut no_color_management = false;
     let mut profile = ProfileMode::Off;
+    let mut dark_hours = None;
 
     // The implicit "*" spec; only kept if any flag touched it.
     let mut current = OutputSpec::new("*".to_string());
@@ -338,6 +387,7 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
             "--profile-gpu-every" => {
                 profile = ProfileMode::Every(parse_duration(&value("--profile-gpu-every")?)?);
             }
+            "--dark-hours" => dark_hours = Some(parse_dark_hours(&value("--dark-hours")?)?),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -397,7 +447,31 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
         intent,
         no_color_management,
         profile,
+        dark_hours,
     })
+}
+
+/// Parse `HH:MM-HH:MM` into a [`DarkHours`] window (24-hour local clock).
+fn parse_dark_hours(s: &str) -> Result<DarkHours> {
+    let (start, end) = s
+        .split_once('-')
+        .with_context(|| format!("--dark-hours expects START-END, got {s:?}"))?;
+    let minute = |hm: &str| -> Result<u32> {
+        let (h, m) = hm
+            .split_once(':')
+            .with_context(|| format!("--dark-hours time {hm:?} is not HH:MM"))?;
+        let h: u32 = h.parse().context("hour")?;
+        let m: u32 = m.parse().context("minute")?;
+        if h > 23 || m > 59 {
+            bail!("--dark-hours time {hm:?} is out of range");
+        }
+        Ok(h * 60 + m)
+    };
+    let (start_min, end_min) = (minute(start)?, minute(end)?);
+    if start_min == end_min {
+        bail!("--dark-hours START and END must differ");
+    }
+    Ok(DarkHours { start_min, end_min })
 }
 
 /// `300ms`, `90s`, `15m`, `1.5h`; a bare number is seconds.
@@ -516,6 +590,39 @@ mod tests {
         );
         // The interval form requires a value.
         assert!(parse(["--profile-gpu-every".to_string()].into_iter()).is_err());
+    }
+
+    #[test]
+    fn dark_hours_parsing_and_window() {
+        assert!(parse_ok(&["-c", "112233"]).dark_hours.is_none());
+        // Wrapping window (evening through morning).
+        let dh = parse_ok(&["-c", "112233", "--dark-hours", "19:00-07:00"])
+            .dark_hours
+            .unwrap();
+        assert!(dh.contains(20 * 60)); // 8pm: dark
+        assert!(dh.contains(3 * 60)); // 3am: dark
+        assert!(!dh.contains(12 * 60)); // noon: bright
+        assert_eq!(dh.preference(23 * 60), Luminance::Dark);
+        assert_eq!(dh.preference(9 * 60), Luminance::Bright);
+        // Non-wrapping window.
+        let day = parse_ok(&["-c", "112233", "--dark-hours", "00:00-06:30"])
+            .dark_hours
+            .unwrap();
+        assert!(day.contains(6 * 60 + 29));
+        assert!(!day.contains(6 * 60 + 30));
+        // Malformed inputs.
+        assert!(parse(["--dark-hours".to_string()].into_iter()).is_err());
+        for bad in ["19:00", "25:00-07:00", "19:60-07:00", "08:00-08:00"] {
+            assert!(
+                parse(
+                    ["-c", "112233", "--dark-hours", bad]
+                        .iter()
+                        .map(|s| s.to_string())
+                )
+                .is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
     }
 
     #[test]

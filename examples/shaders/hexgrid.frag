@@ -1,3 +1,4 @@
+//!luminance dark
 // Glowing hexagonal lattice with a pulse that ripples outward from the center.
 // Each cell lights on its own phase as the wave passes. Uses iTime → animated.
 // Cheap: a couple of mod()s and a distance per pixel.

@@ -14,6 +14,29 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
+use crate::cli::Luminance;
+
+/// Scan a shader's source for its `//!luminance dark|bright` self-declaration.
+/// `None` if absent (the entry is then eligible at any time of day).
+pub fn classify_shader_source(source: &str) -> Option<Luminance> {
+    for line in source.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("//!luminance") {
+            return match rest.trim() {
+                "dark" => Some(Luminance::Dark),
+                "bright" => Some(Luminance::Bright),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// Whether an entry of class `class` may show when `desired` luminance is
+/// preferred. Unclassified entries (`None`) are always eligible.
+fn eligible(class: Option<Luminance>, desired: Luminance) -> bool {
+    class.map_or(true, |c| c == desired)
+}
+
 /// A playlist entry: a still image or a live GLSL shader. The kind is
 /// decided from the file extension when the list is parsed, so the
 /// presentation code can route each entry to the right pipeline without
@@ -53,6 +76,11 @@ impl Source {
 
 pub struct Playlist {
     entries: Vec<Source>,
+    /// Average-luminance class per entry, parallel to `entries`, for
+    /// `--dark-hours` filtering. Shaders are classified from their
+    /// `//!luminance` directive at load; images are left `None` for now (image
+    /// auto-classification is a follow-up). `None` = eligible at any time.
+    classes: Vec<Option<Luminance>>,
     /// Presentation order, indices into `entries`; identity unless
     /// `randomize`.
     order: Vec<usize>,
@@ -86,12 +114,25 @@ impl Playlist {
         if entries.is_empty() {
             bail!("image list {} contains no entries", list.display());
         }
+        // Classify shaders up front (cheap text scan; a missing/unreadable file
+        // is left unclassified — the display path reports the real error).
+        // Images are classified lazily once decoded.
+        let classes = entries
+            .iter()
+            .map(|src| match src {
+                Source::Shader(p) => std::fs::read_to_string(p)
+                    .ok()
+                    .and_then(|s| classify_shader_source(&s)),
+                Source::Image(_) => None,
+            })
+            .collect();
         let mut order: Vec<usize> = (0..entries.len()).collect();
         if randomize {
             shuffle(&mut order);
         }
         Ok(Playlist {
             entries,
+            classes,
             order,
             pos: 0,
             period,
@@ -101,6 +142,33 @@ impl Playlist {
 
     pub fn current(&self) -> &Source {
         &self.entries[self.order[self.pos]]
+    }
+
+    /// The current entry's luminance class (`None` if unknown / unclassified).
+    pub fn current_class(&self) -> Option<Luminance> {
+        self.classes[self.order[self.pos]]
+    }
+
+    /// Move to the first entry from the current position (inclusive) that is
+    /// eligible for `desired`, without reshuffling. No-op when filtering is off
+    /// (`desired` is `None`) or nothing is eligible (leaves the position as-is,
+    /// so the caller still shows *something*).
+    pub fn seek_eligible(&mut self, desired: Option<Luminance>) {
+        let Some(d) = desired else { return };
+        let n = self.order.len();
+        for step in 0..n {
+            let p = (self.pos + step) % n;
+            if eligible(self.classes[self.order[p]], d) {
+                self.pos = p;
+                return;
+            }
+        }
+    }
+
+    /// Whether the current entry is eligible for `desired` (always true when
+    /// `desired` is `None`).
+    pub fn current_eligible(&self, desired: Option<Luminance>) -> bool {
+        desired.map_or(true, |d| eligible(self.current_class(), d))
     }
 
     /// Step to the next entry, wrapping. A randomized list reshuffles each
@@ -141,6 +209,53 @@ mod tests {
             std::env::temp_dir().join(format!("prism-bg-test-{}-{name}", std::process::id()));
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    #[test]
+    fn classifies_shader_directives() {
+        assert_eq!(
+            classify_shader_source("//!luminance dark\n#version 450\n"),
+            Some(Luminance::Dark)
+        );
+        assert_eq!(
+            classify_shader_source("  //!luminance bright\nvoid main(){}"),
+            Some(Luminance::Bright)
+        );
+        assert_eq!(classify_shader_source("void main(){}"), None);
+        // Unknown value is ignored, not an error.
+        assert_eq!(classify_shader_source("//!luminance teal"), None);
+    }
+
+    #[test]
+    fn playlist_filters_by_luminance() {
+        let dark = write_list("dk.frag", "//!luminance dark\nvoid main(){}");
+        let bright = write_list("br.frag", "//!luminance bright\nvoid main(){}");
+        let plain = write_list("pl.frag", "void main(){}");
+        let list = write_list(
+            "lum.txt",
+            &format!(
+                "{}\n{}\n{}\na.png\n",
+                dark.display(),
+                bright.display(),
+                plain.display()
+            ),
+        );
+        let mut pl = Playlist::load(&list, Duration::from_secs(60), false).unwrap();
+        // Identity order: dark, bright, plain(None), image(None).
+        assert_eq!(pl.current_class(), Some(Luminance::Dark));
+        // Seeking bright skips the dark entry to the bright one.
+        pl.seek_eligible(Some(Luminance::Bright));
+        assert_eq!(pl.current_class(), Some(Luminance::Bright));
+        // From there, seeking dark lands on the unclassified plain shader
+        // (None is eligible for any preference) before wrapping to the dark one.
+        pl.seek_eligible(Some(Luminance::Dark));
+        assert_eq!(pl.current_class(), None);
+        assert!(pl.current_eligible(Some(Luminance::Dark)));
+        // No filter → every entry is eligible.
+        assert!(pl.current_eligible(None));
+        for f in [&dark, &bright, &plain, &list] {
+            let _ = std::fs::remove_file(f);
+        }
     }
 
     #[test]

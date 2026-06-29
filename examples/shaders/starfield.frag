@@ -1,3 +1,4 @@
+//!luminance dark
 // Deep-sky starfield. Uses iTime → animated. Stars are drawn with a real
 // magnitude distribution — most are faint sharp points, a rare few are bright
 // with a soft halo that masters into the HDR highlight headroom and the

@@ -51,7 +51,7 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLi
 use smithay_client_toolkit::reexports::calloop;
 
 use crate::audio::AudioCapture;
-use crate::cli::{Args, Color, Intent, Mode, OutputSpec, ProfileMode};
+use crate::cli::{Args, Color, DarkHours, Intent, Luminance, Mode, OutputSpec, ProfileMode};
 use std::time::{Duration, Instant};
 use crate::color::{ColorEncoding, LuminanceControl};
 use crate::colormgmt::ColorState;
@@ -252,6 +252,8 @@ pub struct App {
     pub intent: Intent,
     /// GPU render-time profiling mode (`--profile-gpu[-every]`); `Off` by default.
     profile: ProfileMode,
+    /// `--dark-hours` window; when set, playlists prefer dark/bright by clock.
+    dark_hours: Option<DarkHours>,
     pub specs: Vec<OutputSpec>,
     /// Raw decoded images by path, kept for deriving treated variants
     /// (per-output tone targets, hotplug). Populated synchronously at startup
@@ -379,6 +381,7 @@ impl App {
             color,
             intent: args.intent,
             profile: args.profile,
+            dark_hours: args.dark_hours,
             specs: args.specs.clone(),
             raw_images,
             prepared: HashMap::new(),
@@ -1069,29 +1072,50 @@ impl App {
     /// loop); the current wallpaper stays up until the prep lands. Shaders are
     /// still validated synchronously (a cheap parse) so a broken shader entry is
     /// skipped immediately.
+    /// The luminance class to prefer right now, or `None` when `--dark-hours`
+    /// is unset (no time-of-day filtering).
+    fn desired_luminance(&self) -> Option<Luminance> {
+        self.dark_hours
+            .map(|dh| dh.preference(crate::shader::local_minute_of_day()))
+    }
+
     pub fn rotate(&mut self, qh: &QueueHandle<App>, idx: usize) {
         let previous = self.playlists[idx].current().path().to_path_buf();
+        let desired = self.desired_luminance();
 
         // Advance to the next entry. Shaders are parse-validated so a broken one
         // is skipped now; images are accepted optimistically — the worker
         // validates by decoding, and a failed result skips on the next tick.
+        //
+        // Two passes: the first honors the `--dark-hours` luminance preference;
+        // if nothing eligible is also loadable, the second ignores it so a pool
+        // with no entry of the preferred class still rotates rather than freezes.
         let mut next = None;
-        for _ in 0..self.playlists[idx].len() {
-            self.playlists[idx].advance();
-            let src = self.playlists[idx].current();
-            let path = src.path().to_path_buf();
-            if !src.is_shader() {
-                next = Some(path);
-                break;
-            }
-            match crate::shader::validate_shader_file(&path) {
-                Ok(()) => {
+        for honor_filter in [true, false] {
+            for _ in 0..self.playlists[idx].len() {
+                self.playlists[idx].advance();
+                if honor_filter && !self.playlists[idx].current_eligible(desired) {
+                    continue;
+                }
+                let src = self.playlists[idx].current();
+                let path = src.path().to_path_buf();
+                if !src.is_shader() {
                     next = Some(path);
                     break;
                 }
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), "skipping playlist entry: {e:#}")
+                match crate::shader::validate_shader_file(&path) {
+                    Ok(()) => {
+                        next = Some(path);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), "skipping playlist entry: {e:#}")
+                    }
                 }
+            }
+            // First pass succeeded, or there was no filter to relax → done.
+            if next.is_some() || desired.is_none() {
+                break;
             }
         }
         let Some(next) = next else {

@@ -356,6 +356,22 @@ fn local_date() -> [f32; 4] {
     ]
 }
 
+/// Local-clock minutes since midnight (0..1440), for `--dark-hours` filtering.
+/// Same `localtime_r` path as [`local_date`], so it honors the system timezone.
+pub fn local_minute_of_day() -> u32 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as libc::time_t;
+    // SAFETY: reentrant localtime_r; writes a full tm into our stack slot, or
+    // leaves it zeroed on failure (reads as 00:00 — a harmless default).
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::localtime_r(&secs, &mut tm);
+    }
+    (tm.tm_hour.clamp(0, 23) * 60 + tm.tm_min.clamp(0, 59)) as u32
+}
+
 /// Decode a static image channel to 8-bit RGBA for upload. Path is resolved
 /// relative to the `.frag` file's directory. Pixels are kept sRGB-encoded as
 /// stored; the GPU format chosen at upload decides interpretation — raw `UNORM`
