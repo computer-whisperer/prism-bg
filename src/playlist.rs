@@ -78,8 +78,8 @@ pub struct Playlist {
     entries: Vec<Source>,
     /// Average-luminance class per entry, parallel to `entries`, for
     /// `--dark-hours` filtering. Shaders are classified from their
-    /// `//!luminance` directive at load; images are left `None` for now (image
-    /// auto-classification is a follow-up). `None` = eligible at any time.
+    /// `//!luminance` directive at load; images are filled in lazily once
+    /// decoded (`App` calls [`Self::set_class`]). `None` = eligible at any time.
     classes: Vec<Option<Luminance>>,
     /// Presentation order, indices into `entries`; identity unless
     /// `randomize`.
@@ -147,6 +147,17 @@ impl Playlist {
     /// The current entry's luminance class (`None` if unknown / unclassified).
     pub fn current_class(&self) -> Option<Luminance> {
         self.classes[self.order[self.pos]]
+    }
+
+    /// Record an image entry's class once it has been decoded and classified.
+    /// Matched by path (an entry can appear more than once), so the caller
+    /// needn't know presentation order.
+    pub fn set_class(&mut self, path: &Path, class: Luminance) {
+        for (i, src) in self.entries.iter().enumerate() {
+            if src.path() == path {
+                self.classes[i] = Some(class);
+            }
+        }
     }
 
     /// Move to the first entry from the current position (inclusive) that is

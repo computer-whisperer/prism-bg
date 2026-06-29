@@ -111,7 +111,24 @@ pub struct PrepJob {
 /// error (a broken/missing file must not stall the daemon).
 pub struct PrepResult {
     key: ImageKey,
+    /// The image's average-luminance class, computed on the decode thread for
+    /// `--dark-hours` filtering; `None` on decode failure.
+    class: Option<Luminance>,
     result: Result<PreparedImage>,
+}
+
+/// Mean-luminance cutoff splitting dark from bright wallpapers. Heuristic — a
+/// mostly-dark scene with sparse highlights lands well below it, a daylit photo
+/// well above.
+const DARK_LUMINANCE_CUTOFF: f32 = 0.4;
+
+/// Bucket a mean luminance (`0..1`) into a [`Luminance`] class.
+fn classify_luminance(mean: f32) -> Luminance {
+    if mean < DARK_LUMINANCE_CUTOFF {
+        Luminance::Dark
+    } else {
+        Luminance::Bright
+    }
 }
 
 /// Spawn the background image-prep worker. Returns the job sender (held by
@@ -126,13 +143,20 @@ pub fn spawn_prep_worker() -> (mpsc::Sender<PrepJob>, calloop::channel::Channel<
         .spawn(move || {
             // Blocks on each job; ends when the job sender (App) drops.
             for job in job_rx {
-                let result = crate::decode::load(&job.path).map(|raw| {
+                let decoded = crate::decode::load(&job.path);
+                // Classify on this thread, where the decoded pixels live.
+                let class = decoded
+                    .as_ref()
+                    .ok()
+                    .map(|raw| classify_luminance(raw.mean_luminance()));
+                let result = decoded.map(|raw| {
                     tracing::info!(path = %job.path.display(), "image loaded (background)");
                     prepare_from_raw(&raw, job.treatment)
                 });
                 if res_tx
                     .send(PrepResult {
                         key: job.key,
+                        class,
                         result,
                     })
                     .is_err()
@@ -365,6 +389,17 @@ impl App {
             .map(|proxy| DmabufState { proxy });
         if wants_gpu && dmabuf.is_none() {
             bail!("compositor lacks zwp_linux_dmabuf_v1 v4; needed for GPU wallpaper presentation");
+        }
+
+        // Classify the images decoded synchronously at startup (each playlist's
+        // initial entry), so the first rotation can already filter on them.
+        // Rotation images are classified as they decode (see on_image_prepared).
+        let mut playlists = playlists;
+        for (path, raw) in &raw_images {
+            let class = classify_luminance(raw.mean_luminance());
+            for pl in &mut playlists {
+                pl.set_class(path, class);
+            }
         }
 
         Ok(App {
@@ -689,6 +724,13 @@ impl App {
         self.prep_in_flight.remove(&res.key);
         match res.result {
             Ok(prep) => {
+                // Record the learned luminance so the next rotation can filter
+                // on it (lazy: an image is classified the first time it decodes).
+                if let Some(c) = res.class {
+                    for pl in &mut self.playlists {
+                        pl.set_class(&res.key.0, c);
+                    }
+                }
                 self.prepared.insert(res.key, Arc::new(prep));
                 self.service(qh);
             }

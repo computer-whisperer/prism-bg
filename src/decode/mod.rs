@@ -48,6 +48,58 @@ pub struct DecodedImage {
 }
 
 impl DecodedImage {
+    /// Mean perceptual luminance over the image in `0..1`, for dark/bright
+    /// classification (`--dark-hours`). Pixels are premultiplied; the (gamma-
+    /// encoded) 8-bit path's relative-luminance weights approximate lightness
+    /// directly, and the linear f16 path is gamma-encoded first so the two are
+    /// comparable. Subsamples to a few hundred thousand pixels for speed.
+    pub fn mean_luminance(&self) -> f32 {
+        let luma = |r: f32, g: f32, b: f32| 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let mut sum = 0.0f64;
+        let mut n = 0u64;
+        match &self.pixels {
+            Pixels::Rgba8(d) => {
+                let px = d.len() / 4;
+                let stride = (px / 200_000).max(1);
+                for c in d.chunks_exact(4).step_by(stride) {
+                    let a = c[3] as f32 / 255.0;
+                    // Un-premultiply; opaque pixels (the common case) are a no-op.
+                    let s = if a > 0.0 { 255.0 * a } else { 1.0 };
+                    sum += luma(c[0] as f32 / s, c[1] as f32 / s, c[2] as f32 / s) as f64;
+                    n += 1;
+                }
+            }
+            Pixels::RgbaF16(d) => {
+                let linear = self.encoding.tf == Tf::Linear;
+                let px = d.len() / 4;
+                let stride = (px / 200_000).max(1);
+                for c in d.chunks_exact(4).step_by(stride) {
+                    let a = c[3].to_f32().clamp(0.0, 1.0);
+                    let straight = |v: f16| {
+                        let mut x = v.to_f32();
+                        if a > 0.0 {
+                            x /= a;
+                        }
+                        x = x.clamp(0.0, 1.0);
+                        // Gamma-encode linear light so the value is perceptual,
+                        // comparable to the already-encoded 8-bit path.
+                        if linear {
+                            x = x.powf(1.0 / 2.2);
+                        }
+                        x
+                    };
+                    sum += luma(straight(c[0]), straight(c[1]), straight(c[2])) as f64;
+                    n += 1;
+                }
+            }
+        }
+        if n == 0 {
+            0.0
+        } else {
+            (sum / n as f64) as f32
+        }
+    }
+
     /// Quantize to 8-bit RGBA — used to prepare a shader's static image
     /// channels for upload (Shadertoy textures are 8-bit). Linear-light
     /// content is encoded through `target_tf` first (8-bit linear bands
@@ -681,6 +733,18 @@ mod working_space_tests {
             encoding: ColorEncoding::SRGB,
             has_alpha: rgba[3] != 255,
         }
+    }
+
+    #[test]
+    fn mean_luminance_dark_to_bright() {
+        // Pure black and white bound the scale.
+        assert!(srgb8([0, 0, 0, 255]).mean_luminance() < 0.01);
+        assert!(srgb8([255, 255, 255, 255]).mean_luminance() > 0.99);
+        // Mid grey lands near the middle (8-bit values are already gamma-coded).
+        let mid = srgb8([128, 128, 128, 255]).mean_luminance();
+        assert!((0.45..=0.55).contains(&mid), "mid grey luma {mid}");
+        // Green dominates the luminance weighting.
+        assert!(srgb8([0, 255, 0, 255]).mean_luminance() > srgb8([255, 0, 0, 255]).mean_luminance());
     }
 
     #[test]
