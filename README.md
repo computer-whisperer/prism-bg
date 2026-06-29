@@ -64,7 +64,7 @@ Extras beyond swaybg (also per-output-group):
   compositor's preferred image description (`target_max_cll`, falling
   back to the target luminance) — the same numbers prism derives from
   its HDR config and EDID. Runs between scale and cap.
-- `--image-list <file>` — rotate through the images listed in `<file>`,
+- `--list <file>` — rotate through the images listed in `<file>`,
   one path per line (relative paths resolve against the file's directory;
   blank lines and `#` comments are ignored; `~/` expands). Mutually
   exclusive with `-i`. All outputs matched by the group rotate in

@@ -1,4 +1,4 @@
-//! Wallpaper playlists (`--image-list`): a text file with one entry per
+//! Wallpaper playlists (`--list`): a text file with one entry per
 //! line, stepped through on a timer. Each entry is either a still image or
 //! a live GLSL shader (`.frag`/`.glsl`), classified by extension — a single
 //! list may interleave both.

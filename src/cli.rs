@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::color::LuminanceControl;
 
-/// Rotation period when `--image-list` is given without `--rotate-every`.
+/// Rotation period when `--list` is given without `--rotate-every`.
 pub const DEFAULT_ROTATE_EVERY: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,7 +86,7 @@ pub enum ToneMap {
 pub struct OutputSpec {
     pub output: String,
     pub image: Option<PathBuf>,
-    /// Playlist file (`--image-list`): one entry path per line, rotated
+    /// Playlist file (`--list`): one entry path per line, rotated
     /// on a timer. Entries may be images or `.frag`/`.glsl` shaders; a
     /// single list interleaves both. Mutually exclusive with `image`.
     pub image_list: Option<PathBuf>,
@@ -226,27 +226,27 @@ Usage: prism-bg <options...>
                          main() with iResolution/iTime; a shader that uses
                          iTime animates (vsync-paced, paused when occluded),
                          otherwise it renders a single frame. Mutually
-                         exclusive with --image/--image-list.
+                         exclusive with --image/--list.
       --fps <n>          Cap an animated shader's render rate (1..=1000).
                          Default is the compositor's vsync cadence. Cuts GPU
-                         cost; iTime stays real-time. Requires --shader.
+                         cost; iTime stays real-time. Requires --shader or a
+                         --list containing shaders.
   -m, --mode <mode>      Set the mode to use for the image
                          (stretch|fit|fill|center|tile|solid_color).
   -o, --output <name>    Set the output to operate on or * for all,
                          starting a new per-output group.
-      --image-list <file>
-                         Rotate through the entries listed in <file>, one
+      --list <file>      Rotate through the entries listed in <file>, one
                          path per line (relative to the file's directory;
                          blank lines and # comments ignored). Entries may be
                          images or .frag/.glsl shaders, interleaved. Outputs
                          sharing the group rotate in lockstep.
       --rotate-every <duration>
-                         Rotation period for --image-list, e.g. 90s, 15m,
+                         Rotation period for --list, e.g. 90s, 15m,
                          1h (bare number = seconds). Default: 15m.
       --randomize        Shuffle the playlist order; reshuffles each pass
                          without immediate repeats.
       --fade <duration>  Blur-dissolve transition on rotation instead of a
-                         hard cut, e.g. 500ms, 2s. Requires --image-list.
+                         hard cut, e.g. 500ms, 2s. Requires --list.
       --cap-luminance <nits>
                          Hard-clip HDR content above this luminance.
       --scale-luminance <nits>
@@ -274,7 +274,7 @@ Usage: prism-bg <options...>
       --dark-hours <HH:MM-HH:MM>
                          Prefer dark wallpapers within this local-clock window
                          and bright ones outside it (e.g. 19:00-07:00).
-                         Filters --image-list playlists; shaders self-declare
+                         Filters --list playlists; shaders self-declare
                          via `//!luminance dark|bright`, images by mean
                          luminance.
   -h, --help             Show help message and quit.
@@ -313,8 +313,8 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
                 current.image = Some(PathBuf::from(value("--image")?));
                 current_touched = true;
             }
-            "--image-list" => {
-                current.image_list = Some(PathBuf::from(value("--image-list")?));
+            "--list" => {
+                current.image_list = Some(PathBuf::from(value("--list")?));
                 current_touched = true;
             }
             "--shader" => {
@@ -408,13 +408,13 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
     for spec in &specs {
         if spec.image.is_some() && spec.image_list.is_some() {
             bail!(
-                "output {:?}: --image and --image-list are mutually exclusive",
+                "output {:?}: --image and --list are mutually exclusive",
                 spec.output
             );
         }
         if spec.shader.is_some() && (spec.image.is_some() || spec.image_list.is_some()) {
             bail!(
-                "output {:?}: --shader is mutually exclusive with --image/--image-list",
+                "output {:?}: --shader is mutually exclusive with --image/--list",
                 spec.output
             );
         }
@@ -422,12 +422,17 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
             && spec.image_list.is_none()
         {
             bail!(
-                "output {:?}: --rotate-every/--randomize/--fade require --image-list",
+                "output {:?}: --rotate-every/--randomize/--fade require --list",
                 spec.output
             );
         }
-        if spec.fps.is_some() && spec.shader.is_none() {
-            bail!("output {:?}: --fps requires --shader", spec.output);
+        // --fps caps an animated shader — a direct --shader, or a shader entry
+        // within a --list playlist (its fps flows through at display time).
+        if spec.fps.is_some() && spec.shader.is_none() && spec.image_list.is_none() {
+            bail!(
+                "output {:?}: --fps requires --shader or --list",
+                spec.output
+            );
         }
         // A shader fills the whole surface, so geometry modes don't apply.
         if spec.shader.is_none()
@@ -646,12 +651,16 @@ mod tests {
     }
 
     #[test]
-    fn fps_requires_shader_and_validates_range() {
+    fn fps_requires_shader_or_list_and_validates_range() {
         // Attaches to the shader's group.
         let args = parse_ok(&["--shader", "s.frag", "--fps", "30"]);
         assert_eq!(args.specs[0].fps, Some(30));
-        // No shader → rejected.
+        // A playlist may contain shaders, so --fps is allowed with --list too.
+        let args = parse_ok(&["--list", "walls.txt", "--fps", "30"]);
+        assert_eq!(args.specs[0].fps, Some(30));
+        // Neither shader nor list → rejected.
         assert!(parse(["--fps", "30"].iter().map(|s| s.to_string())).is_err());
+        assert!(parse(["-i", "a.png", "--fps", "30"].iter().map(|s| s.to_string())).is_err());
         // Out of range / non-numeric → rejected.
         let bad = |v: &str| {
             parse(
@@ -668,7 +677,7 @@ mod tests {
     #[test]
     fn image_list_flags() {
         let args = parse_ok(&[
-            "--image-list",
+            "--list",
             "walls.txt",
             "--rotate-every",
             "90s",
@@ -688,7 +697,7 @@ mod tests {
 
     #[test]
     fn image_list_defaults_to_stretch() {
-        let args = parse_ok(&["--image-list", "walls.txt"]);
+        let args = parse_ok(&["--list", "walls.txt"]);
         assert_eq!(args.specs[0].effective_mode(), Mode::Stretch);
         assert_eq!(args.specs[0].rotate_every, None); // default applied in main
     }
@@ -697,7 +706,7 @@ mod tests {
     fn duration_suffixes() {
         let parse_dur = |d: &str| {
             parse(
-                ["--image-list", "w.txt", "--rotate-every", d]
+                ["--list", "w.txt", "--rotate-every", d]
                     .iter()
                     .map(|s| s.to_string()),
             )
@@ -714,7 +723,7 @@ mod tests {
     fn fade_durations() {
         let parse_fade = |d: &str| {
             parse(
-                ["--image-list", "w.txt", "--fade", d]
+                ["--list", "w.txt", "--fade", d]
                     .iter()
                     .map(|s| s.to_string()),
             )
@@ -741,7 +750,7 @@ mod tests {
     #[test]
     fn image_and_image_list_are_mutually_exclusive() {
         assert!(parse(
-            ["-i", "a.png", "--image-list", "w.txt"]
+            ["-i", "a.png", "--list", "w.txt"]
                 .iter()
                 .map(|s| s.to_string())
         )

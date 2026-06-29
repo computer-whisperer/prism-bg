@@ -301,7 +301,7 @@ pub struct App {
     /// In-flight info collection per output, each field filled as its preferred-
     /// description event arrives and consumed on `Done`. See [`PendingLum`].
     pub pending_targets: HashMap<String, PendingLum>,
-    /// Rotation state per `--image-list` spec group, indexed by
+    /// Rotation state per `--list` spec group, indexed by
     /// `OutputSpec::playlist`. Advanced by per-playlist timers in `main`.
     pub playlists: Vec<Playlist>,
     wallpapers: Vec<Wallpaper>,

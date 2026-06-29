@@ -32,7 +32,7 @@ jxl-oxide = "0.12"
 # descriptions only, so ICC is resolved client-side).
 moxcms = "0.8"
 
-# playlist shuffle (--image-list --randomize).
+# playlist shuffle (--list --randomize).
 fastrand = "2"
 
 # GPU shader wallpapers (--shader). ash is thin Vulkan bindings: we drive

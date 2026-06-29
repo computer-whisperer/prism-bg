@@ -69,7 +69,7 @@ fn main() -> Result<()> {
 
     let mut args = cli::parse(std::env::args().skip(1))?;
 
-    // Load playlists (--image-list): one rotation state per spec group.
+    // Load playlists (--list): one rotation state per spec group.
     // Entries decode lazily at rotation time (App::rotate skips broken
     // files); only the initial entry is decoded fail-fast below.
     let mut playlists: Vec<playlist::Playlist> = Vec::new();
