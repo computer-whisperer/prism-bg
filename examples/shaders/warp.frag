@@ -58,15 +58,18 @@ void main() {
                   fbm(p + 3.0 * q + vec2(8.3, 2.8) - t));
     float f = fbm(p + 3.5 * r);
 
-    // Map the field through a smooth palette (deep violet → teal → warm gold).
-    vec3 a = vec3(0.05, 0.03, 0.12);
-    vec3 b = vec3(0.10, 0.45, 0.50);
-    vec3 c = vec3(0.85, 0.55, 0.20);
-    vec3 col = mix(a, b, smoothstep(0.2, 0.6, f));
-    col = mix(col, c, smoothstep(0.55, 0.95, f) * length(r));
+    // Dark-dominant palette: most of the field is deep violet → dark teal.
+    vec3 a = vec3(0.015, 0.012, 0.030);  // violet-black — the bulk
+    vec3 b = vec3(0.04, 0.11, 0.14);     // dark teal
+    vec3 col = mix(a, b, smoothstep(0.28, 0.72, f));
 
-    // Lift the brightest folds a touch into HDR for a soft glow.
-    col += vec3(0.15) * smoothstep(0.8, 1.1, f + length(q)) * headroom();
+    // Bright folds, gated on f *alone* with high thresholds so they stay the
+    // sparse crests of the field. (The earlier length(q)/length(r) factors are
+    // the warp displacement — ~always >= 0.5 — so they flooded the whole screen
+    // instead of isolating folds.)
+    float crest = smoothstep(0.72, 0.90, f);
+    col = mix(col, vec3(0.65, 0.42, 0.16), crest);                  // warm gold folds
+    col += vec3(0.30) * crest * smoothstep(0.84, 0.97, f) * headroom();  // white-hot peaks → HDR
 
     outColor = vec4(min(col, vec3(headroom())), 1.0);
 }
