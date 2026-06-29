@@ -31,11 +31,10 @@ layout(push_constant) uniform Push {
 // Highlight headroom above diffuse white (>= 1.0; 1.0 on SDR).
 float headroom() { return max(pc.iMaxLum / max(pc.iRefWhite, 1.0), 1.0); }
 
-vec3 palette(float t) {
-    vec3 a = vec3(0.5), b = vec3(0.5), c = vec3(1.0);
-    vec3 d = vec3(0.15, 0.40, 0.65);
-    return a + b * cos(6.28318 * (c * t + d));
-}
+// Wave colour: a single near-pure blue. Brightness (not hue) carries the
+// ripple, so the lattice never leaves the blue family; the crest masters into
+// the HDR headroom for a real glow. Hex bodies stay near black.
+const vec3 WAVE = vec3(0.10, 0.28, 1.0);
 
 // Tile the plane into hexagons. Returns the local coordinate within the cell
 // (xy) and the cell's center id (zw).
@@ -74,18 +73,22 @@ void main() {
     float edge = smoothstep(0.0, 0.06, 0.5 - hexDist(gv));
     float border = 1.0 - edge;
 
-    // A ring expanding from the center; cells light as it reaches them.
+    // A ring expanding from the center; cells light as it reaches them. Slow:
+    // a calm wallpaper ripple, not a strobe.
     float dist = length(id) * 0.16;
-    float wave = sin(dist * 4.0 - t * 1.5);
+    float wave = sin(dist * 4.0 - t * 0.9);
     float pulse = smoothstep(0.2, 1.0, wave);
 
-    vec3 col = vec3(0.015, 0.02, 0.035);
-    vec3 tint = palette(dist + t * 0.03);
+    float hh = headroom();
+    // Near-black bodies: a deep void with only the faintest cool tint.
+    vec3 col = vec3(0.004, 0.006, 0.012);
 
-    // Faint always-on cell fill, plus a stronger lit fill where the pulse is.
-    col += tint * (0.05 + 0.4 * pulse) * edge * headroom();
-    // Glowing borders, brightest on lit cells.
-    col += tint * border * (0.15 + 0.5 * pulse) * headroom();
+    // The ripple lives in the borders: a dim resting line that flares to a
+    // bright near-pure blue as the wave crest passes.
+    col += WAVE * border * (0.10 + 0.9 * pulse) * hh;
+    // Hex bodies barely lift off black at the crest — just enough that the wave
+    // has some body, not so much that the cells read as "lit".
+    col += WAVE * 0.05 * pulse * edge * hh;
 
-    outColor = vec4(min(col, vec3(headroom())), 1.0);
+    outColor = vec4(min(col, vec3(hh)), 1.0);
 }
