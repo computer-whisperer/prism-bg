@@ -37,7 +37,7 @@ void main() {
     float aspect = pc.iGlobalResolution.x / max(pc.iGlobalResolution.y, 1.0);
     vec2 gp = gv * vec2(aspect, 1.0);
 
-    float time = pc.iTime * 0.5 + 23.0;
+    float time = pc.iTime * 0.22 + 23.0;
     // No mod() tiling (that would repeat) — a continuous global coordinate,
     // offset into a lively region of the field.
     vec2 p = gp * 5.0 - 250.0;
