@@ -1,3 +1,4 @@
+//!luminance dark
 // Neon rain on glass: falling droplets refract a soft city glow behind them.
 // Uses iTime -> animated wallpaper. Procedural only; no texture channel.
 //

@@ -1,3 +1,4 @@
+//!luminance dark
 // Ember ridge: layered procedural mountains with slow heat shimmer and HDR
 // glints along the skyline. Uses iTime -> animated wallpaper.
 //
@@ -25,6 +26,23 @@ float hash21(vec2 p) {
     p = fract(p * vec2(123.34, 456.21));
     p += dot(p, p + 45.32);
     return fract(p.x * p.y);
+}
+
+// PCG bit-hash (full period) for spark placement. hash21 above is fine for the
+// interpolated ridge noise, but the sparks are sparse points gated on an
+// incrementing cell id, where fract(p*k)'s short period makes them repeat in a
+// visible constellation. pcg gives a decorrelated gate and position per cell.
+const float U32 = 2.3283064e-10;  // 1 / 2^32
+uint pcg(uint v) {
+    v = v * 747796405u + 2891336453u;
+    uint s = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
+    return (s >> 22u) ^ s;
+}
+// Three decorrelated randoms in [0,1) keyed on an integer cell.
+vec3 cellRand3(vec2 cell) {
+    uvec2 q = uvec2(ivec2(cell));
+    uint h = pcg(q.x ^ pcg(q.y));
+    return vec3(pcg(h), pcg(h ^ 0x9e3779b9u), pcg(h ^ 0x85ebca6bu)) * U32;
 }
 
 float noise(vec2 p) {
@@ -86,9 +104,9 @@ void main() {
     vec2 sparkGrid = vec2(g.x * 0.018, g.y * 0.018 - pc.iTime * 0.55);
     vec2 cell = floor(sparkGrid);
     vec2 fp = fract(sparkGrid);
-    float h = hash21(cell);
-    vec2 pos = vec2(h, fract(h * 37.3));
-    float spark = smoothstep(0.045, 0.0, length(fp - pos)) * step(0.965, h);
+    vec3 rnd = cellRand3(cell);
+    vec2 pos = rnd.xy;
+    float spark = smoothstep(0.045, 0.0, length(fp - pos)) * step(0.965, rnd.z);
     spark *= smoothstep(0.0, 0.45, local.y) * (1.0 - smoothstep(0.70, 0.95, local.y));
     col += vec3(1.0, 0.45, 0.08) * spark * headroom();
 
