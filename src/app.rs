@@ -51,7 +51,8 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLi
 use smithay_client_toolkit::reexports::calloop;
 
 use crate::audio::AudioCapture;
-use crate::cli::{Args, Color, Intent, Mode, OutputSpec};
+use crate::cli::{Args, Color, Intent, Mode, OutputSpec, ProfileMode};
+use std::time::{Duration, Instant};
 use crate::color::{ColorEncoding, LuminanceControl};
 use crate::colormgmt::ColorState;
 use crate::decode::DecodedImage;
@@ -211,6 +212,22 @@ struct Wallpaper {
     /// image wallpaper's first source is built. Renders dmabufs attached to
     /// the layer surface.
     shader: Option<ShaderSurface>,
+    /// Per-output GPU render-time profiling window (unused unless `--profile-gpu`).
+    profile_state: ProfileState,
+}
+
+/// Drives one output's GPU-profiling report window. The samples themselves live
+/// in the renderer ([`ShaderSurface::drain_profile`]); this tracks *when* to
+/// report and resets on each shader load.
+#[derive(Default)]
+struct ProfileState {
+    /// Last [`ShaderSurface::load_generation`] seen; a change resets the window.
+    generation: u64,
+    /// Start of the current measurement window; `None` between an `OnLoad`
+    /// report and the next load.
+    window_start: Option<Instant>,
+    /// `OnLoad`: already reported for this load (so we stay quiet).
+    reported: bool,
 }
 
 pub struct App {
@@ -233,6 +250,8 @@ pub struct App {
     wants_mouse: bool,
     pub color: Option<ColorState>,
     pub intent: Intent,
+    /// GPU render-time profiling mode (`--profile-gpu[-every]`); `Off` by default.
+    profile: ProfileMode,
     pub specs: Vec<OutputSpec>,
     /// Raw decoded images by path, kept for deriving treated variants
     /// (per-output tone targets, hotplug). Populated synchronously at startup
@@ -359,6 +378,7 @@ impl App {
             wants_mouse,
             color,
             intent: args.intent,
+            profile: args.profile,
             specs: args.specs.clone(),
             raw_images,
             prepared: HashMap::new(),
@@ -510,6 +530,7 @@ impl App {
             scale,
             color_buffer: None,
             shader,
+            profile_state: ProfileState::default(),
         });
     }
 
@@ -813,16 +834,94 @@ impl App {
             // surface service() hasn't built): show the solid background.
             self.draw_color(index)
         };
-        if let Err(e) = result {
-            tracing::error!(
-                output = self.wallpapers[index].name,
-                "drawing wallpaper failed: {e:#}"
-            );
-            // A shader failure (e.g. modifier negotiation) won't fix itself;
-            // stop retrying every frame.
-            if self.wallpapers[index].shader.is_some() {
-                self.wallpapers[index].broken = true;
+        match result {
+            Err(e) => {
+                tracing::error!(
+                    output = self.wallpapers[index].name,
+                    "drawing wallpaper failed: {e:#}"
+                );
+                // A shader failure (e.g. modifier negotiation) won't fix itself;
+                // stop retrying every frame.
+                if self.wallpapers[index].shader.is_some() {
+                    self.wallpapers[index].broken = true;
+                }
             }
+            Ok(()) if self.profile.enabled() && self.wallpapers[index].shader.is_some() => {
+                self.service_profile(index);
+            }
+            Ok(()) => {}
+        }
+    }
+
+    /// Window and emit this output's GPU render-time report, per `--profile-gpu`.
+    /// Called after each successful shader draw; cheap (mostly an early return).
+    fn service_profile(&mut self, index: usize) {
+        let mode = self.profile;
+        let now = Instant::now();
+        let wp = &mut self.wallpapers[index];
+        let Some(generation) = wp.shader.as_ref().map(|s| s.load_generation()) else {
+            return;
+        };
+
+        // A new shader load (initial, GPU change, or rotation) restarts the
+        // window and discards any partial samples from before it.
+        if generation != wp.profile_state.generation {
+            wp.profile_state.generation = generation;
+            wp.profile_state.window_start = Some(now);
+            wp.profile_state.reported = false;
+            if let Some(s) = &wp.shader {
+                let _ = s.drain_profile();
+            }
+            return;
+        }
+
+        let window = match mode {
+            ProfileMode::Off => return,
+            ProfileMode::OnLoad => Duration::from_secs(5),
+            ProfileMode::Every(d) => d,
+        };
+        let start = match wp.profile_state.window_start {
+            Some(s) => s,
+            // No active window: in OnLoad we've already reported for this load
+            // and stay quiet; otherwise open a window now.
+            None => {
+                if !wp.profile_state.reported {
+                    wp.profile_state.window_start = Some(now);
+                }
+                return;
+            }
+        };
+        let elapsed = now.duration_since(start);
+        if elapsed < window {
+            return;
+        }
+
+        if let Some(acc) = wp.shader.as_ref().and_then(|s| s.drain_profile()) {
+            if acc.count > 0 {
+                let secs = elapsed.as_secs_f64();
+                let avg_ms = (acc.sum_ns as f64 / acc.count as f64) / 1e6;
+                let max_ms = acc.max_ns as f64 / 1e6;
+                // Fraction of wall-clock the GPU spent on this output's render.
+                let busy = (acc.sum_ns as f64 / (secs * 1e9)) * 100.0;
+                let fps = acc.count as f64 / secs;
+                tracing::info!(
+                    output = wp.name,
+                    "GPU {avg_ms:.2} ms/frame avg, {max_ms:.2} ms max — {busy:.1}% of wall \
+                     ({count} frames / {secs:.1}s, {fps:.0} fps)",
+                    count = acc.count,
+                );
+            }
+        }
+
+        match mode {
+            // One report per load: close the window until the next load.
+            ProfileMode::OnLoad => {
+                wp.profile_state.reported = true;
+                wp.profile_state.window_start = None;
+            }
+            // Roll straight into the next interval.
+            ProfileMode::Every(_) => wp.profile_state.window_start = Some(now),
+            ProfileMode::Off => {}
         }
     }
 
@@ -870,6 +969,7 @@ impl App {
         let dmabuf = self.dmabuf.as_ref().context("dmabuf not available")?;
         let color = self.color.as_ref();
         let intent = self.intent;
+        let profile = self.profile.enabled();
         let wp = &mut self.wallpapers[index];
         let scale = wp.scale.max(1) as u32;
         let device_size = (w * scale, h * scale);
@@ -887,6 +987,7 @@ impl App {
             (lum.reference as f32, lum.max as f32),
             color,
             intent,
+            profile,
         )?;
         Ok(())
     }

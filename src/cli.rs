@@ -145,6 +145,24 @@ impl OutputSpec {
     }
 }
 
+/// GPU render-time profiling. Off by default — the timestamp query pool is only
+/// created when this is enabled, so normal operation pays nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileMode {
+    Off,
+    /// One averaged per-output report a few seconds after each shader (re)load,
+    /// then quiet — for a 24/7 daemon that shouldn't spam logs.
+    OnLoad,
+    /// A per-output report every interval, continuously.
+    Every(Duration),
+}
+
+impl ProfileMode {
+    pub fn enabled(self) -> bool {
+        !matches!(self, ProfileMode::Off)
+    }
+}
+
 #[derive(Debug)]
 pub struct Args {
     pub specs: Vec<OutputSpec>,
@@ -152,6 +170,8 @@ pub struct Args {
     /// Escape hatch: skip wp_color_management_v1 entirely (untagged
     /// surfaces, compositor assumes sRGB). For debugging color issues.
     pub no_color_management: bool,
+    /// GPU render-time profiling mode (global, not per-output).
+    pub profile: ProfileMode,
 }
 
 const USAGE: &str = "\
@@ -203,6 +223,12 @@ Usage: prism-bg <options...>
                          Default: perceptual.
       --no-color-management
                          Do not tag surfaces with color descriptions.
+      --profile-gpu      Report per-output GPU render time (timestamp queries)
+                         once, a few seconds after each shader load. Off by
+                         default; near-zero overhead when enabled.
+      --profile-gpu-every <duration>
+                         Instead, report continuously every <duration>
+                         (e.g. 30s, 5m). Implies --profile-gpu.
   -h, --help             Show help message and quit.
   -v, --version          Show the version number and quit.
 
@@ -214,6 +240,7 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
     let mut specs: Vec<OutputSpec> = Vec::new();
     let mut intent = Intent::Perceptual;
     let mut no_color_management = false;
+    let mut profile = ProfileMode::Off;
 
     // The implicit "*" spec; only kept if any flag touched it.
     let mut current = OutputSpec::new("*".to_string());
@@ -307,6 +334,10 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
                 };
             }
             "--no-color-management" => no_color_management = true,
+            "--profile-gpu" => profile = ProfileMode::OnLoad,
+            "--profile-gpu-every" => {
+                profile = ProfileMode::Every(parse_duration(&value("--profile-gpu-every")?)?);
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -365,6 +396,7 @@ pub fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args> {
         specs,
         intent,
         no_color_management,
+        profile,
     })
 }
 
@@ -469,6 +501,21 @@ mod tests {
             spec_for_output(&args.specs, "HDMI-A-1").unwrap().output,
             "*"
         );
+    }
+
+    #[test]
+    fn profile_flags() {
+        assert_eq!(parse_ok(&["-c", "112233"]).profile, ProfileMode::Off);
+        assert_eq!(
+            parse_ok(&["-c", "112233", "--profile-gpu"]).profile,
+            ProfileMode::OnLoad
+        );
+        assert_eq!(
+            parse_ok(&["-c", "112233", "--profile-gpu-every", "30s"]).profile,
+            ProfileMode::Every(Duration::from_secs(30))
+        );
+        // The interval form requires a value.
+        assert!(parse(["--profile-gpu-every".to_string()].into_iter()).is_err());
     }
 
     #[test]

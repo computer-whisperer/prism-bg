@@ -288,6 +288,12 @@ pub struct Gpu {
     /// Loader for `VK_KHR_external_semaphore_fd` device functions (exports the
     /// render-completion semaphore as a sync_file for implicit dmabuf sync).
     pub external_semaphore_fd_fn: ash::khr::external_semaphore_fd::Device,
+    /// Nanoseconds per timestamp-query tick (`limits.timestampPeriod`), for
+    /// GPU render-time profiling.
+    pub timestamp_period: f32,
+    /// Whether this queue family can write usable timestamps
+    /// (`timestampValidBits > 0` and a nonzero period) — gates `--profile-gpu`.
+    pub timestamps_supported: bool,
 }
 
 impl Gpu {
@@ -339,6 +345,18 @@ impl Gpu {
         let memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
+        // Timestamp-query capability, for optional GPU render-time profiling.
+        // SAFETY: physical_device is from this instance.
+        let props = unsafe { instance.get_physical_device_properties(physical_device) };
+        let timestamp_period = props.limits.timestamp_period;
+        // SAFETY: same.
+        let families =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+        let timestamps_supported = timestamp_period > 0.0
+            && families
+                .get(queue_family as usize)
+                .is_some_and(|f| f.timestamp_valid_bits > 0);
+
         let drm_modifier_fn = ash::ext::image_drm_format_modifier::Device::new(instance, &device);
         let external_memory_fd_fn = ash::khr::external_memory_fd::Device::new(instance, &device);
         let external_semaphore_fd_fn =
@@ -356,6 +374,8 @@ impl Gpu {
             drm_modifier_fn,
             external_memory_fd_fn,
             external_semaphore_fd_fn,
+            timestamp_period,
+            timestamps_supported,
         })
     }
 
@@ -1589,6 +1609,88 @@ fn compile_glsl(source: &str, kind: shaderc::ShaderKind, name: &str) -> Result<V
 /// Per-ring-slot command resources. One set per [`RenderTarget`] in the ring
 /// so frames pipeline: while the compositor reads slot N's buffer, we can
 /// already record and submit slot N+1 without waiting on N's GPU work.
+/// GPU render-time samples accumulated since the last drain. `app.rs` windows
+/// these (per shader load, or on an interval) and reports avg/max/percent-busy
+/// per output.
+#[derive(Clone, Copy, Default)]
+pub struct ProfileAccum {
+    /// Summed GPU execution time of the measured frames.
+    pub sum_ns: u64,
+    /// Slowest single frame.
+    pub max_ns: u64,
+    /// Frames measured.
+    pub count: u64,
+}
+
+/// Per-renderer GPU render-time profiling via timestamp queries. Two timestamps
+/// (top/bottom of pipe) bracket each frame's command buffer; the pair is read
+/// back when that ring slot is next reused (after its fence, so the results are
+/// guaranteed available — no added sync). Only built when `--profile-gpu` is on.
+struct GpuProfiler {
+    /// `2 * frames` timestamps: `[start, end]` per ring slot.
+    query_pool: vk::QueryPool,
+    /// Nanoseconds per tick (`Gpu::timestamp_period`).
+    period_ns: f32,
+    /// Whether slot `i` has a written-but-unread timestamp pair.
+    pending: Vec<std::cell::Cell<bool>>,
+    /// Samples since the last [`Self::drain`]. `Cell` so `render` stays `&self`.
+    accum: std::cell::Cell<ProfileAccum>,
+}
+
+impl GpuProfiler {
+    fn new(device: &ash::Device, period_ns: f32, slots: usize) -> Result<GpuProfiler> {
+        let info = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count((slots * 2) as u32);
+        // SAFETY: info outlives the call; pool owned by the returned struct.
+        let query_pool = unsafe { device.create_query_pool(&info, None) }
+            .context("creating timestamp query pool")?;
+        Ok(GpuProfiler {
+            query_pool,
+            period_ns,
+            pending: (0..slots).map(|_| std::cell::Cell::new(false)).collect(),
+            accum: std::cell::Cell::new(ProfileAccum::default()),
+        })
+    }
+
+    /// Read back slot `slot`'s previous timestamp pair and fold it in. The
+    /// caller must have already awaited that slot's fence, so both timestamps
+    /// are written and available.
+    fn collect(&self, device: &ash::Device, slot: usize) {
+        if !self.pending[slot].get() {
+            return;
+        }
+        self.pending[slot].set(false);
+        let mut ts = [0u64; 2];
+        // SAFETY: slot's fence was awaited before this call → results ready.
+        let ok = unsafe {
+            device.get_query_pool_results(
+                self.query_pool,
+                (slot * 2) as u32,
+                &mut ts,
+                vk::QueryResultFlags::TYPE_64,
+            )
+        }
+        .is_ok();
+        if !ok {
+            return;
+        }
+        // Timestamps are unsigned and monotonic within a submission; wrapping
+        // sub guards the rare counter rollover.
+        let ns = (ts[1].wrapping_sub(ts[0]) as f64 * self.period_ns as f64) as u64;
+        let mut a = self.accum.get();
+        a.sum_ns += ns;
+        a.max_ns = a.max_ns.max(ns);
+        a.count += 1;
+        self.accum.set(a);
+    }
+
+    /// Take and reset the accumulated samples.
+    fn drain(&self) -> ProfileAccum {
+        self.accum.replace(ProfileAccum::default())
+    }
+}
+
 struct Frame {
     command_buffer: vk::CommandBuffer,
     /// Signaled when this slot's submission completes. Awaited (cheaply — the
@@ -1726,6 +1828,9 @@ pub struct ShaderRenderer {
     sync_file: bool,
     /// The pass graph (buffers + image).
     graph: Graph,
+    /// GPU render-time profiling; `None` unless `--profile-gpu` is on (and the
+    /// queue supports timestamps).
+    profiler: Option<GpuProfiler>,
 }
 
 impl ShaderRenderer {
@@ -1737,11 +1842,12 @@ impl ShaderRenderer {
         spec: &GraphSpec,
         textures: &[TextureData],
         frames: usize,
+        profile: bool,
     ) -> Result<ShaderRenderer> {
         let device = gpu.device.clone();
         // Borrow the device's shared present pass (not owned — never destroyed
         // here): see `Gpu::present_pass`.
-        Self::build(gpu, device, gpu.present_pass, spec, textures, frames)
+        Self::build(gpu, device, gpu.present_pass, spec, textures, frames, profile)
     }
 
     /// Whether `gpu` can export a binary semaphore as a SYNC_FD sync_file —
@@ -1772,6 +1878,7 @@ impl ShaderRenderer {
         spec: &GraphSpec,
         textures: &[TextureData],
         frame_count: usize,
+        profile: bool,
     ) -> Result<ShaderRenderer> {
         // Spectrum UBO at set 0, binding 0 (fragment stage). Bound as set 0 of
         // every pass; a shader that ignores it is fine.
@@ -1828,6 +1935,28 @@ impl ShaderRenderer {
                 }
             };
 
+        // Timestamp query pool, only when profiling is requested. A device whose
+        // queue can't timestamp degrades to no profiling with one warning,
+        // rather than failing the renderer.
+        let profiler = if profile {
+            if gpu.timestamps_supported {
+                match GpuProfiler::new(&device, gpu.timestamp_period, frame_count) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        tracing::warn!("GPU profiling disabled: {e:#}");
+                        None
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "GPU profiling requested but this device's queue lacks timestamp support"
+                );
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(ShaderRenderer {
             device,
             queue: gpu.queue,
@@ -1839,6 +1968,7 @@ impl ShaderRenderer {
             external_semaphore_fd_fn: gpu.external_semaphore_fd_fn.clone(),
             sync_file,
             graph,
+            profiler,
         })
     }
 
@@ -2674,6 +2804,13 @@ impl ShaderRenderer {
         self.frames[slot].semaphore
     }
 
+    /// Take and reset the GPU render-time samples gathered since the last call.
+    /// `None` when profiling is off (or unsupported). Samples lag the live frame
+    /// by one (a slot's timestamps are read when it's next reused).
+    pub fn drain_profile(&self) -> Option<ProfileAccum> {
+        self.profiler.as_ref().map(|p| p.drain())
+    }
+
     /// Shared core of [`Self::render`]/[`Self::render_offscreen`]: record the
     /// buffer passes into their ping-pong targets, then the image pass into
     /// `dest`, and submit. The present path releases the dmabuf to the
@@ -2717,6 +2854,12 @@ impl ShaderRenderer {
                 .reset_fences(&[frame.fence])
                 .context("resetting fence")?;
 
+            // The fence wait above guarantees this slot's previous submission
+            // (and its timestamp pair) is complete — read it back now.
+            if let Some(p) = &self.profiler {
+                p.collect(device, slot);
+            }
+
             // Safe to overwrite now: the fence wait above means this slot's
             // previous read of the UBO is complete. Coherent mapping → no flush.
             std::ptr::copy_nonoverlapping(
@@ -2733,6 +2876,18 @@ impl ShaderRenderer {
             device
                 .begin_command_buffer(cb, &begin)
                 .context("begin cb")?;
+
+            // Bracket the frame's GPU work with timestamps (reset this slot's
+            // pair first — outside any render pass, which is required).
+            if let Some(p) = &self.profiler {
+                device.cmd_reset_query_pool(cb, p.query_pool, (slot * 2) as u32, 2);
+                device.cmd_write_timestamp(
+                    cb,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    p.query_pool,
+                    (slot * 2) as u32,
+                );
+            }
 
             let clear = vk::ClearValue {
                 color: vk::ClearColorValue {
@@ -2872,6 +3027,16 @@ impl ShaderRenderer {
                     &[barrier],
                 );
             }
+            // Closing timestamp once all work is recorded (still outside any
+            // render pass). BOTTOM_OF_PIPE → written when the frame fully drains.
+            if let Some(p) = &self.profiler {
+                device.cmd_write_timestamp(
+                    cb,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    p.query_pool,
+                    (slot * 2 + 1) as u32,
+                );
+            }
             device.end_command_buffer(cb).context("end cb")?;
 
             let cbs = [cb];
@@ -2886,6 +3051,10 @@ impl ShaderRenderer {
             device
                 .queue_submit(self.queue, &[submit], frame.fence)
                 .context("submitting render")?;
+            // This slot now has a timestamp pair to read back on its next reuse.
+            if let Some(p) = &self.profiler {
+                p.pending[slot].set(true);
+            }
         }
 
         let target = match dest {
@@ -2993,6 +3162,9 @@ impl Drop for ShaderRenderer {
                 .destroy_descriptor_pool(self.descriptor_pool, None);
             self.device
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            if let Some(p) = &self.profiler {
+                self.device.destroy_query_pool(p.query_pool, None);
+            }
             self.graph.destroy(&self.device);
             // render_pass is borrowed from Gpu::present_pass — not destroyed here.
         }
@@ -4008,7 +4180,7 @@ mod tests {
         let mods = gpu.renderable_modifiers();
         let rt = RenderTarget::new(gpu, 320, 200, &mods).expect("render target");
         let spec = shadergraph::parse(DEFAULT_FRAGMENT_GLSL).expect("parse");
-        let renderer = ShaderRenderer::new(gpu, &spec, &[], 1).expect("renderer");
+        let renderer = ShaderRenderer::new(gpu, &spec, &[], 1, false).expect("renderer");
         let fb = renderer.create_framebuffer(&rt).expect("framebuffer");
         let uniforms = ShaderUniforms {
             resolution: [rt.width as f32, rt.height as f32],
@@ -4062,7 +4234,7 @@ void main() {
         let mods = gpu.renderable_modifiers();
         let rt = RenderTarget::new(gpu, 320, 200, &mods).expect("render target");
         let spec = shadergraph::parse(FEEDBACK_GLSL).expect("parse");
-        let mut renderer = ShaderRenderer::new(gpu, &spec, &[], 2).expect("renderer");
+        let mut renderer = ShaderRenderer::new(gpu, &spec, &[], 2, false).expect("renderer");
         renderer
             .resize(gpu, rt.width, rt.height)
             .expect("feedback textures");
@@ -4092,6 +4264,81 @@ void main() {
                 let _ = gpu.device.device_wait_idle();
             }
         }
+        // SAFETY: fb came from this renderer; work is drained above.
+        unsafe {
+            gpu.device.destroy_framebuffer(fb, None);
+        }
+    }
+
+    /// Build a renderer with GPU profiling on, render several frames, and verify
+    /// the timestamp query path yields plausible per-frame GPU times (collected
+    /// when each ring slot is reused). Run with `cargo test --ignored`.
+    #[test]
+    #[ignore]
+    fn profile_smoke() {
+        const GLSL: &str = r#"#version 450
+layout(location = 0) in vec2 fragCoord;
+layout(location = 0) out vec4 outColor;
+layout(push_constant) uniform Push { vec2 iResolution; float iTime; float _pad;
+    vec2 iOutputOffset; vec2 iOutputSize; vec2 iGlobalResolution; } pc;
+void main() {
+    vec2 uv = fragCoord / pc.iResolution;
+    outColor = vec4(uv, 0.5 + 0.5 * sin(pc.iTime), 1.0);
+}
+"#;
+        let mut pool = GpuPool::new().expect("Vulkan bring-up failed");
+        let gpu = pool.any().expect("no usable device");
+        if !gpu.timestamps_supported {
+            eprintln!("queue lacks timestamp support; skipping profile_smoke");
+            return;
+        }
+        let mods = gpu.renderable_modifiers();
+        let rt = RenderTarget::new(gpu, 320, 200, &mods).expect("render target");
+        let spec = shadergraph::parse(GLSL).expect("parse");
+        let renderer = ShaderRenderer::new(gpu, &spec, &[], 3, true).expect("renderer");
+        assert!(renderer.profiler.is_some(), "profiler should be built");
+        let fb = renderer.create_framebuffer(&rt).expect("framebuffer");
+        let mut uniforms = ShaderUniforms {
+            resolution: [rt.width as f32, rt.height as f32],
+            time: 0.0,
+            _pad: 0.0,
+            output_offset: [0.0, 0.0],
+            output_size: [rt.width as f32, rt.height as f32],
+            global_resolution: [rt.width as f32, rt.height as f32],
+            ref_white: 203.0,
+            max_lum: 203.0,
+            mouse: [0.0; 4],
+            date: [0.0; 4],
+            time_delta: 0.0,
+            frame: 0,
+        };
+        let audio = <AudioUniforms as bytemuck::Zeroable>::zeroed();
+        // More frames than slots, so each slot is reused and its timestamps read
+        // back at the next render_to fence wait.
+        for i in 0..9 {
+            uniforms.time = i as f32 * 0.1;
+            renderer
+                .render(i % 3, &rt, fb, &uniforms, &audio)
+                .expect("render frame");
+            // SAFETY: drain before reusing the slot on a later iteration.
+            unsafe {
+                let _ = gpu.device.device_wait_idle();
+            }
+        }
+        let acc = renderer.drain_profile().expect("profiling on");
+        eprintln!(
+            "profile_smoke: {} frames, avg {:.3} ms, max {:.3} ms",
+            acc.count,
+            (acc.sum_ns as f64 / acc.count.max(1) as f64) / 1e6,
+            acc.max_ns as f64 / 1e6,
+        );
+        assert!(acc.count >= 6, "expected several samples, got {}", acc.count);
+        assert!(acc.sum_ns > 0, "GPU time should be nonzero");
+        // A 320×200 fullscreen triangle is microseconds; anything past 100 ms
+        // would mean the timestamp math is wrong.
+        let avg_ns = acc.sum_ns / acc.count;
+        assert!(avg_ns < 100_000_000, "implausible avg {avg_ns} ns/frame");
+
         // SAFETY: fb came from this renderer; work is drained above.
         unsafe {
             gpu.device.destroy_framebuffer(fb, None);
@@ -4157,7 +4404,7 @@ void main() {
         let rt = RenderTarget::new(gpu, 320, 200, &mods).expect("render target");
         let spec = shadergraph::parse(MULTI_GLSL).expect("parse");
         assert_eq!(spec.buffers.len(), 2);
-        let mut renderer = ShaderRenderer::new(gpu, &spec, &[], 2).expect("renderer");
+        let mut renderer = ShaderRenderer::new(gpu, &spec, &[], 2, false).expect("renderer");
         renderer
             .resize(gpu, rt.width, rt.height)
             .expect("buffer textures");
@@ -4235,7 +4482,7 @@ void main() {
             },
         };
         let renderer =
-            ShaderRenderer::new(gpu, &spec, std::slice::from_ref(&tex), 1).expect("renderer");
+            ShaderRenderer::new(gpu, &spec, std::slice::from_ref(&tex), 1, false).expect("renderer");
         let fb = renderer.create_framebuffer(&rt).expect("framebuffer");
         let uniforms = ShaderUniforms {
             resolution: [rt.width as f32, rt.height as f32],

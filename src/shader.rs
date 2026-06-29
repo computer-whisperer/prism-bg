@@ -511,6 +511,11 @@ pub struct ShaderSurface {
     resolved: Option<ResolvedFeedback>,
     /// Renderer + target ring on the resolved GPU.
     state: Option<DeviceState>,
+    /// Bumped each time a renderer is (re)built (initial, GPU change, or source
+    /// swap) — i.e. each "shader load". `app.rs` watches it to reset its
+    /// per-output GPU-profiling window. Profiling state lives in the renderer,
+    /// so a rebuild already starts a fresh accumulator.
+    load_generation: u64,
     /// The graph/textures were swapped (playlist rotation): rebuild the
     /// renderer in place on the next render, keeping the dmabuf ring.
     source_dirty: bool,
@@ -695,6 +700,7 @@ impl ShaderSurface {
             accum: FeedbackAccum::default(),
             resolved: None,
             state: None,
+            load_generation: 0,
             source_dirty: false,
             pending_fade: None,
             outgoing_timing: None,
@@ -826,6 +832,18 @@ impl ShaderSurface {
     /// via `viewport`. (Re)builds the pipeline if the GPU changed and the
     /// ring if the size changed. Returns whether the surface is animated.
     #[allow(clippy::too_many_arguments)]
+    /// Monotonic counter of renderer (re)builds — one "shader load". `app.rs`
+    /// resets its GPU-profiling window when this changes.
+    pub fn load_generation(&self) -> u64 {
+        self.load_generation
+    }
+
+    /// Take the current renderer's accumulated GPU render-time samples (resets
+    /// them). `None` when profiling is off or no renderer is built yet.
+    pub fn drain_profile(&self) -> Option<crate::gpu::ProfileAccum> {
+        self.state.as_ref().and_then(|st| st.renderer.drain_profile())
+    }
+
     pub fn render_frame(
         &mut self,
         gpu: &Gpu,
@@ -843,6 +861,8 @@ impl ShaderSurface {
         lum: (f32, f32),
         color: Option<&ColorState>,
         intent: Intent,
+        // Build renderers with GPU render-time profiling (`--profile-gpu`).
+        profile: bool,
     ) -> Result<bool> {
         if size.0 == 0 || size.1 == 0 {
             return Ok(self.animated);
@@ -887,10 +907,11 @@ impl ShaderSurface {
 
         // (Re)build pipeline if the GPU changed.
         if self.state.as_ref().map(|s| s.device_dev) != Some(device_dev) {
+            self.load_generation += 1;
             self.state = Some(DeviceState {
                 device_dev,
                 device: gpu.device.clone(),
-                renderer: ShaderRenderer::new(gpu, &self.spec, &self.textures, RING)?,
+                renderer: ShaderRenderer::new(gpu, &self.spec, &self.textures, RING, profile)?,
                 ring: Vec::new(),
                 size: (0, 0),
                 blend: None,
@@ -909,7 +930,9 @@ impl ShaderSurface {
         if self.source_dirty {
             if let Some(st) = self.state.as_mut() {
                 if !st.ring.is_empty() {
-                    let mut incoming = ShaderRenderer::new(gpu, &self.spec, &self.textures, RING)?;
+                    self.load_generation += 1;
+                    let mut incoming =
+                        ShaderRenderer::new(gpu, &self.spec, &self.textures, RING, profile)?;
                     incoming.resize(gpu, st.size.0, st.size.1)?;
                     // Supersede any still-running transition: its incoming (the
                     // current `st.renderer`) becomes this dissolve's outgoing.
