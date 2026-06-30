@@ -18,6 +18,7 @@ mod gpu;
 mod playlist;
 mod shader;
 mod shadergraph;
+mod watch;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -210,6 +211,41 @@ fn main() -> Result<()> {
             })
             .map_err(|e| anyhow!("inserting rotation timer: {e}"))?;
     }
+    // Hot-reload: watch each distinct --list file; a debounced edit reloads the
+    // playlist and re-rolls. Best-effort — if the watch can't be set up the
+    // daemon still runs, just without live reload. The debouncer must outlive
+    // the loop, so it's bound here.
+    let mut list_paths: Vec<std::path::PathBuf> = Vec::new();
+    for spec in &args.specs {
+        if let Some(list) = &spec.image_list {
+            if !list_paths.contains(list) {
+                list_paths.push(list.clone());
+            }
+        }
+    }
+    let _list_watcher = if list_paths.is_empty() {
+        None
+    } else {
+        match watch::watch_lists(&list_paths) {
+            Ok((debouncer, watch_rx)) => {
+                let qh = qh.clone();
+                event_loop
+                    .handle()
+                    .insert_source(watch_rx, move |event, _, app: &mut App| {
+                        if let ChannelEvent::Msg(list) = event {
+                            app.reload_list(&list, &qh);
+                        }
+                    })
+                    .map_err(|e| anyhow!("inserting list-watch channel: {e}"))?;
+                Some(debouncer)
+            }
+            Err(e) => {
+                tracing::warn!("list hot-reload disabled: {e:#}");
+                None
+            }
+        }
+    };
+
     event_loop
         .run(None, &mut app, |app| app.service(&qh))
         .context("event loop")?;

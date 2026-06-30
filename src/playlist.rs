@@ -160,6 +160,44 @@ impl Playlist {
         }
     }
 
+    /// Copy known luminance classes from `old` onto matching entries (by path).
+    /// Used on hot-reload so entries that survived the edit keep their
+    /// classification instead of being re-decoded to re-learn it.
+    pub fn inherit_classes(&mut self, old: &Playlist) {
+        for (src, &class) in old.entries.iter().zip(&old.classes) {
+            if let Some(c) = class {
+                self.set_class(src.path(), c);
+            }
+        }
+    }
+
+    /// Re-seat the cursor on an entry eligible for `desired`, preferring one
+    /// whose path differs from `avoid` (the wallpaper currently on screen) so a
+    /// re-roll visibly changes something. Falls back to the first eligible entry
+    /// even if it equals `avoid` (e.g. a single-entry pool), and leaves the
+    /// position untouched when nothing is eligible.
+    pub fn reseat(&mut self, desired: Option<Luminance>, avoid: Option<&Path>) {
+        let n = self.order.len();
+        let mut first_eligible = None;
+        for step in 0..n {
+            let p = (self.pos + step) % n;
+            let entry = self.order[p];
+            if desired.map_or(false, |d| !eligible(self.classes[entry], d)) {
+                continue;
+            }
+            if first_eligible.is_none() {
+                first_eligible = Some(p);
+            }
+            if avoid.map_or(true, |a| self.entries[entry].path() != a) {
+                self.pos = p;
+                return;
+            }
+        }
+        if let Some(p) = first_eligible {
+            self.pos = p;
+        }
+    }
+
     /// Move to the first entry from the current position (inclusive) that is
     /// eligible for `desired`, without reshuffling. No-op when filtering is off
     /// (`desired` is `None`) or nothing is eligible (leaves the position as-is,
@@ -292,6 +330,56 @@ mod tests {
         for f in [&bright, &list] {
             let _ = std::fs::remove_file(f);
         }
+    }
+
+    #[test]
+    fn reseat_rerolls_off_current_entry() {
+        let list = write_list("reseat.txt", "a.png\nb.png\nc.png\n");
+        let mut pl = Playlist::load(&list, Duration::from_secs(60), false).unwrap();
+        let cur = pl.current().path().to_path_buf();
+        // Re-roll avoiding the on-screen entry lands on a different one.
+        pl.reseat(None, Some(&cur));
+        assert_ne!(pl.current().path(), cur.as_path());
+        // Single-entry pool: no alternative exists, so it keeps the only entry
+        // rather than leaving nothing on screen.
+        let solo = write_list("solo.txt", "only.png\n");
+        let mut sp = Playlist::load(&solo, Duration::from_secs(60), false).unwrap();
+        let only = sp.current().path().to_path_buf();
+        sp.reseat(None, Some(&only));
+        assert_eq!(sp.current().path(), only.as_path());
+        for f in [&list, &solo] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
+    #[test]
+    fn reseat_honors_luminance_filter() {
+        let dark = write_list("d2.frag", "//!luminance dark\nvoid main(){}");
+        let bright = write_list("b2.frag", "//!luminance bright\nvoid main(){}");
+        let list = write_list("rl.txt", &format!("{}\n{}\n", bright.display(), dark.display()));
+        let mut pl = Playlist::load(&list, Duration::from_secs(60), false).unwrap();
+        assert_eq!(pl.current_class(), Some(Luminance::Bright));
+        // A dark preference seats past the bright entry onto the dark one.
+        pl.reseat(Some(Luminance::Dark), None);
+        assert_eq!(pl.current_class(), Some(Luminance::Dark));
+        for f in [&dark, &bright, &list] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
+    #[test]
+    fn inherit_classes_carries_known_classes() {
+        let list = write_list("inh.txt", "x.png\ny.png\n");
+        let mut old = Playlist::load(&list, Duration::from_secs(60), false).unwrap();
+        let xpath = old.current().path().to_path_buf();
+        old.set_class(&xpath, Luminance::Bright);
+        // A freshly reloaded playlist starts unclassified; inheriting restores
+        // what the prior load already learned.
+        let mut fresh = Playlist::load(&list, Duration::from_secs(60), false).unwrap();
+        assert_eq!(fresh.current_class(), None);
+        fresh.inherit_classes(&old);
+        assert_eq!(fresh.current_class(), Some(Luminance::Bright));
+        let _ = std::fs::remove_file(&list);
     }
 
     #[test]

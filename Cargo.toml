@@ -35,6 +35,11 @@ moxcms = "0.8"
 # playlist shuffle (--list --randomize).
 fastrand = "2"
 
+# watch the --list file and hot-reload it (debounced: editors save via
+# atomic rename + multi-write bursts, which the debouncer coalesces into
+# one reload). Watches the parent dir so a rename-over-original is caught.
+notify-debouncer-mini = "0.7"
+
 # GPU shader wallpapers (--shader). ash is thin Vulkan bindings: we drive
 # the dmabuf-export + drm-format-modifier path directly (no WSI swapchain),
 # so the client keeps control of the buffer and its color-management tag,

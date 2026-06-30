@@ -1239,6 +1239,59 @@ impl App {
         self.service(qh);
     }
 
+    /// A watched `--list` file changed on disk: reload every playlist built from
+    /// it and re-roll to a fresh wallpaper. One list can back more than one
+    /// playlist (distinct specs naming the same file).
+    pub fn reload_list(&mut self, list: &Path, qh: &QueueHandle<App>) {
+        let idxs: Vec<usize> = self
+            .specs
+            .iter()
+            .filter(|s| s.image_list.as_deref() == Some(list))
+            .filter_map(|s| s.playlist)
+            .collect();
+        for idx in idxs {
+            self.reload_playlist(idx, list, qh);
+        }
+    }
+
+    /// Re-parse playlist `idx` from `list` and re-roll. Best-effort: a list that
+    /// no longer parses (saved empty, unreadable mid-edit) is logged and the
+    /// existing playlist kept, so an editing slip never blanks the wallpaper.
+    fn reload_playlist(&mut self, idx: usize, list: &Path, qh: &QueueHandle<App>) {
+        let randomize = self
+            .specs
+            .iter()
+            .find(|s| s.playlist == Some(idx))
+            .is_some_and(|s| s.randomize);
+        let period = self.playlists[idx].period;
+        let mut fresh = match Playlist::load(list, period, randomize) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(list = %list.display(), "list reload failed; keeping current playlist: {e:#}");
+                return;
+            }
+        };
+        // Carry over what we already learned so `--dark-hours` filtering stays
+        // accurate immediately, without re-decoding surviving entries.
+        fresh.inherit_classes(&self.playlists[idx]);
+        // Re-roll: seat on an eligible entry, avoiding an immediate repeat of
+        // what's on screen when the pool offers an alternative. A new pick whose
+        // class is only learned on decode is still caught by on_image_prepared's
+        // re-roll, exactly as on rotation.
+        let displayed = self.playlists[idx].current().path().to_path_buf();
+        fresh.reseat(self.desired_luminance(), Some(&displayed));
+        let entries = fresh.len();
+        self.playlists[idx] = fresh;
+        for wp in &mut self.wallpapers {
+            if wp.spec.playlist == Some(idx) {
+                wp.broken = false; // retry against the reloaded pool
+            }
+        }
+        self.evict_unused_images();
+        tracing::info!(list = %list.display(), entries, "playlist reloaded; re-rolling wallpaper");
+        self.service(qh);
+    }
+
     /// Drop cached raw and prepared images not reachable from any static spec
     /// or current playlist position — keeps long-running rotation memory-flat.
     /// A just-rotated entry is the playlist's *current* path, so its prep
