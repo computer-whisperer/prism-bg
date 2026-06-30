@@ -48,47 +48,55 @@ pub struct DecodedImage {
 }
 
 impl DecodedImage {
-    /// Mean perceptual luminance over the image in `0..1`, for dark/bright
-    /// classification (`--dark-hours`). Pixels are premultiplied; the (gamma-
-    /// encoded) 8-bit path's relative-luminance weights approximate lightness
-    /// directly, and the linear f16 path is gamma-encoded first so the two are
-    /// comparable. Subsamples to a few hundred thousand pixels for speed.
-    pub fn mean_luminance(&self) -> f32 {
+    /// Mean Rec.709 luminance over the image in **nits** (cd/m²) — the actual
+    /// presented brightness, for dark/bright classification (`--dark-hours`).
+    /// Unlike [`Self::mean_luminance`], highlights are *not* clamped to
+    /// reference white: this is meant to be called on an already-remastered
+    /// image (post `luminance_controlled`), so the value reflects what the
+    /// display will emit. Linear nits = straight value × declared reference;
+    /// PQ goes through the EOTF; display-referred SDR is taken at its declared
+    /// reference. Subsamples like `mean_luminance`.
+    pub fn mean_nits(&self) -> f32 {
         let luma = |r: f32, g: f32, b: f32| 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let ref_nits = self
+            .encoding
+            .luminances
+            .map(|l| l.reference)
+            .unwrap_or(80.0) as f32;
+        let pq = self.encoding.tf == Tf::Pq;
         let mut sum = 0.0f64;
         let mut n = 0u64;
         match &self.pixels {
             Pixels::Rgba8(d) => {
                 let px = d.len() / 4;
                 let stride = (px / 200_000).max(1);
+                let eotf = |v: f32| self.encoding.tf.eotf(v);
                 for c in d.chunks_exact(4).step_by(stride) {
                     let a = c[3] as f32 / 255.0;
-                    // Un-premultiply; opaque pixels (the common case) are a no-op.
                     let s = if a > 0.0 { 255.0 * a } else { 1.0 };
-                    sum += luma(c[0] as f32 / s, c[1] as f32 / s, c[2] as f32 / s) as f64;
+                    // Display-referred: decode to linear light, scale to nits.
+                    let nit = |v: u8| eotf(v as f32 / s) * ref_nits;
+                    sum += luma(nit(c[0]), nit(c[1]), nit(c[2])) as f64;
                     n += 1;
                 }
             }
             Pixels::RgbaF16(d) => {
-                let linear = self.encoding.tf == Tf::Linear;
                 let px = d.len() / 4;
                 let stride = (px / 200_000).max(1);
+                let nit = |v: f16, a: f32| {
+                    let mut x = v.to_f32();
+                    if a > 0.0 {
+                        x /= a;
+                    }
+                    if pq {
+                        crate::color::pq_eotf(x.clamp(0.0, 1.0)) * 10000.0
+                    } else {
+                        x.max(0.0) * ref_nits
+                    }
+                };
                 for c in d.chunks_exact(4).step_by(stride) {
                     let a = c[3].to_f32().clamp(0.0, 1.0);
-                    let straight = |v: f16| {
-                        let mut x = v.to_f32();
-                        if a > 0.0 {
-                            x /= a;
-                        }
-                        x = x.clamp(0.0, 1.0);
-                        // Gamma-encode linear light so the value is perceptual,
-                        // comparable to the already-encoded 8-bit path.
-                        if linear {
-                            x = x.powf(1.0 / 2.2);
-                        }
-                        x
-                    };
-                    sum += luma(straight(c[0]), straight(c[1]), straight(c[2])) as f64;
+                    sum += luma(nit(c[0], a), nit(c[1], a), nit(c[2], a)) as f64;
                     n += 1;
                 }
             }
@@ -736,15 +744,15 @@ mod working_space_tests {
     }
 
     #[test]
-    fn mean_luminance_dark_to_bright() {
-        // Pure black and white bound the scale.
-        assert!(srgb8([0, 0, 0, 255]).mean_luminance() < 0.01);
-        assert!(srgb8([255, 255, 255, 255]).mean_luminance() > 0.99);
-        // Mid grey lands near the middle (8-bit values are already gamma-coded).
-        let mid = srgb8([128, 128, 128, 255]).mean_luminance();
-        assert!((0.45..=0.55).contains(&mid), "mid grey luma {mid}");
-        // Green dominates the luminance weighting.
-        assert!(srgb8([0, 255, 0, 255]).mean_luminance() > srgb8([255, 0, 0, 255]).mean_luminance());
+    fn mean_nits_tracks_presented_brightness() {
+        // sRGB white sits at its declared reference (80 nits for untagged sRGB).
+        let white = srgb8([255, 255, 255, 255]).mean_nits();
+        assert!((white - 80.0).abs() < 1.0, "sRGB white = {white} nits");
+        // Black emits nothing; mid grey lands well below white.
+        assert!(srgb8([0, 0, 0, 255]).mean_nits() < 0.5);
+        assert!(srgb8([128, 128, 128, 255]).mean_nits() < white);
+        // Green dominates the Rec.709 luminance weighting.
+        assert!(srgb8([0, 255, 0, 255]).mean_nits() > srgb8([255, 0, 0, 255]).mean_nits());
     }
 
     #[test]

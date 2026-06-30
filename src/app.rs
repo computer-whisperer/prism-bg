@@ -117,18 +117,37 @@ pub struct PrepResult {
     result: Result<PreparedImage>,
 }
 
-/// Mean-luminance cutoff splitting dark from bright wallpapers. Heuristic — a
-/// mostly-dark scene with sparse highlights lands well below it, a daylit photo
-/// well above.
-const DARK_LUMINANCE_CUTOFF: f32 = 0.4;
+/// Tone-map target (nits) used purely to classify a wallpaper's luminance.
+/// Fixed and panel-independent so the dark/bright verdict is stable across
+/// outputs (the playlist advances in lockstep, so it must be a single value).
+/// Highlights above this are remastered down before we measure — matching what
+/// a bright HDR panel actually presents — so a mostly-dark image with searing
+/// HDR speculars no longer reads as "dark" the way raw mean luminance did.
+const CLASSIFY_TONEMAP_NITS: f64 = 1000.0;
 
-/// Bucket a mean luminance (`0..1`) into a [`Luminance`] class.
-fn classify_luminance(mean: f32) -> Luminance {
-    if mean < DARK_LUMINANCE_CUTOFF {
+/// Mean-*presented*-brightness cutoff (nits) splitting dark from bright
+/// wallpapers, measured after remastering to [`CLASSIFY_TONEMAP_NITS`]. Picked
+/// from the real library: the dark cluster sits below ~14 nits, the bright
+/// group at 15–40.
+const DARK_NITS_CUTOFF: f32 = 15.0;
+
+/// Classify a decoded image by its mean presented brightness: remaster it to
+/// the canonical classification target, then bucket the mean nits. Logs the
+/// decision so the threshold can be retuned against real wallpapers.
+fn classify_image(path: &Path, raw: &DecodedImage) -> Luminance {
+    let presented_nits = raw
+        .luminance_controlled(LuminanceControl {
+            tone_map: Some(CLASSIFY_TONEMAP_NITS),
+            ..Default::default()
+        })
+        .mean_nits();
+    let class = if presented_nits < DARK_NITS_CUTOFF {
         Luminance::Dark
     } else {
         Luminance::Bright
-    }
+    };
+    tracing::info!(path = %path.display(), presented_nits, ?class, "classified wallpaper luminance");
+    class
 }
 
 /// Spawn the background image-prep worker. Returns the job sender (held by
@@ -148,7 +167,7 @@ pub fn spawn_prep_worker() -> (mpsc::Sender<PrepJob>, calloop::channel::Channel<
                 let class = decoded
                     .as_ref()
                     .ok()
-                    .map(|raw| classify_luminance(raw.mean_luminance()));
+                    .map(|raw| classify_image(&job.path, raw));
                 let result = decoded.map(|raw| {
                     tracing::info!(path = %job.path.display(), "image loaded (background)");
                     prepare_from_raw(&raw, job.treatment)
@@ -396,7 +415,7 @@ impl App {
         // Rotation images are classified as they decode (see on_image_prepared).
         let mut playlists = playlists;
         for (path, raw) in &raw_images {
-            let class = classify_luminance(raw.mean_luminance());
+            let class = classify_image(path, raw);
             for pl in &mut playlists {
                 pl.set_class(path, class);
             }
