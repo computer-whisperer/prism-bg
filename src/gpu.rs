@@ -1591,6 +1591,7 @@ fn compile_glsl(source: &str, kind: shaderc::ShaderKind, name: &str) -> Result<V
     // several 4K outputs stalls visibly without this.
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
+    #[allow(clippy::type_complexity)] // a keyed SPIR-V cache; a type alias would obscure more than it clarifies
     static CACHE: OnceLock<Mutex<HashMap<(String, i32), Vec<u32>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = (source.to_string(), kind as i32);
@@ -1847,7 +1848,15 @@ impl ShaderRenderer {
         let device = gpu.device.clone();
         // Borrow the device's shared present pass (not owned — never destroyed
         // here): see `Gpu::present_pass`.
-        Self::build(gpu, device, gpu.present_pass, spec, textures, frames, profile)
+        Self::build(
+            gpu,
+            device,
+            gpu.present_pass,
+            spec,
+            textures,
+            frames,
+            profile,
+        )
     }
 
     /// Whether `gpu` can export a binary semaphore as a SYNC_FD sync_file —
@@ -4332,7 +4341,11 @@ void main() {
             (acc.sum_ns as f64 / acc.count.max(1) as f64) / 1e6,
             acc.max_ns as f64 / 1e6,
         );
-        assert!(acc.count >= 6, "expected several samples, got {}", acc.count);
+        assert!(
+            acc.count >= 6,
+            "expected several samples, got {}",
+            acc.count
+        );
         assert!(acc.sum_ns > 0, "GPU time should be nonzero");
         // A 320×200 fullscreen triangle is microseconds; anything past 100 ms
         // would mean the timestamp math is wrong.
@@ -4481,8 +4494,8 @@ void main() {
                 srgb: false,
             },
         };
-        let renderer =
-            ShaderRenderer::new(gpu, &spec, std::slice::from_ref(&tex), 1, false).expect("renderer");
+        let renderer = ShaderRenderer::new(gpu, &spec, std::slice::from_ref(&tex), 1, false)
+            .expect("renderer");
         let fb = renderer.create_framebuffer(&rt).expect("framebuffer");
         let uniforms = ShaderUniforms {
             resolution: [rt.width as f32, rt.height as f32],

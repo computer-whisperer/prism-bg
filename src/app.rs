@@ -52,13 +52,13 @@ use smithay_client_toolkit::reexports::calloop;
 
 use crate::audio::AudioCapture;
 use crate::cli::{Args, Color, DarkHours, Intent, Luminance, Mode, OutputSpec, ProfileMode};
-use std::time::{Duration, Instant};
 use crate::color::{ColorEncoding, LuminanceControl};
 use crate::colormgmt::ColorState;
 use crate::decode::DecodedImage;
 use crate::gpu::GpuPool;
 use crate::playlist::Playlist;
 use crate::shader::{DmabufState, ShaderSurface, Tiling};
+use std::time::{Duration, Instant};
 
 /// Image identity for deduplication: path + effective luminance treatment
 /// (the same file treated differently for different outputs is different

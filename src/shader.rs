@@ -857,9 +857,12 @@ impl ShaderSurface {
     /// Take the current renderer's accumulated GPU render-time samples (resets
     /// them). `None` when profiling is off or no renderer is built yet.
     pub fn drain_profile(&self) -> Option<crate::gpu::ProfileAccum> {
-        self.state.as_ref().and_then(|st| st.renderer.drain_profile())
+        self.state
+            .as_ref()
+            .and_then(|st| st.renderer.drain_profile())
     }
 
+    #[allow(clippy::too_many_arguments)] // per-frame render inputs; bundling them buys nothing here
     pub fn render_frame(
         &mut self,
         gpu: &Gpu,

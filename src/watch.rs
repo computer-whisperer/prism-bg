@@ -27,7 +27,10 @@ const DEBOUNCE: Duration = Duration::from_millis(250);
 /// changes (matching the path as it appeared in `lists`).
 pub fn watch_lists(
     lists: &[PathBuf],
-) -> Result<(Debouncer<RecommendedWatcher>, calloop::channel::Channel<PathBuf>)> {
+) -> Result<(
+    Debouncer<RecommendedWatcher>,
+    calloop::channel::Channel<PathBuf>,
+)> {
     let (tx, rx) = calloop::channel::channel::<PathBuf>();
 
     // Map each watched file — resolved to the canonical full path inotify will
@@ -118,7 +121,7 @@ mod tests {
         let list = dir.join("list.txt");
         std::fs::write(&list, "a.png\n").unwrap();
 
-        let (debouncer, rx) = watch_lists(&[list.clone()]).unwrap();
+        let (debouncer, rx) = watch_lists(std::slice::from_ref(&list)).unwrap();
         let mut ev: EventLoop<Option<PathBuf>> = EventLoop::try_new().unwrap();
         ev.handle()
             .insert_source(rx, |event, _, got: &mut Option<PathBuf>| {
@@ -131,7 +134,10 @@ mod tests {
         let edited = list.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
-            let mut f = std::fs::OpenOptions::new().append(true).open(&edited).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&edited)
+                .unwrap();
             writeln!(f, "b.png").unwrap();
         });
 

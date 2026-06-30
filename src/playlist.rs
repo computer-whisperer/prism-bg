@@ -34,7 +34,7 @@ pub fn classify_shader_source(source: &str) -> Option<Luminance> {
 /// Whether an entry of class `class` may show when `desired` luminance is
 /// preferred. Unclassified entries (`None`) are always eligible.
 fn eligible(class: Option<Luminance>, desired: Luminance) -> bool {
-    class.map_or(true, |c| c == desired)
+    class.is_none_or(|c| c == desired)
 }
 
 /// A playlist entry: a still image or a live GLSL shader. The kind is
@@ -182,13 +182,13 @@ impl Playlist {
         for step in 0..n {
             let p = (self.pos + step) % n;
             let entry = self.order[p];
-            if desired.map_or(false, |d| !eligible(self.classes[entry], d)) {
+            if desired.is_some_and(|d| !eligible(self.classes[entry], d)) {
                 continue;
             }
             if first_eligible.is_none() {
                 first_eligible = Some(p);
             }
-            if avoid.map_or(true, |a| self.entries[entry].path() != a) {
+            if avoid.is_none_or(|a| self.entries[entry].path() != a) {
                 self.pos = p;
                 return;
             }
@@ -217,7 +217,7 @@ impl Playlist {
     /// Whether the current entry is eligible for `desired` (always true when
     /// `desired` is `None`).
     pub fn current_eligible(&self, desired: Option<Luminance>) -> bool {
-        desired.map_or(true, |d| eligible(self.current_class(), d))
+        desired.is_none_or(|d| eligible(self.current_class(), d))
     }
 
     /// Whether *any* entry could satisfy `desired` — one already known to match,
@@ -356,7 +356,10 @@ mod tests {
     fn reseat_honors_luminance_filter() {
         let dark = write_list("d2.frag", "//!luminance dark\nvoid main(){}");
         let bright = write_list("b2.frag", "//!luminance bright\nvoid main(){}");
-        let list = write_list("rl.txt", &format!("{}\n{}\n", bright.display(), dark.display()));
+        let list = write_list(
+            "rl.txt",
+            &format!("{}\n{}\n", bright.display(), dark.display()),
+        );
         let mut pl = Playlist::load(&list, Duration::from_secs(60), false).unwrap();
         assert_eq!(pl.current_class(), Some(Luminance::Bright));
         // A dark preference seats past the bright entry onto the dark one.
