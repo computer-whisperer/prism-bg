@@ -69,9 +69,13 @@ void main() {
 
         float d = length(P - center);
         float front = WAVESPEED * age;              // current ring radius
+        // Both windows below are exactly 0 past the ring front / the d = 2.0
+        // seam guard, so skip the sin/exp for cells that can't contribute
+        // (always the scan's corners, and most cells while a ring is young).
+        if (d >= front || d >= 2.0) continue;
         float wave = sin(d * FREQ - age * (FREQ * WAVESPEED));
         float inside = smoothstep(front, front - 0.30, d);   // only where the ring has reached
-        float decay = exp(-age * 1.4) * exp(-d * 1.1);       // ripple dies with age + spread
+        float decay = exp(-(age * 1.4 + d * 1.1));           // ripple dies with age + spread
         float win = smoothstep(2.0, 1.4, d);                 // -> 0 before the scan edge: no grid seam
         h += wave * inside * decay * win;
     }

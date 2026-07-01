@@ -95,9 +95,14 @@ void main() {
     const float STEPLEN = 0.045;
     vec2 pos = p;
     float acc = 0.0, wsum = 0.0;
+    vec2 v = vec2(0.0);
     for (int i = 0; i < N; i++) {
-        vec2 v = flow(pos, drift);
-        v /= max(length(v), 1e-4);
+        // The potential is far smoother than the step length, so one velocity
+        // sample serves two steps; the flow eval dominates the loop's cost.
+        if ((i & 1) == 0) {
+            v = flow(pos, drift);
+            v /= max(length(v), 1e-4);
+        }
         pos -= v * STEPLEN;
         float dye = vnoise(pos * 2.3 + vec2(dyeT, -dyeT * 0.4));
         float wgt = 1.0 - float(i) / float(N);   // taper toward the tail

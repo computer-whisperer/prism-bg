@@ -55,10 +55,33 @@ float noise(vec2 p) {
     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
-float fbm(vec2 p) {
+// The ridgelines are pure functions of x, so they use 1-D value noise: two
+// hash taps per octave where the 2-D noise above needs four. `seed` picks the
+// lattice row and steps per octave to decorrelate them.
+float noise1(float x, float seed) {
+    float i = floor(x), f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(hash21(vec2(i, seed)), hash21(vec2(i + 1.0, seed)), f);
+}
+
+float fbm1(float x, float seed) {
     float s = 0.0;
     float a = 0.55;
     for (int i = 0; i < 5; i++) {
+        s += a * noise1(x, seed);
+        x = x * 2.04 + 17.0;
+        seed += 9.0;
+        a *= 0.5;
+    }
+    return s;
+}
+
+// Only the haze samples this 2-D fbm, and only for a broad low-frequency
+// glow, so three octaves carry it.
+float fbm(vec2 p) {
+    float s = 0.0;
+    float a = 0.55;
+    for (int i = 0; i < 3; i++) {
         s += a * noise(p);
         p = p * 2.04 + vec2(17.0, 9.0);
         a *= 0.5;
@@ -68,8 +91,8 @@ float fbm(vec2 p) {
 
 float ridge(float x, float layer, float t) {
     float slow = t * (0.018 + layer * 0.006);
-    float h = fbm(vec2(x * (0.85 + layer * 0.22) + slow, layer * 13.7));
-    h += 0.35 * fbm(vec2(x * 2.4 - slow * 2.0, layer * 31.1));
+    float h = fbm1(x * (0.85 + layer * 0.22) + slow, layer * 13.7);
+    h += 0.35 * fbm1(x * 2.4 - slow * 2.0, layer * 31.1);
     return 0.18 + layer * 0.14 + h * (0.18 + layer * 0.035);
 }
 

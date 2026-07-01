@@ -89,7 +89,9 @@ vec2 NetLayer(vec2 st, float n, float t) {
 
     float m = 0.0, sparkle = 0.0;
     for (int i = 0; i < 9; i++) {
-        m += line(p[4], p[i], st);
+        // i == 4 is the centre node itself: a zero-length segment whose
+        // distance is 0/0 (NaN), silently swallowed by clamp on some drivers.
+        if (i != 4) m += line(p[4], p[i], st);
 
         float d = length(st - p[i]);
         float s = 0.005 / (d * d);

@@ -50,10 +50,13 @@ float noise(vec2 p) {
     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
-float fbm(vec2 p) {
+// Octave count per call site: the domain-warp and depth fields are sampled at
+// low frequency where octaves past the third are sub-pixel, so only the
+// filament displacement pays for four.
+float fbm(vec2 p, int oct) {
     float s = 0.0;
     float a = 0.5;
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < oct; i++) {
         s += a * noise(p);
         p = mat2(1.52, 1.08, -1.08, 1.52) * p + vec2(6.0, 17.0);
         a *= 0.5;
@@ -62,7 +65,7 @@ float fbm(vec2 p) {
 }
 
 float filament(vec2 p, float phase, float width) {
-    float y = p.y + 0.35 * fbm(p * 0.70 + phase) + 0.12 * sin(p.x * 2.0 + phase);
+    float y = p.y + 0.35 * fbm(p * 0.70 + phase, 4) + 0.12 * sin(p.x * 2.0 + phase);
     float f = abs(fract(y) - 0.5);
     return smoothstep(width, 0.0, f);
 }
@@ -76,7 +79,7 @@ void main() {
 
     float t = pc.iTime * 0.055;
     vec2 q = p * 5.0;
-    q += vec2(0.55 * fbm(q * 0.45 + vec2(t, -t)), 0.35 * fbm(q * 0.50 - vec2(t * 1.4, t)));
+    q += vec2(0.55 * fbm(q * 0.45 + vec2(t, -t), 3), 0.35 * fbm(q * 0.50 - vec2(t * 1.4, t), 3));
 
     float f1 = filament(q + vec2(t * 1.7, 0.0), t * 4.0, 0.055);
     float f2 = filament(q * 1.35 + vec2(-t * 1.2, 3.7), -t * 3.0, 0.040);
@@ -84,7 +87,7 @@ void main() {
     float flow = clamp(f1 * 0.65 + f2 * 0.50 + f3 * 0.35, 0.0, 1.0);
 
     vec3 col = mix(vec3(0.003, 0.007, 0.014), vec3(0.012, 0.035, 0.052), gv.y);
-    float depth = fbm(q * 0.22 + vec2(0.0, t));
+    float depth = fbm(q * 0.22 + vec2(0.0, t), 3);
     col += vec3(0.00, 0.10, 0.15) * depth * 0.35;
 
     vec3 teal = vec3(0.08, 0.84, 0.76);
