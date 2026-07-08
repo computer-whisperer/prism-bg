@@ -235,6 +235,13 @@ struct Wallpaper {
     color: Color,
     /// Image preparation failed; don't retry every service pass.
     broken: bool,
+    /// The frame callback armed by the last committed render is still
+    /// unanswered. The compositor withholds callbacks from occluded and
+    /// DPMS-off surfaces, so a lingering `true` means "not visible":
+    /// [`App::rotate`] defers rotation ticks instead of decoding + rendering
+    /// invisibly. Set after each [`ShaderSurface::render_frame`] commit,
+    /// cleared in [`App::frame`].
+    frame_pending: bool,
     /// The image source currently loaded into the GPU surface (path +
     /// luminance treatment); drives staleness detection in [`App::service`].
     /// `None` for shader/solid wallpapers and before the first image loads.
@@ -594,6 +601,7 @@ impl App {
             viewport,
             color,
             broken: shader_broken,
+            frame_pending: false,
             loaded: None,
             _feedback: feedback,
             size: (0, 0),
@@ -1077,7 +1085,7 @@ impl App {
         let scale = wp.scale.max(1) as u32;
         let device_size = (w * scale, h * scale);
         let shader = wp.shader.as_mut().context("not a shader wallpaper")?;
-        shader.render_frame(
+        let armed = shader.render_frame(
             gpu,
             dmabuf,
             qh,
@@ -1092,6 +1100,9 @@ impl App {
             intent,
             profile,
         )?;
+        if armed {
+            wp.frame_pending = true;
+        }
         Ok(())
     }
 
@@ -1165,13 +1176,6 @@ impl App {
         Ok(())
     }
 
-    /// Advance playlist `idx` and re-attach every wallpaper showing it.
-    /// Called from the per-playlist rotation timer. Images are *not* decoded
-    /// here — that happens on the background prep worker (an arbitrary 4K file
-    /// from anywhere has unbounded decode latency and must never block the event
-    /// loop); the current wallpaper stays up until the prep lands. Shaders are
-    /// still validated synchronously (a cheap parse) so a broken shader entry is
-    /// skipped immediately.
     /// The luminance class to prefer right now, or `None` when `--dark-hours`
     /// is unset (no time-of-day filtering).
     fn desired_luminance(&self) -> Option<Luminance> {
@@ -1179,7 +1183,38 @@ impl App {
             .map(|dh| dh.preference(crate::shader::local_minute_of_day()))
     }
 
+    /// Advance playlist `idx` and re-attach every wallpaper showing it.
+    /// Called from the per-playlist rotation timer. Images are *not* decoded
+    /// here — that happens on the background prep worker (an arbitrary 4K file
+    /// from anywhere has unbounded decode latency and must never block the event
+    /// loop); the current wallpaper stays up until the prep lands. Shaders are
+    /// still validated synchronously (a cheap parse) so a broken shader entry is
+    /// skipped immediately.
+    ///
+    /// While every output showing the playlist is frame-callback-starved
+    /// (occluded or DPMS-off), the tick is deferred instead: no decode, no
+    /// render, one remembered rotation applied by [`Self::frame`] when a
+    /// callback next arrives — so wake starts a fresh dissolve rather than
+    /// having rotated invisibly all night. (Visible animated shaders usually
+    /// have a callback in flight too, so this can defer a tick on a live
+    /// surface — it's then applied milliseconds later, on that callback.)
     pub fn rotate(&mut self, qh: &QueueHandle<App>, idx: usize) {
+        let mut showing_any = false;
+        let mut all_starved = true;
+        for wp in &self.wallpapers {
+            if wp.spec.playlist == Some(idx) {
+                showing_any = true;
+                all_starved &= wp.frame_pending;
+            }
+        }
+        if showing_any && all_starved {
+            tracing::debug!(
+                playlist = idx,
+                "all outputs callback-starved; deferring rotation"
+            );
+            self.playlists[idx].rotation_deferred = true;
+            return;
+        }
         let previous = self.playlists[idx].current().path().to_path_buf();
         let desired = self.desired_luminance();
 
@@ -1338,15 +1373,17 @@ impl CompositorHandler for App {
     }
 
     fn frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, surface: &WlSurface, _: u32) {
-        // Image wallpapers are static and never request frame callbacks.
-        // Animated shader wallpapers re-render here and arm the next
-        // callback; an occluded surface gets none, so animation pauses
-        // (and with it the GPU cost) until it's visible again.
+        // Every committed render arms one callback (see `render_frame`).
+        // Animated shader wallpapers re-render here, arming the next one; an
+        // occluded surface gets no callbacks, so animation pauses (and with
+        // it the GPU cost) until it's visible again. For static content the
+        // callback just clears `frame_pending` — the liveness probe.
         if let Some(i) = self
             .wallpapers
             .iter()
             .position(|w| w.layer.wl_surface() == surface)
         {
+            self.wallpapers[i].frame_pending = false;
             let animate = !self.wallpapers[i].broken
                 && self.wallpapers[i]
                     .shader
@@ -1354,6 +1391,14 @@ impl CompositorHandler for App {
                     .is_some_and(|s| s.needs_redraw());
             if animate {
                 self.draw(qh, i);
+            }
+            // A rotation tick deferred while this playlist's outputs were all
+            // callback-starved runs now that one is provably visible.
+            if let Some(p) = self.wallpapers[i].spec.playlist {
+                if self.playlists[p].rotation_deferred {
+                    self.playlists[p].rotation_deferred = false;
+                    self.rotate(qh, p);
+                }
             }
         }
     }

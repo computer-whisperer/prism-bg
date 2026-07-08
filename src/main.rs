@@ -153,7 +153,6 @@ fn main() -> Result<()> {
     let (globals, mut queue) = registry_queue_init::<App>(&conn)?;
     let qh = queue.handle();
 
-    // Created before App: fades insert their ticker via the loop handle.
     let mut event_loop: EventLoop<App> = EventLoop::try_new().context("creating event loop")?;
 
     // Background image-prep worker: decode + colour-space conversion of rotation
@@ -180,10 +179,10 @@ fn main() -> Result<()> {
     }
     app.service(&qh);
 
-    // Event loop: the wayland socket plus one rotation timer per
-    // playlist (and a transient fade ticker while crossfading). service()
-    // runs after every wake-up (cheap when nothing is pending), same as
-    // the old dispatch loop.
+    // Event loop: the wayland socket plus one rotation timer per playlist
+    // (crossfades advance via frame callbacks, not a timer). service() runs
+    // after every wake-up (cheap when nothing is pending), same as the old
+    // dispatch loop.
     WaylandSource::new(conn, queue)
         .insert(event_loop.handle())
         .map_err(|e| anyhow!("inserting wayland source: {e}"))?;

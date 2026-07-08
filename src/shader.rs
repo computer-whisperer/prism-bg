@@ -843,11 +843,6 @@ impl ShaderSurface {
         self.resolved.as_ref().map(|r| r.device)
     }
 
-    /// Render the next frame on `gpu` (which must drive this output) and
-    /// present it on `surface`, scaling the device-pixel buffer to `logical`
-    /// via `viewport`. (Re)builds the pipeline if the GPU changed and the
-    /// ring if the size changed. Returns whether the surface is animated.
-    #[allow(clippy::too_many_arguments)]
     /// Monotonic counter of renderer (re)builds — one "shader load". `app.rs`
     /// resets its GPU-profiling window when this changes.
     pub fn load_generation(&self) -> u64 {
@@ -862,6 +857,12 @@ impl ShaderSurface {
             .and_then(|st| st.renderer.drain_profile())
     }
 
+    /// Render the next frame on `gpu` (which must drive this output) and
+    /// present it on `surface`, scaling the device-pixel buffer to `logical`
+    /// via `viewport`. (Re)builds the pipeline if the GPU changed and the
+    /// ring if the size changed. Returns whether a frame callback was armed
+    /// (i.e. whether anything was committed) — the caller's liveness probe;
+    /// see `Wallpaper::frame_pending`.
     #[allow(clippy::too_many_arguments)] // per-frame render inputs; bundling them buys nothing here
     pub fn render_frame(
         &mut self,
@@ -884,7 +885,7 @@ impl ShaderSurface {
         profile: bool,
     ) -> Result<bool> {
         if size.0 == 0 || size.1 == 0 {
-            return Ok(self.animated);
+            return Ok(false);
         }
 
         // --fps cap: if we rendered too recently, skip this callback's render
@@ -898,7 +899,7 @@ impl ShaderSurface {
             if last.elapsed() < min.mul_f64(0.95) {
                 surface.frame(qh, surface.clone());
                 surface.commit();
-                return Ok(self.animated);
+                return Ok(true);
             }
         }
 
@@ -1016,7 +1017,7 @@ impl ShaderSurface {
             .position(|t| t.available.load(Ordering::Acquire))
         else {
             tracing::debug!("no free shader target this frame; skipping");
-            return Ok(self.animated);
+            return Ok(false);
         };
         let time = match self.started {
             Some(t) => t.elapsed().as_secs_f32(),
@@ -1057,7 +1058,6 @@ impl ShaderSurface {
         } = st;
         let rt = &ring[idx];
         let mut transition_done = false;
-        let keep;
         match (transition.as_mut(), blend.as_mut()) {
             (Some(tr), Some(blend)) => {
                 // Dissolve progress, clamped; the final frame lands exactly at 1.
@@ -1091,15 +1091,11 @@ impl ShaderSurface {
                 tr.out_last_time = Some(out_time);
                 tr.out_frame_count = tr.out_frame_count.wrapping_add(1);
                 transition_done = progress >= 1.0;
-                // Keep ticking until the dissolve ends; after that, only if the
-                // incoming is itself animated.
-                keep = !transition_done || self.animated;
             }
             _ => {
                 renderer
                     .render(idx, &rt.target, rt.framebuffer, &uniforms, audio)
                     .context("rendering shader frame")?;
-                keep = self.animated;
             }
         }
         // Advance the incoming per-frame counters now the render is committed to.
@@ -1111,11 +1107,12 @@ impl ShaderSurface {
         viewport.set_source(-1.0, -1.0, -1.0, -1.0);
         viewport.set_destination(logical.0 as i32, logical.1 as i32);
         surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-        if keep {
-            // Request the next callback before committing; delivered when
-            // ready (and not while occluded).
-            surface.frame(qh, surface.clone());
-        }
+        // Request a callback before every commit — animation continuation when
+        // the surface is visible (`App::frame` re-renders only while
+        // `needs_redraw()`), and a liveness probe otherwise: a callback the
+        // compositor never answers marks the surface occluded / DPMS-off,
+        // which defers rotation (`App::rotate`) instead of rendering invisibly.
+        surface.frame(qh, surface.clone());
         surface.commit();
         // A finished dissolve ends here, leaving the incoming as the sole source.
         // Drain the persistent blend first: its final submit (just queued above)
@@ -1128,7 +1125,7 @@ impl ShaderSurface {
             *transition = None;
             tracing::info!("blur-dissolve complete");
         }
-        Ok(self.animated)
+        Ok(true)
     }
 
     fn build_ring(

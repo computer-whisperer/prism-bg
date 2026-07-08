@@ -86,6 +86,10 @@ pub struct Playlist {
     order: Vec<usize>,
     pos: usize,
     pub period: Duration,
+    /// A rotation tick fired while every output showing this playlist was
+    /// frame-callback-starved (occluded or DPMS-off). One tick is remembered
+    /// here and applied by `App::frame` when a callback next arrives.
+    pub rotation_deferred: bool,
     randomize: bool,
 }
 
@@ -136,6 +140,7 @@ impl Playlist {
             order,
             pos: 0,
             period,
+            rotation_deferred: false,
             randomize,
         })
     }
