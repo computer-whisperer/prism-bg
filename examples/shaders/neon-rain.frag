@@ -44,20 +44,27 @@ vec3 cellRand3(uint seed) {
     return vec3(pcg(h), pcg(h ^ 0x9e3779b9u), pcg(h ^ 0x85ebca6bu)) * U32;
 }
 
+// Each cycle a drop hits the glass near the top of its cell and slides down,
+// leaving a tail that grows behind it and fades where it's oldest. fragCoord
+// is y-up, so "behind" (the wake) is above the head.
 float dropLayer(vec2 uv, float cells, float speed, float t) {
     vec2 p = uv * vec2(cells, cells * 0.55);
-    p.y += t * speed;
+    p.y += t * speed * 0.25;  // gentle whole-field drift down the glass
     vec2 id = floor(p);
     vec2 f = fract(p);
     float h = hash21(id);
     float lane = h * 0.72 + 0.14;
-    float y = fract(h * 13.7 + t * speed * (0.25 + 0.5 * h));
+    float phase = fract(h * 13.7 + t * speed * (0.5 + 0.6 * h));
+    float top = 0.70 + 0.25 * h;      // where this drop strikes the glass
+    float y = mix(top, 0.08, phase);  // head slides top -> bottom over the cycle
     vec2 d = vec2((f.x - lane) * 2.4, f.y - y);
     float head = smoothstep(0.11, 0.0, length(d * vec2(1.0, 2.4)));
-    float trail = smoothstep(0.055, 0.0, abs(f.x - lane));
     float behind = f.y - y;
-    trail *= smoothstep(-0.55, -0.06, behind) * (1.0 - smoothstep(-0.02, 0.08, behind));
-    return (head + trail * 0.45) * smoothstep(0.35, 1.0, h);
+    float trail = smoothstep(0.055, 0.0, abs(f.x - lane));
+    trail *= smoothstep(0.0, 0.02, behind);                            // only above the head
+    trail *= clamp(1.0 - behind / max(top - y, 1e-3), 0.0, 1.0);       // only where it has slid; oldest end faintest
+    float life = smoothstep(1.0, 0.86, phase);  // absorb the drip before it respawns
+    return (head + trail * 0.45) * life * smoothstep(0.35, 1.0, h);
 }
 
 // City glow behind the glass: soft neon signs on a repeating horizontal grid,
@@ -96,7 +103,8 @@ void main() {
     float d2 = dropLayer(vec2(gx + 7.3, gv.y + 2.1), 31.0, 0.85, pc.iTime);
     float drops = clamp(d1 + d2 * 0.7, 0.0, 1.0);
 
-    vec2 refr = vec2(dFdx(drops), dFdy(drops)) * 0.075;
+    // dFdy is framebuffer y-down; negate it into the shader's y-up space.
+    vec2 refr = vec2(dFdx(drops), -dFdy(drops)) * 0.075;
     vec3 bg = neonField(gx + refr.x, gv.y + refr.y);
 
     // Window streaks and wet specular edges.
