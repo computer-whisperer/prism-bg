@@ -1384,21 +1384,32 @@ impl CompositorHandler for App {
             .position(|w| w.layer.wl_surface() == surface)
         {
             self.wallpapers[i].frame_pending = false;
-            let animate = !self.wallpapers[i].broken
+            // A rotation tick deferred while this playlist's outputs were all
+            // callback-starved runs now that one is provably visible. It must
+            // run before the animation redraw below: the redraw re-arms
+            // `frame_pending`, and rotate()'s starvation gate would then
+            // re-defer — on every callback, forever, since a visible animated
+            // shader always has a callback in flight.
+            if let Some(p) = self.wallpapers[i].spec.playlist {
+                if self.playlists[p].rotation_deferred {
+                    self.playlists[p].rotation_deferred = false;
+                    self.rotate(qh, p);
+                }
+            }
+            // If the rotation just committed on this surface (shader swaps and
+            // cached images start their dissolve with an immediate draw),
+            // `frame_pending` is set again and a callback is armed — drawing
+            // once more would leave two callbacks in flight, doubling frame
+            // traffic from then on. A rotation still waiting on image prep
+            // commits nothing, and the outgoing shader keeps animating.
+            let animate = !self.wallpapers[i].frame_pending
+                && !self.wallpapers[i].broken
                 && self.wallpapers[i]
                     .shader
                     .as_ref()
                     .is_some_and(|s| s.needs_redraw());
             if animate {
                 self.draw(qh, i);
-            }
-            // A rotation tick deferred while this playlist's outputs were all
-            // callback-starved runs now that one is provably visible.
-            if let Some(p) = self.wallpapers[i].spec.playlist {
-                if self.playlists[p].rotation_deferred {
-                    self.playlists[p].rotation_deferred = false;
-                    self.rotate(qh, p);
-                }
             }
         }
     }
