@@ -1176,9 +1176,11 @@ fn clear_buffer_textures(
     let black = vk::ClearColorValue {
         float32: [0.0, 0.0, 0.0, 1.0],
     };
+    // Record + submit in a closure so an early `?` returns *here*, not out of
+    // the function — the cb below must be freed either way.
     // SAFETY: cb is valid; all images/barriers are this device's; the queue
     // submit + wait below drains the work before the cb is freed.
-    let result = unsafe {
+    let result = (|| unsafe {
         device
             .begin_command_buffer(
                 cb,
@@ -1242,8 +1244,10 @@ fn clear_buffer_textures(
         device
             .queue_wait_idle(gpu.queue)
             .context("waiting on feedback clear")
-    };
-    // SAFETY: the submission has drained (queue_wait_idle), so the cb is free.
+    })();
+    // SAFETY: either the submission has drained (queue_wait_idle) or the cb
+    // was never submitted (the closure's `?` returns into `result`), so the
+    // cb is free on every path.
     unsafe { device.free_command_buffers(gpu.command_pool, &[cb]) };
     result
 }
@@ -1819,6 +1823,12 @@ pub struct ShaderRenderer {
     /// that ignores the UBO is fine.
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
+    /// The shared [`Gpu::command_pool`] the per-frame command buffers were
+    /// allocated from. Borrowed (the pool is the device's) — kept only so
+    /// `Drop` can free the command buffers back to it; renderers are recreated
+    /// every rotation, so leaving them allocated leaks pool BOs for the life
+    /// of the process.
+    command_pool: vk::CommandPool,
     /// One [`Frame`] per ring slot; indexed by the slot passed to [`Self::render`].
     frames: Vec<Frame>,
     /// Loader to export the render semaphore as a sync_file FD.
@@ -1973,6 +1983,7 @@ impl ShaderRenderer {
             render_pass,
             descriptor_set_layout,
             descriptor_pool,
+            command_pool: gpu.command_pool,
             frames,
             external_semaphore_fd_fn: gpu.external_semaphore_fd_fn.clone(),
             sync_file,
@@ -2406,9 +2417,11 @@ impl ShaderRenderer {
                     });
                 }
                 Err(e) => {
-                    // Free the slots already built, then the pool (which frees
-                    // their descriptor sets and the command buffers).
-                    // SAFETY: every handle below was created by this function.
+                    // Free the slots already built, the command buffers (their
+                    // pool is the shared, process-lifetime one), then the
+                    // descriptor pool (which frees their descriptor sets).
+                    // SAFETY: every handle below was created by this function;
+                    // nothing was submitted yet.
                     unsafe {
                         for f in &frames {
                             device.destroy_fence(f.fence, None);
@@ -2416,6 +2429,7 @@ impl ShaderRenderer {
                             device.destroy_buffer(f.ubo, None);
                             device.free_memory(f.ubo_memory, None);
                         }
+                        device.free_command_buffers(gpu.command_pool, &command_buffers);
                         device.destroy_descriptor_pool(descriptor_pool, None);
                     }
                     return Err(e);
@@ -3153,11 +3167,18 @@ impl Drop for ShaderRenderer {
     fn drop(&mut self) {
         // SAFETY: all handles are this renderer's. On the sync_file path a
         // submission may still be in flight, so wait every slot's fence
-        // before tearing down. Command buffers are freed with the pool.
+        // before tearing down. Command buffers must be freed back to the
+        // shared pool explicitly — it outlives us by the whole process, so
+        // anything left allocated is leaked until exit.
         unsafe {
             let fences: Vec<vk::Fence> = self.frames.iter().map(|f| f.fence).collect();
             if !fences.is_empty() {
                 let _ = self.device.wait_for_fences(&fences, true, u64::MAX);
+            }
+            let cbs: Vec<vk::CommandBuffer> =
+                self.frames.iter().map(|f| f.command_buffer).collect();
+            if !cbs.is_empty() {
+                self.device.free_command_buffers(self.command_pool, &cbs);
             }
             for frame in &self.frames {
                 self.device.destroy_fence(frame.fence, None);
@@ -3274,6 +3295,10 @@ pub struct Transition {
     /// One set pointing at `[outgoing, incoming]`, shared by every slot's blend
     /// command buffer (read-only; re-pointed only on resize).
     descriptor_set: vk::DescriptorSet,
+    /// The shared [`Gpu::command_pool`] the blend command buffers were
+    /// allocated from. Borrowed — kept only so `Drop` can free them back
+    /// (the pool itself lives for the process).
+    command_pool: vk::CommandPool,
     frames: Vec<BlendFrame>,
     external_semaphore_fd_fn: ash::khr::external_semaphore_fd::Device,
     sync_file: bool,
@@ -3566,7 +3591,9 @@ impl Transition {
                 }),
                 (f, s) => {
                     // SAFETY: free whichever of this pair succeeded, plus the
-                    // already-built frames and the pool/pipeline chain.
+                    // already-built frames, the command buffers (their pool is
+                    // the shared, process-lifetime one; nothing was submitted
+                    // yet), and the pool/pipeline chain.
                     unsafe {
                         if let Ok(fence) = f {
                             device.destroy_fence(fence, None);
@@ -3578,6 +3605,7 @@ impl Transition {
                             device.destroy_fence(bf.fence, None);
                             device.destroy_semaphore(bf.semaphore, None);
                         }
+                        device.free_command_buffers(gpu.command_pool, &command_buffers);
                     }
                     cleanup_pool(&device);
                     return Err(anyhow::anyhow!("creating blend frame sync objects"));
@@ -3600,6 +3628,7 @@ impl Transition {
             pipeline,
             descriptor_pool,
             descriptor_set,
+            command_pool: gpu.command_pool,
             frames: blend_frames,
             external_semaphore_fd_fn: gpu.external_semaphore_fd_fn.clone(),
             sync_file: ShaderRenderer::sync_file_exportable(gpu),
@@ -3921,11 +3950,17 @@ impl Transition {
 impl Drop for Transition {
     fn drop(&mut self) {
         // SAFETY: all handles are this transition's; drain in-flight blends
-        // before teardown. Command buffers are freed with the pool.
+        // before teardown. Command buffers must be freed back to the shared
+        // pool explicitly — it outlives us by the whole process.
         unsafe {
             let fences: Vec<vk::Fence> = self.frames.iter().map(|f| f.fence).collect();
             if !fences.is_empty() {
                 let _ = self.device.wait_for_fences(&fences, true, u64::MAX);
+            }
+            let cbs: Vec<vk::CommandBuffer> =
+                self.frames.iter().map(|f| f.command_buffer).collect();
+            if !cbs.is_empty() {
+                self.device.free_command_buffers(self.command_pool, &cbs);
             }
             for f in &self.frames {
                 self.device.destroy_fence(f.fence, None);
